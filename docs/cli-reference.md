@@ -6,10 +6,12 @@ Complete command-line reference for Conductor.
 
 - [`conductor run`](#conductor-run)
 - [`conductor stop`](#conductor-stop)
-- [`conductor gate-respond`](#conductor-gate-respond)
+- [`conductor gate respond`](#conductor-gate-respond)
+- [`conductor checkpoint list`](#conductor-checkpoint-list)
 - [`conductor validate`](#conductor-validate)
 - [`conductor doctor`](#conductor-doctor)
 - [`conductor registry`](#conductor-registry)
+- [Deprecated command aliases](#deprecated-command-aliases)
 
 ## `conductor run`
 
@@ -109,7 +111,7 @@ load time and aborts before forking, with a message listing the options:
 1. Use `--web` (foreground) instead of `--web-bg`
 2. Add `--skip-gates` to auto-select the first option at every gate
 3. Remove `human_gate` steps from the workflow
-4. Use `conductor gate-respond --port <port> --choice <value>` to resolve from CLI
+4. Use `conductor gate respond --port <port> --choice <value>` to resolve from CLI
 
 The same check applies to `conductor resume --web-bg`.
 
@@ -236,12 +238,12 @@ conductor stop --port 8080
 conductor stop --all
 ```
 
-## `conductor gate-respond`
+## `conductor gate respond`
 
 Resolve a parked `human_gate` step from the command line without opening a browser. Sends a gate response to a running workflow's web dashboard via HTTP — useful for SSH sessions or headless environments where the dashboard UI is unreachable.
 
 ```bash
-conductor gate-respond [OPTIONS]
+conductor gate respond [OPTIONS]
 ```
 
 ### Options
@@ -260,26 +262,30 @@ If the running workflow was launched with a gate token configured, requests with
 
 ### Auto-Discovery
 
-When `--agent` is omitted, `conductor gate-respond` queries `GET /api/gate-status` on the specified port. If a gate is currently waiting, its agent name is used automatically and printed to the console. If no gate is waiting, the command exits with code 1.
+When `--agent` is omitted, `conductor gate respond` queries `GET /api/gate-status` on the specified port. If a gate is currently waiting, its agent name is used automatically and printed to the console. If no gate is waiting, the command exits with code 1.
 
 ### Examples
 
 ```bash
 # Resolve the only waiting gate (agent auto-discovered)
-conductor gate-respond --port 8080 --choice approve
+conductor gate respond --port 8080 --choice approve
 
 # Resolve a specific named gate
-conductor gate-respond -p 8080 -c reject --agent review-gate
+conductor gate respond -p 8080 -c reject --agent review-gate
 
 # Pass additional free-text input
-conductor gate-respond -p 8080 -c approve --input "Looks good, ship it"
+conductor gate respond -p 8080 -c approve --input "Looks good, ship it"
 
 # Provide auth token via flag
-conductor gate-respond -p 8080 -c approve --token my-secret
+conductor gate respond -p 8080 -c approve --token my-secret
 
 # Provide auth token via environment variable
-CONDUCTOR_GATE_TOKEN=my-secret conductor gate-respond -p 8080 -c approve
+CONDUCTOR_GATE_TOKEN=my-secret conductor gate respond -p 8080 -c approve
 ```
+
+> **Deprecated alias:** `conductor gate-respond` still works but prints a
+> deprecation warning and will be removed in a future release. Use
+> `conductor gate respond` instead.
 
 ### Exit Codes
 
@@ -287,6 +293,36 @@ CONDUCTOR_GATE_TOKEN=my-secret conductor gate-respond -p 8080 -c approve
 |------|---------|
 | 0 | Gate resolved successfully |
 | 1 | Connection error, auth failure, validation error, or no gate waiting |
+
+## `conductor checkpoint list`
+
+List saved workflow checkpoints (failure and periodic), newest first. Each row shows the workflow name, timestamp, trigger, the agent that was running (or about to run), the error type for failure checkpoints, and the checkpoint file path.
+
+```bash
+conductor checkpoint list [WORKFLOW]
+```
+
+### Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `WORKFLOW` | Optional workflow YAML path; filters the list to that workflow only |
+
+### Examples
+
+```bash
+# List all checkpoints across every workflow
+conductor checkpoint list
+
+# List checkpoints for a single workflow
+conductor checkpoint list workflow.yaml
+```
+
+Resume a failed run from its latest checkpoint with `conductor resume`.
+
+> **Deprecated alias:** `conductor checkpoints` still works but prints a
+> deprecation warning and will be removed in a future release. Use
+> `conductor checkpoint list` instead.
 
 ## `conductor validate`
 
@@ -493,6 +529,19 @@ that includes one.
 
 See [design/registry.md](./design/registry.md) for the full design.
 
+## Deprecated command aliases
+
+The command surface groups related subcommands under nouns (`checkpoint`,
+`gate`, `registry`). Two older flat commands are retained as **deprecated
+aliases** so existing scripts keep working. Each still runs, but prints a
+one-line deprecation warning to stderr and forwards to its replacement. They
+are hidden from `--help` and are slated for removal in a future release.
+
+| Deprecated alias | Use instead |
+|------------------|-------------|
+| `conductor checkpoints [WORKFLOW]` | `conductor checkpoint list [WORKFLOW]` |
+| `conductor gate-respond [OPTIONS]` | `conductor gate respond [OPTIONS]` |
+
 ## Environment Variables
 
 | Variable | Description |
@@ -500,7 +549,7 @@ See [design/registry.md](./design/registry.md) for the full design.
 | `ANTHROPIC_API_KEY` | API key for Claude provider |
 | `GITHUB_TOKEN` | Token for Copilot provider (if not using GitHub CLI auth) |
 | `CONDUCTOR_LOG_LEVEL` | Logging level: DEBUG, INFO, WARNING, ERROR |
-| `CONDUCTOR_GATE_TOKEN` | Auth token required by `conductor gate-respond` (and checked by `POST /api/gate-respond`) when the workflow dashboard is started with a gate token |
+| `CONDUCTOR_GATE_TOKEN` | Auth token required by `conductor gate respond` (and checked by `POST /api/gate-respond`) when the workflow dashboard is started with a gate token |
 
 ## Exit Codes
 

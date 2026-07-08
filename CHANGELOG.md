@@ -28,6 +28,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the scoped provider (default `copilot`) fails to connect. Also adds a
   public `list_models()` method to the provider interface (implemented for
   Copilot and Claude). ([#274](https://github.com/microsoft/conductor/issues/274))
+- **Grouped CLI command surface** — related subcommands are now organised under
+  noun groups: `conductor checkpoint list` (was `conductor checkpoints`) and
+  `conductor gate respond` (was `conductor gate-respond`), alongside the
+  existing `registry` group. The root `--help` groups commands into
+  *Author & Inspect*, *Run & Recover*, *Interact*, *State*, and *Environment*
+  panels, while the hot-path verbs (`run`, `resume`, `validate`, `show`,
+  `stop`, `replay`, `update`, `doctor`) stay flat.
+  ([#275](https://github.com/microsoft/conductor/issues/275))
+
+### Deprecated
+
+- **`conductor checkpoints` and `conductor gate-respond`** — replaced by
+  `conductor checkpoint list` and `conductor gate respond` respectively. The old
+  names still work and forward to the new commands, but print a one-line stderr
+  deprecation warning, are hidden from `--help`, and will be removed in a future
+  release. ([#275](https://github.com/microsoft/conductor/issues/275))
 
 ### Fixed
 

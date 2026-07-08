@@ -40,9 +40,13 @@ app = typer.Typer(
 )
 
 # Register subcommand groups
+from conductor.cli.checkpoint import checkpoint_app  # noqa: E402
+from conductor.cli.gate import gate_app  # noqa: E402
 from conductor.cli.registry import registry_app  # noqa: E402
 
-app.add_typer(registry_app)
+app.add_typer(registry_app, rich_help_panel="Environment")
+app.add_typer(gate_app, rich_help_panel="Interact")
+app.add_typer(checkpoint_app, rich_help_panel="State")
 
 # Rich console for formatted output
 console = Console(stderr=True)
@@ -192,7 +196,7 @@ def _abort_web_bg_if_human_gate(workflow_path: Path, *, skip_gates: bool) -> Non
         "  1. Use --web (foreground) instead of --web-bg\n"
         "  2. Add --skip-gates to auto-accept the first option\n"
         "  3. Remove human_gate steps from the workflow\n"
-        "  4. Use `conductor gate-respond --port <port> --choice <value>` to resolve from CLI"
+        "  4. Use `conductor gate respond --port <port> --choice <value>` to resolve from CLI"
     )
     typer.echo(message, err=True)
     raise typer.Exit(code=2)
@@ -262,7 +266,7 @@ def main(
             check_for_update_hint(console)
 
 
-@app.command()
+@app.command(rich_help_panel="Run & Recover")
 def run(
     workflow: Annotated[
         str,
@@ -555,7 +559,7 @@ def run(
         raise typer.Exit(code=1) from None
 
 
-@app.command()
+@app.command(rich_help_panel="Author & Inspect")
 def validate(
     workflow: Annotated[
         str,
@@ -601,7 +605,7 @@ def validate(
         raise typer.Exit(code=1)
 
 
-@app.command()
+@app.command(rich_help_panel="Author & Inspect")
 def show(
     workflow: Annotated[
         str,
@@ -726,7 +730,7 @@ def show(
         output_console.print(f"\n[dim]conductor run {ref_str}[/dim]")
 
 
-@app.command()
+@app.command(rich_help_panel="Run & Recover")
 def resume(
     workflow: Annotated[
         str | None,
@@ -996,7 +1000,7 @@ def resume(
         raise typer.Exit(code=1) from None
 
 
-@app.command()
+@app.command(hidden=True)
 def checkpoints(
     workflow: Annotated[
         Path | None,
@@ -1005,67 +1009,17 @@ def checkpoints(
         ),
     ] = None,
 ) -> None:
-    """List available workflow checkpoints.
+    """Deprecated alias for 'conductor checkpoint list'."""
+    console.print(
+        "[yellow]Warning:[/yellow] 'conductor checkpoints' is deprecated and will "
+        "be removed in a future release. Use 'conductor checkpoint list' instead."
+    )
+    from conductor.cli.checkpoint import _list_checkpoints_impl
 
-    Shows all checkpoint files with metadata including workflow name,
-    timestamp, failed agent, and error type. Optionally filter by
-    workflow file.
-
-    \b
-    Examples:
-        conductor checkpoints
-        conductor checkpoints workflow.yaml
-    """
-    from rich.table import Table
-
-    from conductor.engine.checkpoint import CheckpointManager
-
-    # Resolve workflow path for filtering
-    resolved_workflow: Path | None = None
-    if workflow is not None:
-        resolved_workflow = workflow.resolve()
-        if not resolved_workflow.exists():
-            console.print(f"[bold red]Error:[/bold red] Workflow file not found: {workflow}")
-            raise typer.Exit(code=1)
-
-    checkpoint_list = CheckpointManager.list_checkpoints(resolved_workflow)
-
-    if not checkpoint_list:
-        if resolved_workflow:
-            output_console.print(
-                f"[dim]No checkpoints found for workflow: {resolved_workflow.name}[/dim]"
-            )
-        else:
-            output_console.print("[dim]No checkpoints found.[/dim]")
-        return
-
-    table = Table(title="Workflow Checkpoints", show_lines=True)
-    table.add_column("Workflow", style="cyan")
-    table.add_column("Timestamp", style="green")
-    table.add_column("Trigger", style="magenta")
-    table.add_column("Agent", style="yellow")
-    table.add_column("Error Type", style="red", no_wrap=True, min_width=13)
-    # File path absorbs truncation so the triage columns stay readable.
-    table.add_column("File", style="dim", overflow="ellipsis")
-
-    for cp in checkpoint_list:
-        workflow_name = Path(cp.workflow_path).stem
-        timestamp = cp.created_at
-        trigger = cp.trigger
-        # For failure checkpoints this is the failed agent; for periodic
-        # checkpoints it is the step that was about to run.
-        agent = cp.failure.get("agent") or "unknown"
-        # Periodic checkpoints have no error; show an em dash.
-        error_type = cp.failure.get("error_type") or "—"
-        file_path = str(cp.file_path)
-
-        table.add_row(workflow_name, timestamp, trigger, agent, error_type, file_path)
-
-    output_console.print(table)
-    output_console.print(f"\n[dim]Total: {len(checkpoint_list)} checkpoint(s)[/dim]")
+    _list_checkpoints_impl(workflow)
 
 
-@app.command()
+@app.command(rich_help_panel="Run & Recover")
 def replay(
     log_file: Annotated[
         Path,
@@ -1130,7 +1084,7 @@ def replay(
             console.print("\n[dim]Replay stopped.[/dim]")
 
 
-@app.command()
+@app.command(rich_help_panel="Run & Recover")
 def stop(
     port: Annotated[
         int | None,
@@ -1273,7 +1227,7 @@ def _print_running_list(entries: list[dict], con: Console) -> None:
     con.print(table)
 
 
-@app.command(name="gate-respond")
+@app.command(name="gate-respond", hidden=True)
 def gate_respond(
     port: Annotated[
         int,
@@ -1314,98 +1268,17 @@ def gate_respond(
         ),
     ] = None,
 ) -> None:
-    """Resolve a parked human gate from the command line.
-
-    Sends a gate response to a running workflow's web dashboard via HTTP.
-    Use this when the dashboard UI is unreachable (e.g. SSH session).
-
-    \b
-    Examples:
-        conductor gate-respond --port 8080 --choice approve
-        conductor gate-respond -p 8080 -c reject --agent review-gate
-        conductor gate-respond -p 8080 -c approve --token secret123
-        conductor gate-respond -p 8080 -c approve --input "Looks good"
-    """
-    import httpx
-
-    base_url = f"http://127.0.0.1:{port}"
-
-    # Resolve token from flag or environment variable
-    resolved_token = token or os.environ.get("CONDUCTOR_GATE_TOKEN")
-
-    # Auto-discover agent name if not provided
-    if agent is None:
-        try:
-            resp = httpx.get(f"{base_url}/api/gate-status", timeout=5)
-            resp.raise_for_status()
-            status = resp.json()
-            if not status.get("waiting"):
-                console.print(f"[yellow]No gate is currently waiting on port {port}.[/yellow]")
-                raise typer.Exit(code=1)
-            agent = status["agent_name"]
-        except httpx.ConnectError:
-            console.print(
-                f"[bold red]Error:[/bold red] Cannot connect to dashboard on port {port}. "
-                "Is the workflow running with --web or --web-bg?"
-            )
-            raise typer.Exit(code=1) from None
-        except httpx.HTTPError as exc:
-            console.print(f"[bold red]Error:[/bold red] Failed to query gate status: {exc}")
-            raise typer.Exit(code=1) from None
-
-    # Build request body
-    body: dict[str, Any] = {
-        "agent_name": agent,
-        "selected_value": choice,
-    }
-    if input_text is not None:
-        body["additional_input"] = input_text
-
-    # Send the token in the Authorization header (not the body) so it is not
-    # captured in request-body logs and is compared in constant time server-side.
-    headers: dict[str, str] = {}
-    if resolved_token is not None:
-        headers["Authorization"] = f"Bearer {resolved_token}"
-
-    # Send gate response
-    try:
-        resp = httpx.post(f"{base_url}/api/gate-respond", json=body, headers=headers, timeout=10)
-    except httpx.ConnectError:
-        console.print(
-            f"[bold red]Error:[/bold red] Cannot connect to dashboard on port {port}. "
-            "Is the workflow running with --web or --web-bg?"
-        )
-        raise typer.Exit(code=1) from None
-    except httpx.HTTPError as exc:
-        console.print(f"[bold red]Error:[/bold red] Request failed: {exc}")
-        raise typer.Exit(code=1) from None
-
-    if resp.status_code == 403:
-        console.print(
-            "[bold red]Error:[/bold red] Authentication failed. "
-            "Provide a valid token with --token or CONDUCTOR_GATE_TOKEN env var."
-        )
-        raise typer.Exit(code=1)
-    if resp.status_code == 409:
-        detail = resp.json().get("error", "Gate is not waiting for this response")
-        console.print(f"[bold red]Error:[/bold red] {detail}")
-        raise typer.Exit(code=1)
-    if resp.status_code == 422:
-        detail = resp.json().get("error", "Validation error")
-        console.print(f"[bold red]Error:[/bold red] {detail}")
-        raise typer.Exit(code=1)
-    if resp.status_code != 200:
-        console.print(
-            f"[bold red]Error:[/bold red] Unexpected response ({resp.status_code}): {resp.text}"
-        )
-        raise typer.Exit(code=1)
-
+    """Deprecated alias for 'conductor gate respond'."""
     console.print(
-        f"[green]Gate resolved:[/green] agent=[cyan]{agent}[/cyan] choice=[cyan]{choice}[/cyan]"
+        "[yellow]Warning:[/yellow] 'conductor gate-respond' is deprecated and will "
+        "be removed in a future release. Use 'conductor gate respond' instead."
     )
+    from conductor.cli.gate import _gate_respond_impl
+
+    _gate_respond_impl(port, choice, agent, input_text, token)
 
 
-@app.command()
+@app.command(rich_help_panel="Environment")
 def update(
     force: bool = typer.Option(
         False,
@@ -1443,7 +1316,7 @@ def update(
         raise typer.Exit(code=1) from None
 
 
-@app.command()
+@app.command(rich_help_panel="Environment")
 def doctor(
     section: Annotated[
         str | None,
