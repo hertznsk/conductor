@@ -169,6 +169,12 @@ def _is_retryable_error(exception: Exception) -> bool:
     if type(exception) is ModelAPIError:
         return True
 
+    # The OpenAI SDK raises a bare APIError for error objects delivered after
+    # an SSE response has started. Unlike HTTP APIStatusError subclasses, that
+    # exception has no status code; retry only server/rate-limit payload types.
+    if openai is not None and type(exception) is openai.APIError:
+        return exception.type in {"server_error", "rate_limit_error"}
+
     error_type_name = type(exception).__name__
 
     retryable_names = {

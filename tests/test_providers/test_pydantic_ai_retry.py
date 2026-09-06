@@ -228,6 +228,17 @@ class TestOpenAIErrorClassification:
         assert _is_retryable_error(_make_openai_status_error(503)) is True
         assert _is_retryable_error(_make_openai_status_error(429)) is True
 
+    def test_raw_openai_stream_validation_error_is_fatal(self) -> None:
+        # Requirement: a structured client-side error inside an SSE stream must not
+        # become retryable merely because the SDK reports it as a base APIError.
+        error = openai.APIError(
+            message="invalid request",
+            request=_make_http_request(),
+            body={"type": "invalid_request_error", "code": "invalid_value"},
+        )
+
+        assert _is_retryable_error(error) is False
+
     def test_raw_openai_api_status_4xx_are_fatal(self) -> None:
         """Raw openai APIStatusError 400/401/403/404 must be fatal."""
         assert _is_retryable_error(_make_openai_status_error(400)) is False
@@ -343,6 +354,38 @@ class TestOpenAIErrorClassification:
             "delay": 2.0,
         }
         mock_sleep.assert_called_once_with(2.0)
+
+    @pytest.mark.asyncio
+    async def test_real_openai_stream_server_error_retries_once_then_succeeds(self) -> None:
+        # Requirement: a transient error delivered inside an OpenAI-compatible SSE stream
+        # must consume the configured retry attempt instead of failing after the first call.
+        attempts = 0
+        request = _make_http_request()
+        stream_error = openai.APIError(
+            message="upstream overloaded",
+            request=request,
+            body={"type": "server_error", "code": "internal_server_error"},
+        )
+
+        async def factory() -> str:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise stream_error
+            return "success"
+
+        config = RetryConfig(max_attempts=2, base_delay=0.0, jitter=0.0)
+        with patch("conductor.providers._pydantic_ai.retry.asyncio.sleep") as mock_sleep:
+            result = await execute_with_retry(
+                factory,
+                retry_config=config,
+                event_callback=None,
+                agent_name="openai-stream-retryer",
+            )
+
+        assert result == "success"
+        assert attempts == 2
+        mock_sleep.assert_called_once_with(0.0)
 
     @pytest.mark.asyncio
     async def test_real_openai_bad_request_error_is_not_retried(self) -> None:
