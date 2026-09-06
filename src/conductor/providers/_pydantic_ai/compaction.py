@@ -94,6 +94,25 @@ async def _estimate_context_tokens(
     )
 
 
+def _count_utf8_bytes(text: str) -> int:
+    """Return a one-byte-per-token safety bound for token-dense text."""
+    return len(text.encode("utf-8"))
+
+
+def _estimate_conservative_context_tokens(
+    messages: list[ModelMessage],
+    model_request_parameters: ModelRequestParameters | None,
+) -> int:
+    """Estimate context with a one-byte-per-token safety bound."""
+    from pydantic_ai_harness.compaction import estimate_context_tokens
+
+    return estimate_context_tokens(
+        messages,
+        tokenizer=_count_utf8_bytes,
+        model_request_parameters=model_request_parameters,
+    )
+
+
 def _estimate_after_compaction_tokens(
     before_messages: list[ModelMessage],
     after_messages: list[ModelMessage],
@@ -254,28 +273,59 @@ class _FailOpenCompactionWrapper(AbstractCapability[Any]):
         if self._disabled:
             return request_context
 
-        # Zone (a): gate measurement. A broken estimate says nothing about
-        # the compaction path, so this warns and skips compaction for this
-        # request only — no errored event, no disable latch.
+        before_messages = list(request_context.messages)
+        conservative_estimate: int | None = None
         try:
-            before_messages = list(request_context.messages)
             before_estimate = await _estimate_context_tokens(
                 before_messages,
                 request_context.model_request_parameters,
             )
         except Exception:  # noqa: BLE001 - estimation must never fail the run
             logger.warning(
-                "Compaction gate measurement failed for agent %r; "
-                "skipping compaction for this request.",
+                "Compaction gate measurement failed for agent %r; using the conservative fallback.",
                 self._config.agent_name,
                 exc_info=True,
             )
-            return request_context
+            try:
+                conservative_estimate = _estimate_conservative_context_tokens(
+                    before_messages,
+                    request_context.model_request_parameters,
+                )
+            except Exception:  # noqa: BLE001 - estimation must never fail the run
+                logger.warning(
+                    "Compaction fallback measurement failed for agent %r; "
+                    "skipping compaction for this request.",
+                    self._config.agent_name,
+                    exc_info=True,
+                )
+                return request_context
+            before_estimate = conservative_estimate
+        else:
+            try:
+                conservative_estimate = _estimate_conservative_context_tokens(
+                    before_messages,
+                    request_context.model_request_parameters,
+                )
+            except Exception:  # noqa: BLE001 - primary estimate remains usable
+                logger.warning(
+                    "Compaction safety measurement failed for agent %r; "
+                    "using the primary estimate.",
+                    self._config.agent_name,
+                    exc_info=True,
+                )
 
-        # Gate on the token estimate, not the message count: one large
-        # prompt can exceed the trigger with nothing to drop.
-        if before_estimate <= self._config.trigger_tokens:
+        # The primary estimate drives the reserve-based trigger. The byte bound
+        # only guards the hard window, avoiding premature compaction of ordinary
+        # text while catching suffixes the four-characters heuristic undercounts.
+        exceeds_trigger = before_estimate > self._config.trigger_tokens
+        may_exceed_window = (
+            conservative_estimate is not None
+            and conservative_estimate >= self._config.window_tokens
+        )
+        if not exceeds_trigger and not may_exceed_window:
             return request_context
+        if conservative_estimate is not None and may_exceed_window:
+            before_estimate = max(before_estimate, conservative_estimate)
 
         self._on_before(estimate=before_estimate, messages_before=len(before_messages))
         for tier in self._tier_wrappers:

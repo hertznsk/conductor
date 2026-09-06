@@ -332,6 +332,60 @@ class TestThresholdGating:
         assert len(result.messages) == 1
 
 
+class TestKnownWindowSafety:
+    """Requirement: known context windows are hard pre-request boundaries."""
+
+    @pytest.mark.asyncio
+    async def test_token_dense_suffix_compacts_before_known_window_overflow(self) -> None:
+        # Requirement: provider usage plus token-dense suffix growth must compact before
+        # the next request can exceed the known context window.
+        capability = build_tiered_compaction(
+            _make_config(trigger_tokens=121_000, target_tokens=100_000)
+        )
+        messages: list[Any] = [
+            ModelResponse(
+                parts=[TextPart(content="compaction complete")],
+                usage=RequestUsage(input_tokens=74_499, output_tokens=0),
+            )
+        ]
+        for index in range(30):
+            messages.append(
+                ModelRequest(parts=[UserPromptPart(content=f"turn-{index}-" + "!" * 4_193)])
+            )
+        request_context = _request_context_with_messages(messages)
+
+        result = await capability.before_model_request(_make_run_context(), request_context)
+
+        assert len(result.messages) < len(messages)
+        assert len(result.messages) == 21
+
+    @pytest.mark.asyncio
+    async def test_estimator_failure_uses_safe_fallback_before_large_request(self) -> None:
+        # Requirement: a failed primary estimate must not bypass compaction when an
+        # independent conservative estimate shows the request can exceed the known window.
+        inner = AsyncMock()
+        compacted = _request_context_with_messages(
+            [ModelRequest(parts=[UserPromptPart(content="compacted")])]
+        )
+        inner.before_model_request = AsyncMock(return_value=compacted)
+        capability = _FailOpenCompactionWrapper(
+            inner,
+            config=_make_config(trigger_tokens=121_000, target_tokens=100_000),
+        )
+        request_context = _request_context_with_messages(
+            [ModelRequest(parts=[UserPromptPart(content="!" * 200_288)])]
+        )
+
+        with patch(
+            "conductor.providers._pydantic_ai.compaction._estimate_context_tokens",
+            new=AsyncMock(side_effect=RuntimeError("estimator exploded")),
+        ):
+            result = await capability.before_model_request(_make_run_context(), request_context)
+
+        inner.before_model_request.assert_called_once()
+        assert result is compacted
+
+
 class TestTierFallback:
     """Requirement: a failing non-final tier still yields to the final tier."""
 
@@ -920,9 +974,9 @@ class TestEventEmission:
         assert any(e[0] == "agent_compaction_complete" for e in events)
 
     @pytest.mark.asyncio
-    async def test_gate_measurement_failure_skips_without_latch_or_event(self) -> None:
-        # A failing gate estimate warns, returns the
-        # original context, emits no event, and does not engage the latch.
+    async def test_gate_measurement_failure_uses_fallback_without_latch(self) -> None:
+        # Requirement: a failed primary estimate uses the conservative fallback
+        # without disabling compaction for later requests.
         events: list[tuple[str, dict[str, Any]]] = []
 
         def callback(event_type: str, data: dict[str, Any]) -> None:
@@ -942,7 +996,10 @@ class TestEventEmission:
 
         assert result is request_context
         assert capability._disabled is False  # type: ignore[attr-defined]
-        assert not events
+        assert [event_type for event_type, _ in events] == [
+            "agent_compaction_start",
+            "agent_compaction_complete",
+        ]
 
     @pytest.mark.asyncio
     async def test_telemetry_failure_keeps_compacted_result_without_latch(self) -> None:
