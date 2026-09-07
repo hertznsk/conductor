@@ -831,6 +831,7 @@ class CopilotProvider(AgentProvider):
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
         custom_agents: list[dict[str, Any]] | None = None,
+        continuation_state: Any = None,
         extra_mcp_servers: dict[str, Any] | None = None,
     ) -> AgentOutput:
         """Execute an agent using the Copilot SDK.
