@@ -1227,7 +1227,7 @@ agents:
 1. The primary agent runs and produces output.
 2. The validator runs a second LLM call that receives the agent's rendered prompt, its output, and the `criteria`, and must answer `{ "passed": bool, "issues": [str, ...] }`.
 3. If `passed` is true, the output flows downstream unchanged.
-4. If `passed` is false and `max_retries > 0`, the agent re-runs once with a `## Validation feedback` section (the issues) appended to its prompt. The second output is taken as final — there is no second validation loop.
+4. If `passed` is false and `max_retries > 0`, the agent re-runs once with a `## Validation feedback` section (the issues) appended to its prompt. The second output is taken as final — there is no second validation loop. For the Pydantic AI-based Claude and OpenAI providers, this correction continues the completed agent conversation, preserving prior model and tool messages while sending only the validation feedback as the next user turn. Other providers keep their existing re-run behavior.
 
 **Configuration:**
 

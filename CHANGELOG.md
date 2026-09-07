@@ -26,6 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retry is logged at warning level (a taken one already was), and a fatal
   bare `APIError`'s message now carries the payload `type`/`code` the SDK
   leaves out of `str(e)`.
+- **Pydantic AI validator retries preserve the primary agent conversation.** When a
+  semantic validator rejects output from the Claude or OpenAI provider, the correction
+  now continues with the completed Pydantic AI message history and sends validation
+  feedback as the next user turn. This preserves prior reasoning and tool exchanges
+  without repeating the original prompt, workspace instructions, or injected skills.
 
 ### Added
 
