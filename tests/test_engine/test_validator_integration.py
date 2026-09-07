@@ -559,6 +559,44 @@ class TestValidatorCostAndFailurePaths:
         assert any(r.exc_info is not None for r in debugs)
 
     @pytest.mark.asyncio
+    async def test_continuation_rerun_failure_fails_open_to_original(self) -> None:
+        # Requirement: a validator re-run that fails while continuing the
+        # provider conversation must fail open to the original output — the
+        # same contract as the stateless re-run — with the continuation state
+        # having actually reached the failed re-run.
+        continuation = ["original request", "original response"]
+        seen_states: list[Any] = []
+
+        async def exec_fn(
+            *,
+            agent: AgentDef,
+            rendered_prompt: str,
+            continuation_state: Any = None,
+            **kw: Any,
+        ) -> AgentOutput:
+            if _is_validator_agent(agent):
+                return AgentOutput(
+                    content={"passed": False, "issues": ["fix"]},
+                    raw_response="",
+                    model="judge",
+                )
+            seen_states.append(continuation_state)
+            raise RuntimeError("continuation rerun boom")
+
+        engine, executor, agent = self._engine_and_executor(exec_fn)
+        original = AgentOutput(
+            content={"summary": "orig"},
+            raw_response="",
+            model="gpt-4",
+            continuation_state=continuation,
+        )
+
+        result = await engine._apply_validator(agent, original, 0.5, {}, executor, None, None)
+
+        assert result is original
+        assert seen_states == [continuation]
+
+    @pytest.mark.asyncio
     async def test_partial_rerun_keeps_original(self) -> None:
         async def exec_fn(*, agent: AgentDef, rendered_prompt: str, **kw: Any) -> AgentOutput:
             if agent.output and "passed" in agent.output:
