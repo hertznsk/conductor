@@ -1080,7 +1080,6 @@ class ClaudeProvider(AgentProvider):
             ValidationError: If output doesn't match schema.
         """
         del skill_directories  # Claude relies on eager preamble injection (see docstring).
-        del custom_agents, extra_mcp_servers
         from conductor.providers._pydantic_ai.agent_builder import (
             build_agent,
             resolve_anthropic_effective_max_tokens,
