@@ -1047,6 +1047,7 @@ class ClaudeProvider(AgentProvider):
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
         custom_agents: list[dict[str, Any]] | None = None,
+        continuation_state: Any = None,
         extra_mcp_servers: dict[str, Any] | None = None,
     ) -> AgentOutput:
         """Execute an agent using the Pydantic AI pipeline.
@@ -1079,6 +1080,7 @@ class ClaudeProvider(AgentProvider):
             ValidationError: If output doesn't match schema.
         """
         del skill_directories  # Claude relies on eager preamble injection (see docstring).
+        del custom_agents, extra_mcp_servers
         from conductor.providers._pydantic_ai.agent_builder import (
             build_agent,
             resolve_anthropic_effective_max_tokens,
@@ -1216,5 +1218,6 @@ class ClaudeProvider(AgentProvider):
             default_model=self._default_model,
             retry_history=self._retry_history,
             build_agent_fn=build_agent_fn,
+            message_history=continuation_state,
             compaction=compaction_cfg,
         )

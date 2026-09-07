@@ -878,6 +878,7 @@ class OpenAIProvider(AgentProvider):
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
         custom_agents: list[dict[str, Any]] | None = None,
+        continuation_state: Any = None,
         extra_mcp_servers: dict[str, Any] | None = None,
     ) -> AgentOutput:
         """Execute an agent using the shared Pydantic AI pipeline.
@@ -1049,5 +1050,6 @@ class OpenAIProvider(AgentProvider):
             default_model=self._default_model,
             retry_history=self._retry_history,
             build_agent_fn=build_agent_fn,
+            message_history=continuation_state,
             compaction=compaction_cfg,
         )

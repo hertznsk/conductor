@@ -74,6 +74,8 @@ class TestExecuteHappyPath:
         assert output.tokens_used is not None
         assert output.input_tokens is not None
         assert output.output_tokens is not None
+        # Requirement: completed Pydantic AI runs expose resumable message history.
+        assert output.continuation_state is not None
 
 
 class TestExecuteStructuredOutput:

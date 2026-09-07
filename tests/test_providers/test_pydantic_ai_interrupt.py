@@ -20,7 +20,7 @@ from typing import Any
 import pytest
 from pydantic_ai import Agent, AgentRetries, UsageLimits
 from pydantic_ai.exceptions import UnexpectedModelBehavior
-from pydantic_ai.messages import ModelResponse, TextPart
+from pydantic_ai.messages import ModelResponse, TextPart, UserPromptPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.output import ToolOutput
@@ -135,6 +135,40 @@ class TestInterruptBeforeRun:
         assert outcome.is_partial is True
         assert outcome.last_call_input_tokens is not None
         assert outcome.last_call_input_tokens > 0
+
+
+class TestMessageHistoryContinuation:
+    """Requirement: a follow-up run continues the completed message history."""
+
+    @pytest.mark.asyncio
+    async def test_message_history_is_followed_by_new_user_turn(self) -> None:
+        # Requirement: validator feedback must be a new user turn after the first run.
+        agent = _make_text_agent()
+        first = await run_with_interrupt(
+            agent,
+            "original request",
+            interrupt_signal=None,
+            event_callback=None,
+            has_output_schema=False,
+        )
+        assert first.result is not None
+        history = first.result.all_messages()
+
+        second = await run_with_interrupt(
+            agent,
+            "validation feedback",
+            interrupt_signal=None,
+            event_callback=None,
+            has_output_schema=False,
+            message_history=history,
+        )
+
+        assert second.result is not None
+        messages = second.result.all_messages()
+        assert messages[: len(history)] == history
+        final_request = messages[-2]
+        assert isinstance(final_request.parts[0], UserPromptPart)
+        assert final_request.parts[0].content == "validation feedback"
 
 
 class TestInterruptMidRun:

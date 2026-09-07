@@ -244,6 +244,8 @@ class TestExecute:
             output = await provider.execute(agent, {}, "say hi")
 
         assert output.content == {"result": "hello"}
+        # Requirement: completed Pydantic AI runs expose resumable message history.
+        assert output.continuation_state is not None
         assert captured_kwargs.get("backend") == "openai"
         assert captured_kwargs.get("http_client") is None
         assert captured_kwargs.get("api_key") == "test-key"

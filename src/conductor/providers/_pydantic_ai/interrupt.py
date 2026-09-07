@@ -19,7 +19,7 @@ import asyncio
 import contextlib
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -178,6 +178,7 @@ async def run_with_interrupt(
     usage_limits: UsageLimits | None = None,
     max_session_seconds: float | None = None,
     max_parse_recovery_attempts: int = 0,
+    message_history: Sequence[ModelMessage] | None = None,
 ) -> RunOutcome:
     """Run a Pydantic AI agent with Conductor interrupt support.
 
@@ -210,6 +211,8 @@ async def run_with_interrupt(
             non-retryable ``ProviderError`` is raised.
         max_parse_recovery_attempts: Configured output-correction budget used
             in ``agent_parse_recovery`` event payloads.
+        message_history: Optional completed-run messages to continue before
+            adding ``user_prompt`` as the next user turn.
 
     Returns:
         A ``RunOutcome`` describing normal completion, partial output, or
@@ -220,14 +223,18 @@ async def run_with_interrupt(
     if interrupt_signal.is_set():
         logger.info("Pydantic AI agent interrupted before first iteration")
         interrupt_signal.clear()
-        return await _request_partial_output(agent, [], event_callback, has_output_schema)
+        return await _request_partial_output(
+            agent, list(message_history or []), event_callback, has_output_schema
+        )
 
     recovery_attempt = [0]
     iteration = 0
     session_start = time.monotonic()
 
     try:
-        async with agent.iter(user_prompt, usage_limits=usage_limits) as run:
+        async with agent.iter(
+            user_prompt, usage_limits=usage_limits, message_history=message_history
+        ) as run:
             next_node = run.next_node
             while not isinstance(next_node, End):
                 iteration += 1
