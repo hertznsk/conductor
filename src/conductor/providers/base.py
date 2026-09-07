@@ -181,6 +181,9 @@ class AgentOutput:
     """Sandbox wall-clock time reported by a remote-runtime provider (issue #284,
     FR7). ``None`` for providers with no distinct sandbox time to report."""
 
+    continuation_state: Any = None
+    """Provider-specific state for continuing this completed execution in memory."""
+
 
 @dataclass(frozen=True)
 class ModelCapabilityInfo:
@@ -417,6 +420,7 @@ class AgentProvider(ABC):
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
         custom_agents: list[dict[str, Any]] | None = None,
+        continuation_state: Any = None,
         extra_mcp_servers: dict[str, Any] | None = None,
     ) -> AgentOutput:
         """Execute an agent and return normalized output.
@@ -449,6 +453,9 @@ class AgentProvider(ABC):
                 ``<plugin>:<agent>``. Providers that set
                 :attr:`supports_native_plugins` to ``True`` should
                 register these so the model can dispatch to them.
+            continuation_state: Optional provider-specific state from a completed
+                execution. Providers that support in-memory continuation resume it
+                with ``rendered_prompt`` as the next user turn.
             extra_mcp_servers: Optional MCP servers contributed by the
                 agent's effective ``plugins`` list, merged on top of the
                 workflow-level ``runtime.mcp_servers`` for this call
