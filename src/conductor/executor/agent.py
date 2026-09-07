@@ -343,6 +343,7 @@ class AgentExecutor:
         agent: AgentDef,
         context: dict[str, Any],
         guidance_section: str | None = None,
+        continuation_state: Any = None,
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
     ) -> AgentOutput:
@@ -360,6 +361,7 @@ class AgentExecutor:
             guidance_section: Optional user guidance section to append to the
                 rendered prompt. When provided, this is appended after the
                 rendered prompt text.
+            continuation_state: Optional provider-specific state from a completed run.
             interrupt_signal: Optional event for mid-agent interrupt signaling.
                 Forwarded to the provider's execute method.
             event_callback: Optional callback for streaming SDK events upstream.
@@ -424,17 +426,16 @@ class AgentExecutor:
             )
             agent = agent.model_copy(update={"context_tier": resolved_tier})
 
-        # Render prompt with context
-        rendered_prompt = self.renderer.render(agent.prompt, context)
-
-        # Prepend prompt prefix (workspace instructions + optional skills)
-        prefix = self._build_prompt_prefix(agent, event_callback)
-        if prefix:
-            rendered_prompt = prefix + rendered_prompt
-
-        # Append user guidance section if provided
-        if guidance_section:
-            rendered_prompt = rendered_prompt + guidance_section
+        # Render a new task or add one user turn to provider-owned state.
+        if continuation_state is not None:
+            rendered_prompt = guidance_section or ""
+        else:
+            rendered_prompt = self.renderer.render(agent.prompt, context)
+            prefix = self._build_prompt_prefix(agent, event_callback)
+            if prefix:
+                rendered_prompt = prefix + rendered_prompt
+            if guidance_section:
+                rendered_prompt = rendered_prompt + guidance_section
 
         # Emit prompt rendered event via callback
         if event_callback is not None:
@@ -524,18 +525,33 @@ class AgentExecutor:
                 f"{len(extra_mcp_servers or {})} MCP server(s) forwarded"
             )
 
-        # Execute via provider
-        output = await self.provider.execute(
-            agent=agent,
-            context=context,
-            rendered_prompt=rendered_prompt,
-            tools=resolved_tools,
-            interrupt_signal=interrupt_signal,
-            event_callback=event_callback,
-            skill_directories=skill_dirs,
-            custom_agents=custom_agents,
-            extra_mcp_servers=extra_mcp_servers,
-        )
+        # Execute via provider. Keep the existing call shape unless this is a
+        # provider-owned continuation, so external providers remain compatible.
+        if continuation_state is None:
+            output = await self.provider.execute(
+                agent=agent,
+                context=context,
+                rendered_prompt=rendered_prompt,
+                tools=resolved_tools,
+                interrupt_signal=interrupt_signal,
+                event_callback=event_callback,
+                skill_directories=skill_dirs,
+                custom_agents=custom_agents,
+                extra_mcp_servers=extra_mcp_servers,
+            )
+        else:
+            output = await self.provider.execute(
+                agent=agent,
+                context=context,
+                rendered_prompt=rendered_prompt,
+                tools=resolved_tools,
+                interrupt_signal=interrupt_signal,
+                event_callback=event_callback,
+                skill_directories=skill_dirs,
+                custom_agents=custom_agents,
+                continuation_state=continuation_state,
+                extra_mcp_servers=extra_mcp_servers,
+            )
 
         # Ensure output.content is a dict
         if not isinstance(output.content, dict):

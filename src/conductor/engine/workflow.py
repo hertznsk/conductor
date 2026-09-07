@@ -4136,7 +4136,10 @@ class WorkflowEngine:
                 executor.execute(
                     agent,
                     agent_context,
-                    guidance_section=new_guidance,
+                    guidance_section=(
+                        feedback.lstrip() if output.continuation_state is not None else new_guidance
+                    ),
+                    continuation_state=output.continuation_state,
                     interrupt_signal=self._interrupt_event,
                     event_callback=event_callback,
                 ),

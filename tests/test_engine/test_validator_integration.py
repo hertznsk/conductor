@@ -120,6 +120,53 @@ class TestValidatorMainLoop:
         assert _validator_rows(engine) == ["reviewer (validator)"]
 
     @pytest.mark.asyncio
+    async def test_fail_then_continues_provider_state(self) -> None:
+        # Requirement: a validator retry continues provider state with feedback only.
+        continuation = ["original request", "original response"]
+        calls: list[dict[str, Any]] = []
+
+        async def exec_fn(
+            *,
+            agent: AgentDef,
+            rendered_prompt: str,
+            continuation_state: Any = None,
+            **kwargs: Any,
+        ) -> AgentOutput:
+            calls.append(
+                {
+                    "agent": agent,
+                    "prompt": rendered_prompt,
+                    "continuation_state": continuation_state,
+                }
+            )
+            if _is_validator_agent(agent):
+                return AgentOutput(
+                    content={"passed": False, "issues": ["fix null safety"]},
+                    raw_response="",
+                    model="judge",
+                )
+            return AgentOutput(
+                content={"summary": "corrected"},
+                raw_response="",
+                model="gpt-4",
+            )
+
+        engine, executor, agent = TestValidatorCostAndFailurePaths()._engine_and_executor(exec_fn)
+        original = AgentOutput(
+            content={"summary": "draft"},
+            raw_response="",
+            model="gpt-4",
+            continuation_state=continuation,
+        )
+
+        result = await engine._apply_validator(agent, original, 0.5, {}, executor, None, None)
+
+        assert result.content == {"summary": "corrected"}
+        primary_rerun = calls[-1]
+        assert primary_rerun["continuation_state"] is continuation
+        assert primary_rerun["prompt"].startswith("## Validation feedback")
+        assert "Review the diff." not in primary_rerun["prompt"]
+
     async def test_fail_then_rerun_succeeds(self) -> None:
         """Validator fails → primary re-runs once with feedback appended."""
         primary_prompts: list[str] = []
