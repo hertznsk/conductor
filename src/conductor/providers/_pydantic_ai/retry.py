@@ -368,6 +368,30 @@ def _get_retry_after(exception: Exception) -> float | None:
     return None
 
 
+def _describe_stream_error(exception: BaseException | None) -> str:
+    """Render an exception for an error message, adding payload details for a
+    bare ``openai.APIError``.
+
+    ``str()`` of a bare ``APIError`` carries only the message — not the
+    payload ``type``/``code``, and not the body when a gateway sent a
+    non-object ``error`` value — and the SDK substitutes the generic "An
+    error occurred during streaming" when the payload has no usable message,
+    so an unenriched failure is undiagnosable.
+    """
+    if exception is None or openai is None or type(exception) is not openai.APIError:
+        return str(exception)
+    details: list[str] = []
+    if exception.type is not None:
+        details.append(f"type={exception.type!r}")
+    if exception.code is not None:
+        details.append(f"code={exception.code!r}")
+    if exception.body is not None and not isinstance(exception.body, dict):
+        details.append(f"body={repr(exception.body)[:200]}")
+    if not details:
+        return str(exception)
+    return f"{exception} ({', '.join(details)})"
+
+
 def _extract_status_code(exception: Exception) -> int | None:
     """Extract HTTP status code from exception if available.
 
@@ -497,16 +521,29 @@ async def execute_with_retry[T](
             )
 
             if not is_retryable:
+                # Asymmetric with a retry *taken*, which logs a warning and
+                # emits agent_retry: a declined retry must also leave a
+                # trace. Conductor installs no logging handlers, so the
+                # debug line above never reaches an operator, and nothing
+                # would otherwise record that a retry policy existed and
+                # was declined.
+                logger.warning(
+                    "[No retry] %s classified non-retryable on attempt %s/%s: %s",
+                    type(e).__name__,
+                    attempt,
+                    retry_config.max_attempts,
+                    e,
+                )
                 status_code = _extract_status_code(e)
                 if status_code is not None:
                     raise ProviderError(
-                        f"Pydantic AI provider error: {e}",
+                        f"Pydantic AI provider error: {_describe_stream_error(e)}",
                         suggestion="Check API key, model name, and request parameters",
                         status_code=status_code,
                         is_retryable=False,
                     ) from e
                 raise ProviderError(
-                    f"Pydantic AI call failed: {e}",
+                    f"Pydantic AI call failed: {_describe_stream_error(e)}",
                     suggestion="Check API key, model name, and request parameters",
                     is_retryable=False,
                 ) from e
@@ -514,7 +551,20 @@ async def execute_with_retry[T](
             if retry_config.retry_on is not None:
                 error_category = _classify_error(e)
                 if error_category not in retry_config.retry_on:
-                    raise
+                    # A retry policy was configured and declined this error.
+                    # Keep the ProviderError contract: a bare `raise` here
+                    # would let a raw SDK exception (e.g. a mid-stream
+                    # openai.APIError) escape past callers that catch
+                    # ProviderError.
+                    raise ProviderError(
+                        f"Pydantic AI call failed: {_describe_stream_error(e)}",
+                        suggestion=(
+                            f"Error category {error_category!r} is not in retry_on="
+                            f"{retry_config.retry_on}; widen retry_on to retry it."
+                        ),
+                        status_code=_extract_status_code(e),
+                        is_retryable=False,
+                    ) from e
 
             if attempt >= retry_config.max_attempts:
                 break
@@ -596,7 +646,8 @@ async def execute_with_retry[T](
         suggestion = f"Check API connectivity and rate limits. Last error: {last_error}"
 
     raise ProviderError(
-        f"Pydantic AI call failed after {retry_config.max_attempts} attempts: {last_error}",
+        f"Pydantic AI call failed after {retry_config.max_attempts} attempts: "
+        f"{_describe_stream_error(last_error)}",
         suggestion=suggestion,
         is_retryable=False,
     ) from last_error

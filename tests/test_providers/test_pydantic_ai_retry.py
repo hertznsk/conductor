@@ -8,6 +8,7 @@ semantics, that Pydantic AI's own retry budget is disabled, and that the
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable, Coroutine
 from typing import Any
 from unittest.mock import Mock, patch
@@ -940,8 +941,12 @@ class TestExecuteWithRetry:
 
     @pytest.mark.asyncio
     async def test_retry_on_filter_honored(self) -> None:
-        """Per-agent retry_on must filter which error categories are retried."""
+        """Per-agent retry_on must filter which error categories are retried,
+        and a declined error must surface as a non-retryable ProviderError
+        chained to the original — never as a raw SDK exception escaping past
+        callers that catch ProviderError."""
         callback = Mock()
+        original = MockAPIStatusError("500", 500)
 
         config = RetryConfig(
             max_attempts=3,
@@ -949,11 +954,11 @@ class TestExecuteWithRetry:
             jitter=0.0,
             retry_on=["timeout"],
         )
-        factory = _make_factory([MockAPIStatusError("500", 500)])
+        factory = _make_factory([original])
 
         with (
             patch("conductor.providers._pydantic_ai.retry.asyncio.sleep") as mock_sleep,
-            pytest.raises(MockAPIStatusError),
+            pytest.raises(ProviderError) as exc_info,
         ):
             await execute_with_retry(
                 factory,
@@ -962,8 +967,87 @@ class TestExecuteWithRetry:
                 agent_name="retryer",
             )
 
+        assert exc_info.value.is_retryable is False
+        assert exc_info.value.__cause__ is original
+        assert exc_info.value.suggestion is not None
+        assert "provider_error" in exc_info.value.suggestion
+        assert "retry_on" in exc_info.value.suggestion
         callback.assert_not_called()
         mock_sleep.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_retry_on_filtered_stream_error_surfaces_as_provider_error(self) -> None:
+        # Requirement: a stream error this PR makes retryable still reaches the
+        # retry_on gate — when the filter declines it, the error must escape as
+        # a ProviderError chained to the original, not a raw openai.APIError.
+        stream_error = openai.APIError(
+            "upstream overloaded",
+            _make_http_request(),
+            body={"type": "server_error", "code": "internal_server_error"},
+        )
+        config = RetryConfig(max_attempts=3, base_delay=0.0, jitter=0.0, retry_on=["timeout"])
+        factory = _make_factory([stream_error])
+
+        with pytest.raises(ProviderError) as exc_info:
+            await execute_with_retry(
+                factory,
+                retry_config=config,
+                event_callback=None,
+                agent_name="openai-stream-filtered",
+            )
+
+        assert exc_info.value.is_retryable is False
+        assert exc_info.value.__cause__ is stream_error
+        assert exc_info.value.suggestion is not None
+        assert "retry_on" in exc_info.value.suggestion
+
+    @pytest.mark.asyncio
+    async def test_fatal_stream_error_message_carries_payload_details(self) -> None:
+        # Requirement: a fatal bare APIError must surface its payload type/code
+        # in the ProviderError message — str(e) alone does not carry them, and
+        # the SDK falls back to a generic "An error occurred during streaming"
+        # message when the payload has none.
+        error = openai.APIError(
+            "invalid request",
+            _make_http_request(),
+            body={"type": "invalid_request_error", "code": "invalid_value"},
+        )
+        config = RetryConfig(max_attempts=1, base_delay=0.0, jitter=0.0)
+        factory = _make_factory([error])
+
+        with pytest.raises(ProviderError) as exc_info:
+            await execute_with_retry(
+                factory,
+                retry_config=config,
+                event_callback=None,
+                agent_name="openai-stream-fatal",
+            )
+
+        message = str(exc_info.value)
+        assert "invalid_request_error" in message
+        assert "invalid_value" in message
+
+    @pytest.mark.asyncio
+    async def test_declined_retry_logs_a_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        # Requirement: a declined retry must leave a trace. Conductor installs
+        # no logging handlers, so the debug-level classification line never
+        # reaches an operator — the decision is logged at warning level,
+        # mirroring the retry-taken path.
+        factory = _make_factory([ValueError("fatal")])
+        config = RetryConfig(max_attempts=3, base_delay=0.0, jitter=0.0)
+
+        with (
+            caplog.at_level(logging.WARNING, logger="conductor.providers._pydantic_ai.retry"),
+            pytest.raises(ProviderError),
+        ):
+            await execute_with_retry(
+                factory,
+                retry_config=config,
+                event_callback=None,
+                agent_name="retryer",
+            )
+
+        assert any("classified non-retryable" in record.getMessage() for record in caplog.records)
 
     @pytest.mark.asyncio
     async def test_retry_after_header_respected(self) -> None:

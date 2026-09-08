@@ -20,7 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream errors with no parseable payload `type` (a non-object `error` value
   from an Ollama/vLLM gateway, or an Azure-style `{"code": ...}` shape),
   which are treated like broken streams. Still fatal: recognized client-side
-  payload types (e.g. `invalid_request_error`) and every HTTP 4xx.
+  payload types (e.g. `invalid_request_error`) and every HTTP 4xx. Errors a
+  narrowed `retry_on:` declines are now wrapped in `ProviderError` naming the
+  declined category instead of escaping as raw SDK exceptions, a declined
+  retry is logged at warning level (a taken one already was), and a fatal
+  bare `APIError`'s message now carries the payload `type`/`code` the SDK
+  leaves out of `str(e)`.
 
 ### Added
 
