@@ -628,6 +628,77 @@ class TestValidatorCostAndFailurePaths:
         assert rerun_failed["continued"] is True
 
     @pytest.mark.asyncio
+    async def test_continuation_state_never_reaches_events_or_checkpoint(
+        self, tmp_path: Any
+    ) -> None:
+        # Requirement: continuation_state is provider-opaque and in-memory
+        # only — an arbitrary object must survive neither into emitted event
+        # payloads nor into a checkpoint's JSON.
+        import json
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from conductor.engine.checkpoint import CheckpointManager
+
+        sentinel = object()
+
+        async def exec_fn(*, agent: AgentDef, rendered_prompt: str, **kw: Any) -> AgentOutput:
+            if _is_validator_agent(agent):
+                return AgentOutput(
+                    content={"passed": False, "issues": ["fix"]},
+                    raw_response="",
+                    model="judge",
+                )
+            return AgentOutput(content={"summary": "v2"}, raw_response="", model="gpt-4")
+
+        engine, executor, agent = self._engine_and_executor(exec_fn, continuation_capable=True)
+        original = AgentOutput(
+            content={"summary": "orig"},
+            raw_response="",
+            model="gpt-4",
+            continuation_state=sentinel,
+        )
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        result = await engine._apply_validator(
+            agent, original, 0.5, {}, executor, None, lambda e, d: events.append((e, d))
+        )
+        assert result.content == {"summary": "v2"}
+
+        def _contains(obj: Any) -> bool:
+            if obj is sentinel:
+                return True
+            if isinstance(obj, dict):
+                return any(_contains(k) or _contains(v) for k, v in obj.items())
+            if isinstance(obj, list | tuple):
+                return any(_contains(i) for i in obj)
+            return False
+
+        assert events  # the retry emitted validator events
+        assert not any(_contains(d) for _, d in events)
+        for _, data in events:
+            json.dumps(data)  # payloads stay JSON-clean without coercion
+
+        # The engine stores output.content (a plain dict), so a checkpoint
+        # taken after the retry round-trips through JSON with no trace of the
+        # sentinel.
+        engine.context.store(agent.name, result.content)
+        workflow_file = Path(tmp_path) / "w.yaml"
+        workflow_file.write_text("workflow: {}")
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=Path(tmp_path)):
+            checkpoint_path = CheckpointManager.save_checkpoint(
+                workflow_path=workflow_file,
+                context=engine.context,
+                limits=engine.limits,
+                current_agent=agent.name,
+                error=RuntimeError("boom"),
+                inputs={},
+            )
+        assert checkpoint_path is not None
+        saved = json.loads(checkpoint_path.read_text())
+        assert not _contains(saved)
+
+    @pytest.mark.asyncio
     async def test_partial_rerun_keeps_original(self) -> None:
         async def exec_fn(*, agent: AgentDef, rendered_prompt: str, **kw: Any) -> AgentOutput:
             if agent.output and "passed" in agent.output:
