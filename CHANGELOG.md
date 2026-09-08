@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.36...HEAD)
 
+### Fixed
+
+- **`openai`: retry transient errors delivered inside an SSE stream** (#506) —
+  the OpenAI SDK raises a bare `openai.APIError` (no HTTP status) for an
+  `error` object embedded in a stream, which pydantic-ai does not translate,
+  so a configured `retry:` policy was skipped and the run failed after the
+  first attempt. Now retried: OpenAI mid-stream 5xx (`server_error` /
+  `internal_server_error`), OpenAI rate limits (`type` `requests` / `tokens`
+  with code `rate_limit_exceeded`), Anthropic-shaped gateway errors proxied
+  unchanged (`rate_limit_error` / `overloaded_error` / `api_error`), and
+  stream errors with no parseable payload `type` (a non-object `error` value
+  from an Ollama/vLLM gateway, or an Azure-style `{"code": ...}` shape),
+  which are treated like broken streams. Still fatal: recognized client-side
+  payload types (e.g. `invalid_request_error`) and every HTTP 4xx.
+
 ### Added
 
 - **Opt-in `runtime.provider.setting_sources` on `claude-agent-sdk`** (#501) —

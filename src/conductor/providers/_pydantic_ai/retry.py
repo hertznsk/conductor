@@ -9,20 +9,31 @@ plain-text answers to a tool-output schema must be recovered in-session before
 Conductor retries the whole call.
 
 pydantic-ai translates the Anthropic SDK's own exceptions before Conductor
-ever sees them — a private helper (``_map_api_errors`` in pydantic-ai 2.x;
-written inline in ``AnthropicModel`` at the 1.44.0 floor pinned in
-pyproject.toml, with identical resulting behavior) wraps the SDK call: an
-HTTP error response (``APIStatusError``, including ``RateLimitError``)
-becomes ``ModelHTTPError``, and a transport failure (``APIConnectionError``,
-including ``APITimeoutError``) becomes a bare ``ModelAPIError``. Those are
-the exception types actually observed on this path, not the SDK's own
+ever sees them — a private helper (``_map_api_errors`` in
+``pydantic_ai.models.anthropic``) wraps the SDK call: an HTTP error response
+(``APIStatusError``, including ``RateLimitError``) becomes ``ModelHTTPError``,
+and a transport failure (``APIConnectionError``, including
+``APITimeoutError``) becomes a bare ``ModelAPIError``. Those are the
+exception types actually observed on the Anthropic path, not the SDK's own
 classes, so ``_is_retryable_error`` and ``_get_retry_after`` classify those
-translated types directly (issue #454). Only the public ``ModelHTTPError``/
-``ModelAPIError`` types are relied on at runtime, so a change to the private
-translator degrades this comment, not the code. The translation also drops
-the original response headers, so a server's ``retry-after`` value is only
+translated types directly (issue #454). The translation also drops the
+original response headers, so a server's ``retry-after`` value is only
 recoverable through ``__cause__``, which the translator sets to the
 untranslated SDK exception via ``from e``.
+
+The OpenAI path is translated by the same-named ``_map_api_errors`` in
+``pydantic_ai.models.openai``, which catches only ``APIStatusError``
+(-> ``ModelHTTPError``) and ``APIConnectionError`` (-> ``ModelAPIError``).
+It deliberately does not catch the bare ``openai.APIError`` that
+``openai/_streaming.py`` raises for an ``error`` object embedded in an SSE
+body, so that one SDK class does reach Conductor untranslated and is
+classified directly in ``_is_retryable_error``. If pydantic-ai widens that
+``except`` clause, the branch goes dead and mid-stream errors arrive as
+``ModelAPIError`` — which is unconditionally retryable, reversing the fatal
+classification for client-side payload types. A canary test
+(``test_pydantic_ai_does_not_translate_bare_openai_api_error``) pins the
+upstream behavior so that change fails loudly instead of silently
+re-classifying errors.
 """
 
 from __future__ import annotations
@@ -142,9 +153,12 @@ def _is_retryable_error(exception: Exception) -> bool:
 
     Extended to classify the ``ModelHTTPError``/``ModelAPIError`` types
     pydantic-ai actually raises on this path (see the module docstring;
-    issue #454). The SDK-class-name and ``anthropic.APIStatusError``
-    fallback below is unreachable in production but kept intentionally —
-    see the comment at its definition.
+    issue #454), plus the bare ``openai.APIError`` the OpenAI SDK raises for
+    an error object embedded in an SSE body, which pydantic-ai does **not**
+    translate and which is therefore reachable in production. The
+    SDK-class-name and ``anthropic.APIStatusError`` fallback below remains
+    unreachable in production but is kept intentionally — see the comment
+    at its definition.
     """
     if isinstance(exception, ProviderError):
         return exception.is_retryable
@@ -169,11 +183,46 @@ def _is_retryable_error(exception: Exception) -> bool:
     if type(exception) is ModelAPIError:
         return True
 
-    # The OpenAI SDK raises a bare APIError for error objects delivered after
-    # an SSE response has started. Unlike HTTP APIStatusError subclasses, that
-    # exception has no status code; retry only server/rate-limit payload types.
+    # The OpenAI SDK raises a bare APIError for an error object embedded in
+    # an SSE body after the response has started (openai/_streaming.py).
+    # Unlike the HTTP APIStatusError subclasses, that exception carries no
+    # status code — only the payload's free-form `type`/`code` passthroughs
+    # (no SDK enum backs them), so the retryable vocabulary is spelled out
+    # here with its sources:
+    #   - "server_error" / "internal_server_error": OpenAI mid-stream 5xx
+    #   - "requests" / "tokens" + code "rate_limit_exceeded": an OpenAI 429
+    #     (see the code literals in openai/types/beta/threads/run.py)
+    #   - "rate_limit_error" / "overloaded_error" / "api_error":
+    #     Anthropic-shaped gateways (e.g. LiteLLM) proxying that vocabulary
+    #     unchanged onto OpenAI-compatible endpoints
+    # An exact-type check, not isinstance: APIStatusError subclasses (e.g.
+    # BadRequestError) must keep their status-based classification below.
     if openai is not None and type(exception) is openai.APIError:
-        return exception.type in {"server_error", "rate_limit_error"}
+        payload_type = getattr(exception, "type", None)
+        payload_code = getattr(exception, "code", None)
+        if payload_type is None:
+            # A mid-stream error whose payload carries no `type` — a
+            # non-object `error` value ("upstream overloaded" from an
+            # Ollama/vLLM gateway) or a shape like Azure's {"code": "429"} —
+            # is indistinguishable from a broken stream, and by the time a
+            # stream has started, auth and request validation have already
+            # passed. Treat it like the transport failures above rather
+            # than burning the run.
+            return True
+        retryable_markers = {
+            "server_error",
+            "internal_server_error",
+            "requests",
+            "tokens",
+            "rate_limit_exceeded",
+            "rate_limit_error",
+            "overloaded_error",
+            "api_error",
+        }
+        # `in` is type-agnostic: the SDK does not coerce, so a payload like
+        # {"type": 500} arrives as an int, simply misses the set, and stays
+        # fatal (unknown marker) rather than crashing the comparison.
+        return payload_type in retryable_markers or payload_code in retryable_markers
 
     error_type_name = type(exception).__name__
 

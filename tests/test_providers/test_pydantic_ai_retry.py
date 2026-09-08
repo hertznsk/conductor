@@ -229,8 +229,9 @@ class TestOpenAIErrorClassification:
         assert _is_retryable_error(_make_openai_status_error(429)) is True
 
     def test_raw_openai_stream_validation_error_is_fatal(self) -> None:
-        # Requirement: a structured client-side error inside an SSE stream must not
-        # become retryable merely because the SDK reports it as a base APIError.
+        # Requirement: a structured client-side error shaped like the one the
+        # SDK raises from an SSE body must not become retryable merely because
+        # the SDK reports it as a base APIError.
         error = openai.APIError(
             message="invalid request",
             request=_make_http_request(),
@@ -238,6 +239,179 @@ class TestOpenAIErrorClassification:
         )
 
         assert _is_retryable_error(error) is False
+
+    def test_raw_openai_stream_rate_limit_error_is_retryable(self) -> None:
+        # Requirement: a rate limit delivered mid-stream must be retryable in
+        # every shape OpenAI and Anthropic-shaped gateways send it. OpenAI's
+        # real 429 payload is type "requests"/"tokens" with code
+        # "rate_limit_exceeded" (literals in openai/types/beta/threads/run.py);
+        # "rate_limit_error" is the Anthropic vocabulary a gateway like
+        # LiteLLM proxies unchanged. The third row matches on the code marker
+        # alone — it is what pins "rate_limit_exceeded" in the retryable set.
+        request = _make_http_request()
+        for body in (
+            {"type": "requests", "code": "rate_limit_exceeded"},
+            {"type": "tokens", "code": "rate_limit_exceeded"},
+            {"type": "rate_limit_error"},
+            {"type": "throttled", "code": "rate_limit_exceeded"},
+        ):
+            error = openai.APIError("slow down", request, body=body)
+            assert _is_retryable_error(error) is True, body
+
+    def test_raw_openai_stream_gateway_overload_errors_are_retryable(self) -> None:
+        # Requirement: Anthropic-shaped gateways proxy their transient 5xx
+        # vocabulary ("overloaded_error", "api_error") onto OpenAI-compatible
+        # endpoints unchanged; both must retry.
+        request = _make_http_request()
+        for body in ({"type": "overloaded_error"}, {"type": "api_error"}):
+            error = openai.APIError("upstream overloaded", request, body=body)
+            assert _is_retryable_error(error) is True, body
+
+    @pytest.mark.parametrize(
+        "marker",
+        [
+            "server_error",
+            "internal_server_error",
+            "requests",
+            "tokens",
+            "rate_limit_exceeded",
+            "rate_limit_error",
+            "overloaded_error",
+            "api_error",
+        ],
+    )
+    def test_every_documented_stream_marker_is_retryable_as_type_and_code(
+        self, marker: str
+    ) -> None:
+        # Requirement: every marker in the retryable set is load-bearing in
+        # both payload positions the classifier checks, so deleting one from
+        # the set is a loud failure rather than a silent behavior change.
+        request = _make_http_request()
+        assert (
+            _is_retryable_error(openai.APIError("boom", request, body={"type": marker})) is True
+        ), marker
+        assert (
+            _is_retryable_error(
+                openai.APIError("boom", request, body={"type": "unrelated", "code": marker})
+            )
+            is True
+        ), marker
+
+    def test_openai_status_subclasses_are_not_captured_by_the_bare_arm(self) -> None:
+        # Requirement: the bare-APIError arm is an exact-type check — an
+        # APIStatusError subclass must keep its status-based classification
+        # even when its payload carries a marker from the retryable set (or
+        # a fatal one). This is the test that fails if the check is loosened
+        # to isinstance.
+        request = _make_http_request()
+        assert (
+            _is_retryable_error(
+                openai.BadRequestError(
+                    "bad",
+                    response=httpx.Response(400, request=request),
+                    body={"type": "server_error"},
+                )
+            )
+            is False
+        )
+        assert (
+            _is_retryable_error(
+                openai.InternalServerError(
+                    "boom",
+                    response=httpx.Response(500, request=request),
+                    body={"type": "invalid_request_error"},
+                )
+            )
+            is True
+        )
+
+    @pytest.mark.parametrize("body", [None, "upstream overloaded", [1, 2], {"code": "x"}])
+    def test_raw_openai_api_error_without_payload_type_is_retryable(self, body: object) -> None:
+        # Requirement: a mid-stream error with no parseable `type` — a
+        # non-object `error` value from an Ollama/vLLM gateway, or an
+        # Azure-style {"code": ...} shape — is treated like a broken stream
+        # (retryable), since auth and request validation have already passed
+        # once streaming starts.
+        assert _is_retryable_error(openai.APIError("boom", _make_http_request(), body=body)) is True
+
+    def test_raw_openai_api_error_with_non_string_type_is_fatal(self) -> None:
+        # Requirement: the SDK does not coerce `type` — a payload of
+        # {"type": 500} arrives as an int. It must not crash classification,
+        # and an unknown marker stays fatal.
+        assert (
+            _is_retryable_error(openai.APIError("boom", _make_http_request(), body={"type": 500}))
+            is False
+        )
+
+    def test_pydantic_ai_does_not_translate_bare_openai_api_error(self) -> None:
+        # Canary: the bare-APIError classification arm is only reachable while
+        # pydantic-ai's ``_map_api_errors`` lets a bare ``openai.APIError``
+        # through untranslated. If upstream widens its ``except`` clause, this
+        # test fails — and the fatal classification for client-side payload
+        # types must be revisited, because those errors would then arrive as
+        # ``ModelAPIError``, which is unconditionally retryable.
+        from pydantic_ai.models.openai import _map_api_errors
+
+        error = openai.APIError(
+            "boom",
+            _make_http_request(),
+            body={"type": "invalid_request_error"},
+        )
+        with pytest.raises(openai.APIError) as exc_info, _map_api_errors("gpt-4o"):
+            raise error
+        assert exc_info.value is error
+
+    def test_sdk_stream_error_payload_shape_is_what_we_classify(self) -> None:
+        # Canary: drive a real ``openai.Stream`` over an SSE body carrying an
+        # error event and assert the SDK puts the error object itself into
+        # ``APIError.body`` (so `.type` sits at the top level, which is what
+        # the classifier reads). If a future SDK release nests the payload one
+        # level deeper, `.type` becomes None and the marker-based
+        # classification silently stops matching — this test fails instead.
+        with openai.OpenAI(api_key="test-key") as client:
+            request = httpx.Request("POST", "http://example.com/v1/chat/completions")
+            response = httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=(
+                    b'data: {"error": {"type": "server_error", "message": "boom"}}\n\n'
+                    b"data: [DONE]\n\n"
+                ),
+                request=request,
+            )
+            stream = openai.Stream(cast_to=object, response=response, client=client)
+
+            with pytest.raises(openai.APIError) as exc_info:
+                for _ in stream:
+                    pass
+
+        assert exc_info.value.type == "server_error"
+        assert exc_info.value.body == {"type": "server_error", "message": "boom"}
+        assert _is_retryable_error(exc_info.value) is True
+
+    def test_sdk_stream_error_with_non_object_error_value(self) -> None:
+        # Canary: a gateway sending {"error": "upstream overloaded"} yields a
+        # bare APIError with .type None, the raw string body, and the SDK's
+        # fallback message — the exact shape the type-less retry branch
+        # exists for.
+        with openai.OpenAI(api_key="test-key") as client:
+            request = httpx.Request("POST", "http://example.com/v1/chat/completions")
+            response = httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=b'data: {"error": "upstream overloaded"}\n\ndata: [DONE]\n\n',
+                request=request,
+            )
+            stream = openai.Stream(cast_to=object, response=response, client=client)
+
+            with pytest.raises(openai.APIError) as exc_info:
+                for _ in stream:
+                    pass
+
+        assert exc_info.value.type is None
+        assert exc_info.value.body == "upstream overloaded"
+        assert str(exc_info.value) == "An error occurred during streaming"
+        assert _is_retryable_error(exc_info.value) is True
 
     def test_raw_openai_api_status_4xx_are_fatal(self) -> None:
         """Raw openai APIStatusError 400/401/403/404 must be fatal."""
@@ -357,8 +531,10 @@ class TestOpenAIErrorClassification:
 
     @pytest.mark.asyncio
     async def test_real_openai_stream_server_error_retries_once_then_succeeds(self) -> None:
-        # Requirement: a transient error delivered inside an OpenAI-compatible SSE stream
-        # must consume the configured retry attempt instead of failing after the first call.
+        # Requirement: a transient error shaped like the one the SDK raises
+        # from an SSE body must consume the configured retry attempt instead
+        # of failing after the first call. (The SDK's real SSE parsing is
+        # pinned separately by test_sdk_stream_error_payload_shape_is_what_we_classify.)
         attempts = 0
         request = _make_http_request()
         stream_error = openai.APIError(
