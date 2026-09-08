@@ -428,6 +428,25 @@ class AgentExecutor:
 
         # Render a new task or add one user turn to provider-owned state.
         if continuation_state is not None:
+            # Discarding the rendered prompt is only safe when the provider
+            # actually holds the completed conversation: the task, the
+            # workspace-instructions preamble, and the eager skill injection
+            # all live in that state, so this run sends only the follow-up
+            # turn. A provider that hands back state it cannot resume would
+            # otherwise reduce the model's input to the bare follow-up text.
+            if not self.provider.supports_continuation:
+                raise ExecutionError(
+                    f"Agent '{agent.name}': provider "
+                    f"'{type(self.provider).__name__}' returned continuation state "
+                    f"it cannot resume (supports_continuation=False). Continuing "
+                    f"would send the model only the follow-up turn, without the "
+                    f"original task prompt.",
+                    agent_name=agent.name,
+                    suggestion=(
+                        "A provider that cannot continue a completed run must "
+                        "leave AgentOutput.continuation_state unset."
+                    ),
+                )
             rendered_prompt = guidance_section or ""
         else:
             rendered_prompt = self.renderer.render(agent.prompt, context)

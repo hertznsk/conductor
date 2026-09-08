@@ -345,6 +345,26 @@ class AgentProvider(ABC):
         """
         return False
 
+    @property
+    def supports_continuation(self) -> bool:
+        """Whether the provider can resume a completed execution in memory.
+
+        When ``True``, a completed :meth:`execute` returns provider-opaque
+        state on :attr:`AgentOutput.continuation_state`, and handing that
+        state back to :meth:`execute` continues the completed conversation
+        with ``rendered_prompt`` as the next user turn. On that path the
+        :class:`~conductor.executor.agent.AgentExecutor` skips prompt
+        rendering entirely — the task, the workspace-instructions
+        preamble, and the eager skill injection all live in the
+        provider-held conversation already — so it refuses to discard the
+        rendered prompt unless the provider declares this property.
+
+        When ``False`` (default), the provider must leave
+        :attr:`AgentOutput.continuation_state` at ``None``; a follow-up
+        run then gets a freshly rebuilt prompt instead.
+        """
+        return False
+
     def __init_subclass__(cls, *, abstract: bool = False, **kwargs: Any) -> None:
         """Enforce that a production subclass declares what it can honour.
 

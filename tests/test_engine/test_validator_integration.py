@@ -151,7 +151,9 @@ class TestValidatorMainLoop:
                 model="gpt-4",
             )
 
-        engine, executor, agent = TestValidatorCostAndFailurePaths()._engine_and_executor(exec_fn)
+        engine, executor, agent = TestValidatorCostAndFailurePaths()._engine_and_executor(
+            exec_fn, continuation_capable=True
+        )
         original = AgentOutput(
             content={"summary": "draft"},
             raw_response="",
@@ -191,6 +193,9 @@ class TestValidatorMainLoop:
         # Primary ran twice (initial + re-run); validator graded once.
         assert primary_calls == 2
         assert result["summary"] == "answer 2"
+        # The stateless re-run rebuilds the full prompt: the second prompt is
+        # the first prompt plus the feedback, never a feedback-only stub.
+        assert primary_prompts[1].startswith(primary_prompts[0])
         # Re-run prompt carries the validation feedback section + the issue.
         assert "## Validation feedback" in primary_prompts[1]
         assert "missing null-safety check" in primary_prompts[1]
@@ -429,7 +434,7 @@ class TestValidatorCostAndFailurePaths:
     """
 
     def _engine_and_executor(
-        self, exec_fn: Any, *, timeout_seconds: float | None = None
+        self, exec_fn: Any, *, timeout_seconds: float | None = None, continuation_capable: bool = False
     ) -> tuple[WorkflowEngine, AgentExecutor, AgentDef]:
         agent = AgentDef(
             name="reviewer",
@@ -451,7 +456,16 @@ class TestValidatorCostAndFailurePaths:
             agents=[agent],
             output={"summary": "{{ reviewer.output.summary }}"},
         )
-        provider = CopilotProvider(mock_handler=lambda a, p, c: {})
+
+        class _CapableCopilotProvider(CopilotProvider, abstract=True):
+            # Test double for continuation tests: declares the support the
+            # executor's guard requires so the state is let through.
+            @property
+            def supports_continuation(self) -> bool:
+                return True
+
+        provider_cls = _CapableCopilotProvider if continuation_capable else CopilotProvider
+        provider = provider_cls(mock_handler=lambda a, p, c: {})
         provider.execute = exec_fn  # type: ignore[method-assign]
         engine = WorkflowEngine(config, provider)
         executor = AgentExecutor(provider, workflow_tools=[])
@@ -583,7 +597,7 @@ class TestValidatorCostAndFailurePaths:
             seen_states.append(continuation_state)
             raise RuntimeError("continuation rerun boom")
 
-        engine, executor, agent = self._engine_and_executor(exec_fn)
+        engine, executor, agent = self._engine_and_executor(exec_fn, continuation_capable=True)
         original = AgentOutput(
             content={"summary": "orig"},
             raw_response="",

@@ -172,6 +172,11 @@ class OpenAIProvider(AgentProvider):
         """OpenAI has no native plugin/subagent surface."""
         return False
 
+    @property
+    def supports_continuation(self) -> bool:
+        """Pydantic AI message history resumes a completed run in memory."""
+        return True
+
     def __init__(
         self,
         api_key: str | None = None,
