@@ -47,6 +47,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entirely. See
   [`examples/claude-agent-sdk-setting-sources.yaml`](examples/claude-agent-sdk-setting-sources.yaml).
 
+### Fixed
+
+- **Context compaction window guard against token-dense drift** (#507) — the
+  `claude` / `openai` providers' compaction trigger anchors on
+  provider-reported token usage and estimates everything after the anchor
+  with a ~4-characters-per-token heuristic, which undercounts token-dense
+  content (CJK and other non-Latin scripts, base64, hex, minified data) by
+  2-4x. A dense suffix could therefore grow the real request past a known
+  context window while the trigger estimate stayed below the threshold, and
+  the provider rejected the request with `context_length_exceeded`. A second,
+  density-calibrated estimate now guards the hard window: it matches the
+  primary heuristic on ordinary prose, counts text with a substantial
+  non-ASCII share at ~1 token per character, and whitespace-poor ASCII blobs
+  at ~2 characters per token, so it fires only on genuinely dense content —
+  never on a history that is merely large. When it fires, the tier chain is
+  driven directly against that measurement (the inner strategy's own gate
+  would re-measure with the same heuristic that under-counted the content
+  and no-op), until the estimate is back under the target. Telemetry stays on
+  the token scale: `agent_compaction_start` gains `trigger_reason`
+  (`"trigger"` / `"window_guard"`) and a separate `density_tokens` field
+  instead of overloading `tokens_before`, and `agent_compaction_complete`
+  gains `degraded_estimators` and `still_over_window` so a guard compaction
+  that could not get back under the window reads as degraded, not as false
+  success. A failed primary measurement falls back to an independent
+  density-calibrated estimate that shares no code with it, and a double
+  failure is reported as a new `agent_compaction_skipped` event
+  (`reason: "estimate_unavailable"`) rather than vanishing into stderr. See
+  [Workflow Syntax → Context Compaction](docs/workflow-syntax.md#context-compaction).
+
 ## [0.1.36](https://github.com/microsoft/conductor/compare/v0.1.35...v0.1.36) - 2026-09-02
 
 ### Added
