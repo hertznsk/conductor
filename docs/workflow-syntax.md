@@ -1227,7 +1227,7 @@ agents:
 1. The primary agent runs and produces output.
 2. The validator runs a second LLM call that receives the agent's rendered prompt, its output, and the `criteria`, and must answer `{ "passed": bool, "issues": [str, ...] }`.
 3. If `passed` is true, the output flows downstream unchanged.
-4. If `passed` is false and `max_retries > 0`, the agent re-runs once with a `## Validation feedback` section (the issues) appended to its prompt. The second output is taken as final — there is no second validation loop. On the `claude` and `openai` providers this correction continues the completed agent conversation, preserving prior model and tool messages while sending only the validation feedback as the next user turn. Other providers keep their existing re-run behavior.
+4. If `passed` is false and `max_retries > 0`, the agent re-runs once with a `## Validation feedback` section (the issues) appended to its prompt. The second output is taken as final — there is no second validation loop. On the `claude`, `openai`, and `hermes` providers this correction continues the completed agent conversation, preserving prior model and tool messages while sending only the validation feedback as the next user turn. Other providers keep their existing re-run behavior.
 
    The continuation trade-off: the re-run carries the entire first conversation, including every tool exchange, so an agent that already burned most of its context window on the first attempt can overflow on the retry where a rebuilt prompt would have fit. When the re-run itself fails, the original output is kept and the failure is reported on the `agent_validation_failed` event (with the error) and in the console log.
 

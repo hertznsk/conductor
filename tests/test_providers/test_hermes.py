@@ -528,6 +528,118 @@ class TestHermesExecute:
         asyncio.run(run_with_pre_set_interrupt())
 
 
+class TestHermesContinuation:
+    """Continuation state carries the completed run's messages into the next turn."""
+
+    @pytest.fixture()
+    def provider(self) -> HermesProvider:
+        with (
+            patch("conductor.providers.hermes.HERMES_SDK_AVAILABLE", True),
+            patch("conductor.providers.hermes.AIAgent"),
+        ):
+            return HermesProvider(model="anthropic/claude-sonnet-4", max_agent_iterations=10)
+
+    def _run(self, coro: Any) -> Any:
+        return asyncio.run(coro)
+
+    def test_completed_run_exposes_messages_as_continuation_state(
+        self, provider: HermesProvider
+    ) -> None:
+        # Requirement: a completed run's message list is resumable as
+        # continuation state.
+        history = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": '{"answer": "pong"}'},
+        ]
+        result_dict = _make_result(final_response='{"answer": "pong"}')
+        result_dict["messages"] = history
+        agent = _make_agent(output={"answer": OutputField(type="string")})
+
+        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
+            mock_instance = Mock()
+            mock_instance.run_conversation.return_value = result_dict
+            mock_cls.return_value = mock_instance
+
+            output = self._run(provider.execute(agent, {}, "answer this"))
+
+        assert output.continuation_state is history
+
+    def test_continuation_state_is_forwarded_as_conversation_history(
+        self, provider: HermesProvider
+    ) -> None:
+        # Requirement: continuation_state handed to execute() reaches
+        # run_conversation as conversation_history, with rendered_prompt as
+        # the sole new user turn — the inbound half of the contract.
+        history = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "draft"},
+        ]
+        result_dict = _make_result(final_response="revised")
+        captured: dict[str, Any] = {}
+
+        def fake_run_conv(prompt: str, **kwargs: Any) -> dict[str, Any]:
+            captured["prompt"] = prompt
+            captured.update(kwargs)
+            return result_dict
+
+        agent = _make_agent()
+        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
+            mock_instance = Mock()
+            mock_instance.run_conversation.side_effect = fake_run_conv
+            mock_cls.return_value = mock_instance
+
+            self._run(
+                provider.execute(agent, {}, "validation feedback", continuation_state=history)
+            )
+
+        assert captured["conversation_history"] is history
+        assert captured["prompt"] == "validation feedback"
+
+    def test_parse_recovery_run_leaves_continuation_state_unset(
+        self, provider: HermesProvider
+    ) -> None:
+        # Requirement: an output recovered by a fresh correction conversation
+        # is not resumable from the original run's messages — those end in
+        # the unrecovered answer, not the one the validator graded.
+        schema = {"answer": OutputField(type="string")}
+        agent = _make_agent(output=schema)
+        responses = iter(
+            [
+                _make_result(final_response='{"wrong": "field"}'),
+                _make_result(final_response='{"answer": "fixed"}'),
+            ]
+        )
+
+        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
+            mock_instance = Mock()
+            mock_instance.run_conversation.side_effect = lambda *a, **k: next(responses)
+            mock_cls.return_value = mock_instance
+
+            output = self._run(provider.execute(agent, {}, "answer this"))
+
+        assert output.content == {"answer": "fixed"}
+        assert output.continuation_state is None
+
+    def test_partial_run_leaves_continuation_state_unset(self, provider: HermesProvider) -> None:
+        # Requirement: a partial (interrupted) run has no completed
+        # conversation to resume.
+        result_dict = _make_result(final_response="partial text", partial=True)
+        result_dict["messages"] = [{"role": "user", "content": "task"}]
+        agent = _make_agent()
+
+        with patch("conductor.providers.hermes.AIAgent") as mock_cls:
+            mock_instance = Mock()
+            mock_instance.run_conversation.return_value = result_dict
+            mock_cls.return_value = mock_instance
+
+            output = self._run(provider.execute(agent, {}, "say hello"))
+
+        assert output.partial is True
+        assert output.continuation_state is None
+
+
 class TestHermesSystemPrompt:
     def test_system_prompt_forwarded(self) -> None:
         with (

@@ -1118,7 +1118,7 @@ class TestContinuationState:
             {"rendered_prompt": "FEEDBACK", "context_keys": ["workflow"], "continuation": True}
         ]
 
-    def test_continuation_support_is_declared_only_by_pydantic_providers(self) -> None:
+    def test_continuation_support_is_declared_only_by_conversation_providers(self) -> None:
         # Requirement: only providers able to resume a completed conversation
         # override the base declaration; everyone else inherits False.
         from conductor.providers.aca import AcaRuntimeProvider
@@ -1129,6 +1129,7 @@ class TestContinuationState:
 
         assert ClaudeProvider.supports_continuation is not AgentProvider.supports_continuation
         assert OpenAIProvider.supports_continuation is not AgentProvider.supports_continuation
-        for cls in (CopilotProvider, HermesProvider, AcaRuntimeProvider, ClaudeAgentSdkProvider):
+        assert HermesProvider.supports_continuation is not AgentProvider.supports_continuation
+        for cls in (CopilotProvider, AcaRuntimeProvider, ClaudeAgentSdkProvider):
             assert cls.supports_continuation is AgentProvider.supports_continuation
         assert CopilotProvider(mock_handler=lambda a, p, c: {}).supports_continuation is False
