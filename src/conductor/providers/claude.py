@@ -1082,6 +1082,10 @@ class ClaudeProvider(AgentProvider):
                 :class:`AgentExecutor` refuses ``plugins:`` on this
                 provider before reaching here and this is always ``None``.
             extra_mcp_servers: Ignored, for the same reason.
+            continuation_state: Optional Pydantic AI message history from a
+                completed run on this provider. When provided, the run
+                continues that conversation with ``rendered_prompt`` as the
+                next user turn (``supports_continuation`` is ``True``).
 
         Returns:
             Normalized AgentOutput with structured content.

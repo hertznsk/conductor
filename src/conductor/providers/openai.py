@@ -905,6 +905,10 @@ class OpenAIProvider(AgentProvider):
                 executor has already eager-injected skill content into the prompt.
             custom_agents: Ignored. ``plugins=False``.
             extra_mcp_servers: Ignored. ``plugins=False``.
+            continuation_state: Optional Pydantic AI message history from a
+                completed run on this provider. When provided, the run
+                continues that conversation with ``rendered_prompt`` as the
+                next user turn (``supports_continuation`` is ``True``).
 
         Returns:
             Normalized AgentOutput with structured content.

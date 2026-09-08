@@ -807,7 +807,11 @@ class ClaudeAgentSdkProvider(AgentProvider):
         output. ``context`` is unused — the executor renders the prompt before
         it reaches any provider. The SDK-availability check lives in
         :meth:`_execute_session`, alongside the symbols it guards.
+        ``continuation_state`` is ignored: the CLI owns its transcripts, so
+        ``supports_continuation`` is ``False``, this provider never populates
+        ``AgentOutput.continuation_state``, and it is never handed one back.
         """
+        del continuation_state  # No continuation surface (see docstring).
         # Resolved before anything else so the session slot is known: the slot
         # is ``(session_key, cwd)``, and a claim taken later would leave the
         # window it exists to close.

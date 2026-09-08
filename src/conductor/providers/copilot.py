@@ -860,6 +860,11 @@ class CopilotProvider(AgentProvider):
             extra_mcp_servers: Optional MCP servers contributed by the
                 agent's effective ``plugins:``, merged on top of the
                 workflow's own ``runtime.mcp_servers`` for this call.
+            continuation_state: Ignored. Copilot has no in-memory
+                continuation surface (``supports_continuation`` is
+                ``False``), so it never populates
+                ``AgentOutput.continuation_state`` and is never handed one
+                back.
 
         Returns:
             Normalized AgentOutput with structured content.
@@ -867,6 +872,7 @@ class CopilotProvider(AgentProvider):
         Raises:
             ProviderError: If execution fails after all retry attempts.
         """
+        del continuation_state  # No continuation surface (see docstring).
         # Record the call for testing purposes
         self._call_history.append(
             {

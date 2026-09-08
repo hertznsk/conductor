@@ -4004,8 +4004,12 @@ class WorkflowEngine:
         4. Otherwise emit ``agent_validation_failed`` (always, on every
            failure — including ``max_retries == 0``). When ``max_retries > 0``,
            re-run the primary agent exactly once with a ``## Validation
-           feedback`` section appended and take the re-run output as final
-           (no second validation loop). When ``max_retries == 0``, return
+           feedback`` section and take the re-run output as final
+           (no second validation loop). The re-run continues the provider's
+           in-memory conversation when the primary output carries a
+           ``continuation_state`` (the feedback is the sole new user turn),
+           and rebuilds the prompt statelessly with the feedback appended
+           otherwise. When ``max_retries == 0``, return
            ``output`` unchanged.
 
         Validation is fail-open: a validator error never blocks the workflow
@@ -4026,7 +4030,9 @@ class WorkflowEngine:
             agent_context: Context the primary agent executed against.
             executor: Executor (and provider) for the primary agent.
             guidance_section: Any guidance already appended to the primary
-                prompt; the validation feedback is appended after it on re-run.
+                prompt. On a stateless re-run the validation feedback is
+                appended after it; on a continuation re-run it is already
+                inside the provider-held conversation and is not re-sent.
             event_callback: Callback used to emit validator events and stream
                 re-run events with the correct agent/item tagging. May be
                 ``None`` when no emitter is configured.
@@ -4205,7 +4211,12 @@ class WorkflowEngine:
 
     @staticmethod
     def _build_validation_feedback(issues: list[str]) -> str:
-        """Build the ``## Validation feedback`` section appended on re-run."""
+        """Build the ``## Validation feedback`` section for the re-run.
+
+        Prefixed with newlines for the append case (stateless re-run);
+        callers handing it to a continuation re-run strip them, since the
+        section is then the entire user turn.
+        """
         if issues:
             bullets = "\n".join(f"- {issue}" for issue in issues)
         else:

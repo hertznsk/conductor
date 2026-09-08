@@ -234,6 +234,11 @@ class HermesProvider(AgentProvider):
                 :class:`AgentExecutor` refuses ``plugins:`` on this
                 provider before reaching here and this is always ``None``.
             extra_mcp_servers: Ignored, for the same reason.
+            continuation_state: Ignored. Hermes has no in-memory
+                continuation surface (``supports_continuation`` is
+                ``False``), so it never populates
+                ``AgentOutput.continuation_state`` and is never handed one
+                back.
 
         Returns:
             Normalized AgentOutput with structured content.
@@ -244,6 +249,7 @@ class HermesProvider(AgentProvider):
             ValidationError: If output doesn't match the declared schema.
         """
         del skill_directories  # Hermes relies on eager preamble injection (see docstring).
+        del continuation_state  # No continuation surface (see docstring).
         # Resolve per-agent overrides
         resolved_model = agent.model or self._default_model
         resolved_max_iter = (

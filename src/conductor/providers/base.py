@@ -182,7 +182,15 @@ class AgentOutput:
     FR7). ``None`` for providers with no distinct sandbox time to report."""
 
     continuation_state: object | None = None
-    """Provider-specific state for continuing this completed execution in memory."""
+    """Provider-specific state for continuing this completed execution in memory.
+
+    Populated only by providers that declare
+    :attr:`AgentProvider.supports_continuation`; every other provider leaves
+    it ``None``, the first-class "rebuild the prompt statelessly" signal the
+    executor branches on. The value is provider-opaque: it must never be
+    handed to a different provider, and it is in-memory only — it is never
+    serialized to checkpoints or event logs.
+    """
 
 
 @dataclass(frozen=True)
@@ -480,9 +488,12 @@ class AgentProvider(ABC):
                 only. Per-call rather than per-provider because
                 ``plugins:`` is a per-agent field and providers are
                 cached per type.
-            continuation_state: Optional provider-specific state from a completed
-                execution. Providers that support in-memory continuation resume it
-                with ``rendered_prompt`` as the next user turn.
+            continuation_state: Optional provider-specific state from a
+                completed execution. Providers that declare
+                :attr:`supports_continuation` resume it with
+                ``rendered_prompt`` as the next user turn; every other
+                provider ignores it and leaves
+                :attr:`AgentOutput.continuation_state` at ``None``.
 
         Returns:
             Normalized AgentOutput with structured content.
