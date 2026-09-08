@@ -181,7 +181,7 @@ class AgentOutput:
     """Sandbox wall-clock time reported by a remote-runtime provider (issue #284,
     FR7). ``None`` for providers with no distinct sandbox time to report."""
 
-    continuation_state: Any = None
+    continuation_state: object | None = None
     """Provider-specific state for continuing this completed execution in memory."""
 
 
@@ -442,7 +442,7 @@ class AgentProvider(ABC):
         skill_directories: list[str] | None = None,
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
-        continuation_state: Any = None,
+        continuation_state: object | None = None,
     ) -> AgentOutput:
         """Execute an agent and return normalized output.
 

@@ -2758,7 +2758,7 @@ def build_dry_run_plan(workflow_path: Path) -> ExecutionPlan:
             skill_directories: list[str] | None = None,
             custom_agents: list[dict[str, Any]] | None = None,
             extra_mcp_servers: dict[str, Any] | None = None,
-            continuation_state: Any = None,
+            continuation_state: object | None = None,
         ) -> AgentOutput:
             return AgentOutput(content={}, raw_response="")
 

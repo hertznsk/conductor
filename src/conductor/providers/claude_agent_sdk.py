@@ -797,7 +797,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
         skill_directories: list[str] | None = None,
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
-        continuation_state: Any = None,
+        continuation_state: object | None = None,
     ) -> AgentOutput:
         """Run one agent, holding its ``session_key`` slot for the duration.
 

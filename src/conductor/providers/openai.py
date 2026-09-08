@@ -21,7 +21,7 @@ import asyncio
 import inspect
 import logging
 import os
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import BaseModel
 
@@ -43,6 +43,10 @@ from conductor.providers.capabilities import ProviderCapabilities
 from conductor.providers.reasoning import ReasoningEffort, resolve_reasoning_effort
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from pydantic_ai.messages import ModelMessage
+
     from conductor.engine.pricing import ModelPricing
 
 
@@ -885,7 +889,7 @@ class OpenAIProvider(AgentProvider):
         skill_directories: list[str] | None = None,
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
-        continuation_state: Any = None,
+        continuation_state: object | None = None,
     ) -> AgentOutput:
         """Execute an agent using the shared Pydantic AI pipeline.
 
@@ -1042,6 +1046,11 @@ class OpenAIProvider(AgentProvider):
 
         self._retry_history.clear()
 
+        # continuation_state is ``object`` at the AgentOutput boundary because
+        # the value is provider-opaque; on this provider it can only be the
+        # ``all_messages()`` list a prior execute() produced.
+        message_history = cast("Sequence[ModelMessage] | None", continuation_state)
+
         return await run_agent_pipeline(
             agent=agent,
             rendered_prompt=rendered_prompt,
@@ -1056,6 +1065,6 @@ class OpenAIProvider(AgentProvider):
             default_model=self._default_model,
             retry_history=self._retry_history,
             build_agent_fn=build_agent_fn,
-            message_history=continuation_state,
+            message_history=message_history,
             compaction=compaction_cfg,
         )

@@ -103,7 +103,7 @@ def build_agent_output(
     usage: RunUsage | None = None,
     model: str | None = None,
     last_call_input_tokens: int | None = None,
-    continuation_state: Any = None,
+    continuation_state: object | None = None,
 ) -> AgentOutput:
     """Build a normalized ``AgentOutput`` from Pydantic AI result pieces.
 

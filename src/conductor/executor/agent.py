@@ -346,7 +346,7 @@ class AgentExecutor:
         guidance_section: str | None = None,
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
-        continuation_state: Any = None,
+        continuation_state: object | None = None,
     ) -> AgentOutput:
         """Execute an agent with the given context.
 
