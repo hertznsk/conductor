@@ -4129,17 +4129,26 @@ class WorkflowEngine:
             return output
 
         feedback = self._build_validation_feedback(outcome.issues)
-        new_guidance = (guidance_section or "") + feedback
+        continuation_state = output.continuation_state
+        if continuation_state is None:
+            # Stateless re-run: the whole prompt is rebuilt, so the feedback
+            # lands after any guidance already appended to the primary prompt.
+            rerun_guidance = (guidance_section or "") + feedback
+        else:
+            # The provider still holds the first run's conversation, which
+            # already contains the rendered prompt *and* guidance_section —
+            # re-sending either would duplicate it. The feedback is the sole
+            # new user turn, lstripped because _build_validation_feedback
+            # prefixes newlines for the append case.
+            rerun_guidance = feedback.lstrip()
         try:
             new_output = await self._execute_with_agent_timeout(
                 agent,
                 executor.execute(
                     agent,
                     agent_context,
-                    guidance_section=(
-                        feedback.lstrip() if output.continuation_state is not None else new_guidance
-                    ),
-                    continuation_state=output.continuation_state,
+                    guidance_section=rerun_guidance,
+                    continuation_state=continuation_state,
                     interrupt_signal=self._interrupt_event,
                     event_callback=event_callback,
                 ),
