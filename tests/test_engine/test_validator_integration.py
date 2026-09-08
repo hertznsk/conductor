@@ -554,6 +554,11 @@ class TestValidatorCostAndFailurePaths:
         assert len(vrows) == 1  # only the grading call
         failed = [d for (e, d) in events if e == "agent_validation_failed"]
         assert any(d.get("rerun_errored") for d in failed)
+        # The rerun-errored emission carries the failure cause, so the one
+        # user-visible surface says *why* the re-run failed, not just *that*.
+        rerun_failed = next(d for d in failed if d.get("rerun_errored"))
+        assert rerun_failed["error"] == "RuntimeError: rerun boom"
+        assert rerun_failed["continued"] is False
 
         # Requirement (issue #357): the handled fail-open path must not print a
         # traceback at WARNING level — a concise warning names the exception, and
@@ -608,11 +613,19 @@ class TestValidatorCostAndFailurePaths:
             model="gpt-4",
             continuation_state=continuation,
         )
+        events: list[tuple[str, dict[str, Any]]] = []
 
-        result = await engine._apply_validator(agent, original, 0.5, {}, executor, None, None)
+        result = await engine._apply_validator(
+            agent, original, 0.5, {}, executor, None, lambda e, d: events.append((e, d))
+        )
 
         assert result is original
         assert seen_states == [continuation]
+        rerun_failed = next(
+            d for (e, d) in events if e == "agent_validation_failed" and d.get("rerun_errored")
+        )
+        assert rerun_failed["error"] == "RuntimeError: continuation rerun boom"
+        assert rerun_failed["continued"] is True
 
     @pytest.mark.asyncio
     async def test_partial_rerun_keeps_original(self) -> None:

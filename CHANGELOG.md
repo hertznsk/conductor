@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now continues with the completed Pydantic AI message history and sends validation
   feedback as the next user turn. This preserves prior reasoning and tool exchanges
   without repeating the original prompt, workspace instructions, or injected skills.
+  A failed re-run now reports its cause on the `agent_validation_failed` event and in
+  the console log, and the dashboard keeps the agent's original prompt visible instead
+  of replacing it with the feedback-only turn.
 
 ### Added
 

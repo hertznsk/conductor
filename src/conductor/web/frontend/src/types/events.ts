@@ -567,6 +567,10 @@ export interface AgentValidationFailedData {
   /** True on the second emission, when the feedback re-run itself failed and
    *  the original (failing) output was kept. */
   rerun_errored?: boolean;
+  /** Why the feedback re-run failed ("TypeError: ..."); set with rerun_errored. */
+  error?: string;
+  /** Whether the re-run continued the provider-held conversation. */
+  continued?: boolean;
 }
 
 // --- Compaction events ---

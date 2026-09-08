@@ -1085,6 +1085,8 @@ class ConsoleEventSubscriber:
             )
             for issue in issues:
                 verbose_log(f"    - {issue}", style="dim")
+            if d.get("rerun_errored") and d.get("error"):
+                verbose_log(f"    cause: {d.get('error')}", style=style)
 
         elif t == "skill_injection_warning":
             # Only reaches the console through this branch: the executor's

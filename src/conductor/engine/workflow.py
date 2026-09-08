@@ -4177,7 +4177,16 @@ class WorkflowEngine:
             )
             _emit_v(
                 "agent_validation_failed",
-                {"issues": outcome.issues, "will_retry": False, "rerun_errored": True},
+                {
+                    "issues": outcome.issues,
+                    "will_retry": False,
+                    "rerun_errored": True,
+                    # The one user-visible surface for this failure: without
+                    # the cause the event says *that* the re-run failed but
+                    # never *why*.
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "continued": output.continuation_state is not None,
+                },
             )
             return output
 

@@ -2642,7 +2642,10 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
         : data.will_retry
           ? 're-running once with feedback'
           : 'validation failed (no retry)',
-      detail: data.issues && data.issues.length ? data.issues.join('\n') : null,
+      detail: [
+        ...(data.issues && data.issues.length ? [data.issues.join('\n')] : []),
+        ...(rerunErrored && data.error ? [`cause: ${data.error}`] : []),
+      ].join('\n') || null,
     };
     addActivity(t.nodes, data.agent_name, entry);
     if (itemKey != null) {
