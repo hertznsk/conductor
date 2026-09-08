@@ -465,6 +465,10 @@ class AgentExecutor:
                     {
                         "rendered_prompt": rendered_prompt,
                         "context_keys": list(context.keys()) if isinstance(context, dict) else [],
+                        # On the continuation path rendered_prompt is only the
+                        # new follow-up turn; the flag lets consumers append it
+                        # to the original prompt instead of replacing it.
+                        "continuation": continuation_state is not None,
                     },
                 )
 

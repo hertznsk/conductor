@@ -205,6 +205,7 @@ export interface AgentPromptRenderedData {
   agent_name: string;
   rendered_prompt: string;
   context_keys?: string[];
+  continuation?: boolean;
 }
 
 export interface AgentReasoningData {

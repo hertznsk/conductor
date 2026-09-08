@@ -1100,16 +1100,23 @@ class TestContinuationState:
             name="test", model="gpt-4", prompt="Do {{ workflow.input.x }}", output=None
         )
         sentinel = object()
+        emitted: list[dict[str, Any]] = []
 
         await executor.execute(
             agent,
             {"workflow": {"input": {"x": "things"}}},
             guidance_section="FEEDBACK",
             continuation_state=sentinel,
+            event_callback=lambda t, d: emitted.append(d) if t == "agent_prompt_rendered" else None,
         )
 
         assert captured["prompt"] == "FEEDBACK"
         assert captured["state"] is sentinel
+        # The rendered-prompt event is tagged so the dashboard appends the
+        # follow-up turn to the original prompt instead of replacing it.
+        assert emitted == [
+            {"rendered_prompt": "FEEDBACK", "context_keys": ["workflow"], "continuation": True}
+        ]
 
     def test_continuation_support_is_declared_only_by_pydantic_providers(self) -> None:
         # Requirement: only providers able to resume a completed conversation
