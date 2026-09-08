@@ -77,6 +77,45 @@ class TestExecuteHappyPath:
         # Requirement: completed Pydantic AI runs expose resumable message history.
         assert output.continuation_state is not None
 
+    async def test_execute_continuation_state_reaches_the_pydantic_run(
+        self, provider: ClaudeProvider, no_mcp_manager: Any
+    ) -> None:
+        # Requirement: continuation_state handed to execute() is forwarded as
+        # message_history into the Pydantic AI run — the inbound half of the
+        # continuation contract, with user_prompt as the sole new turn.
+        agent = AgentDef(name="greeter", model="test", prompt="say hi")
+        with patch(
+            "conductor.providers._pydantic_ai.agent_builder.build_agent",
+            return_value=_build_text_agent("first"),
+        ):
+            first = await provider.execute(agent, {}, "say hi")
+        history = first.continuation_state
+
+        from conductor.providers._pydantic_ai import interrupt as interrupt_mod
+
+        real_run_with_interrupt = interrupt_mod.run_with_interrupt
+        captured: dict[str, Any] = {}
+
+        async def spy_run_with_interrupt(*args: Any, **kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return await real_run_with_interrupt(*args, **kwargs)
+
+        with (
+            patch(
+                "conductor.providers._pydantic_ai.agent_builder.build_agent",
+                return_value=_build_text_agent("corrected"),
+            ),
+            patch.object(interrupt_mod, "run_with_interrupt", new=spy_run_with_interrupt),
+        ):
+            second = await provider.execute(
+                agent, {}, "validation feedback", continuation_state=history
+            )
+
+        assert captured["message_history"] is history
+        assert captured["user_prompt"] == "validation feedback"
+        continued = second.continuation_state
+        assert continued[: len(history)] == history
+
 
 class TestExecuteStructuredOutput:
     """Tests for the structured-output execute() path."""
