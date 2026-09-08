@@ -342,10 +342,11 @@ class AgentExecutor:
         self,
         agent: AgentDef,
         context: dict[str, Any],
+        *,
         guidance_section: str | None = None,
-        continuation_state: Any = None,
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
+        continuation_state: Any = None,
     ) -> AgentOutput:
         """Execute an agent with the given context.
 
@@ -544,33 +545,19 @@ class AgentExecutor:
                 f"{len(extra_mcp_servers or {})} MCP server(s) forwarded"
             )
 
-        # Execute via provider. Keep the existing call shape unless this is a
-        # provider-owned continuation, so external providers remain compatible.
-        if continuation_state is None:
-            output = await self.provider.execute(
-                agent=agent,
-                context=context,
-                rendered_prompt=rendered_prompt,
-                tools=resolved_tools,
-                interrupt_signal=interrupt_signal,
-                event_callback=event_callback,
-                skill_directories=skill_dirs,
-                custom_agents=custom_agents,
-                extra_mcp_servers=extra_mcp_servers,
-            )
-        else:
-            output = await self.provider.execute(
-                agent=agent,
-                context=context,
-                rendered_prompt=rendered_prompt,
-                tools=resolved_tools,
-                interrupt_signal=interrupt_signal,
-                event_callback=event_callback,
-                skill_directories=skill_dirs,
-                custom_agents=custom_agents,
-                continuation_state=continuation_state,
-                extra_mcp_servers=extra_mcp_servers,
-            )
+        # Execute via provider
+        output = await self.provider.execute(
+            agent=agent,
+            context=context,
+            rendered_prompt=rendered_prompt,
+            tools=resolved_tools,
+            interrupt_signal=interrupt_signal,
+            event_callback=event_callback,
+            skill_directories=skill_dirs,
+            custom_agents=custom_agents,
+            extra_mcp_servers=extra_mcp_servers,
+            continuation_state=continuation_state,
+        )
 
         # Ensure output.content is a dict
         if not isinstance(output.content, dict):

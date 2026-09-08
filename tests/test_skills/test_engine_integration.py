@@ -58,6 +58,7 @@ class _CapturingProvider(AgentProvider, abstract=True):
         skill_directories: list[str] | None = None,
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
+        continuation_state: Any = None,
     ) -> AgentOutput:
         self.skill_directories = skill_directories
         self.rendered_prompt = rendered_prompt

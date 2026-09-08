@@ -887,6 +887,7 @@ class _StubProvider(AgentProvider, abstract=True):
         skill_directories: list[str] | None = None,
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
+        continuation_state: Any = None,
     ) -> AgentOutput:
         return AgentOutput(content={"answer": "ok"}, raw_response="")
 
@@ -1095,7 +1096,9 @@ class TestContinuationState:
 
         provider.execute = exec_fn  # type: ignore[method-assign]
         executor = AgentExecutor(provider, instructions_preamble="WORKSPACE INSTRUCTIONS\n")
-        agent = AgentDef(name="test", model="gpt-4", prompt="Do {{ workflow.input.x }}", output=None)
+        agent = AgentDef(
+            name="test", model="gpt-4", prompt="Do {{ workflow.input.x }}", output=None
+        )
         sentinel = object()
 
         await executor.execute(

@@ -790,13 +790,14 @@ class ClaudeAgentSdkProvider(AgentProvider):
         agent: AgentDef,
         context: dict[str, Any],
         rendered_prompt: str,
+        *,
         tools: list[str] | None = None,
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
         custom_agents: list[dict[str, Any]] | None = None,
-        continuation_state: Any = None,
         extra_mcp_servers: dict[str, Any] | None = None,
+        continuation_state: Any = None,
     ) -> AgentOutput:
         """Run one agent, holding its ``session_key`` slot for the duration.
 

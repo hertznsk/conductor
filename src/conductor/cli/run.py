@@ -2751,13 +2751,14 @@ def build_dry_run_plan(workflow_path: Path) -> ExecutionPlan:
             agent: AgentDef,
             context: dict[str, Any],
             rendered_prompt: str,
+            *,
             tools: list[str] | None = None,
             interrupt_signal: asyncio.Event | None = None,
             event_callback: Any = None,
             skill_directories: list[str] | None = None,
             custom_agents: list[dict[str, Any]] | None = None,
-            continuation_state: Any = None,
             extra_mcp_servers: dict[str, Any] | None = None,
+            continuation_state: Any = None,
         ) -> AgentOutput:
             return AgentOutput(content={}, raw_response="")
 

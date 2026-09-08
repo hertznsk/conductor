@@ -434,7 +434,11 @@ class TestValidatorCostAndFailurePaths:
     """
 
     def _engine_and_executor(
-        self, exec_fn: Any, *, timeout_seconds: float | None = None, continuation_capable: bool = False
+        self,
+        exec_fn: Any,
+        *,
+        timeout_seconds: float | None = None,
+        continuation_capable: bool = False,
     ) -> tuple[WorkflowEngine, AgentExecutor, AgentDef]:
         agent = AgentDef(
             name="reviewer",
