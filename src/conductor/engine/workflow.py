@@ -134,6 +134,16 @@ class WebPauseOutcome:
     """Guidance text(s) submitted while paused, in submission order. Empty
     when the pause was resolved by a plain Resume click or disconnect."""
 
+    reason: Literal["resume", "guidance", "disconnect", "unavailable"] = "unavailable"
+    """Why the pause resolved (or didn't). ``resume`` / ``guidance`` are
+    explicit user decisions; ``disconnect`` means every browser client went
+    away mid-pause; ``unavailable`` means no pause was presented (no
+    dashboard, or a dashboard with zero connected clients). Callers whose
+    interrupted work has unknown external side effects (an in-flight
+    ``type: mcp`` tool call) must re-execute only on ``resume`` /
+    ``guidance`` and park the run on the other two; the LLM path keeps its
+    auto-resume behaviour on all of them."""
+
 
 @dataclass
 class ParallelAgentError:
@@ -354,6 +364,30 @@ class _McpStepInterrupted(Exception):
     ``asyncio.CancelledError``): task cancellation tears the workflow down,
     while this asks the caller to pause.
     """
+
+
+class _McpStepOutcomeUncertain(InterruptError):
+    """Terminal, resumable stop: an interrupted mcp call had no one to resume it.
+
+    Raised by the main-loop mcp dispatch when a Stop cancelled the in-flight
+    tool call and the pause then resolved WITHOUT an explicit resume decision
+    (every dashboard client disconnected mid-pause, or the dashboard has no
+    connected clients at all). Repeating the call transparently would risk
+    duplicating unknown external side effects, so the run stops instead:
+    deriving from ``InterruptError`` flags ``stopped_by_user`` on
+    ``workflow_failed``, and the failure checkpoint makes ``conductor
+    resume`` the explicit at-least-once re-execution boundary. No
+    ``mcp_failed`` is emitted — the tool reported no failure; the call's
+    outcome is simply unknown.
+    """
+
+    def __init__(self, agent_name: str) -> None:
+        super().__init__(
+            f"MCP step '{agent_name}' was interrupted and not resumed: the "
+            "tool call's external outcome is unknown. Resume the workflow to "
+            "re-run the step (at-least-once semantics).",
+            agent_name=agent_name,
+        )
 
 
 async def _cancel_and_drain_group_tasks(tasks: list[asyncio.Task[Any]]) -> None:
@@ -2031,9 +2065,10 @@ class WorkflowEngine:
         elapsed = _time.time() - start
 
         content = envelope.get("content")
-        # Truncation markers are trusted because call_tool_structured strips
-        # server-supplied fields of these names at ingestion; the helper is
-        # the single read-side shared with the synthetic replay path.
+        # Truncation markers are trusted here because call_tool_structured
+        # strips server-supplied fields of these names at ingestion — this
+        # envelope came straight from the live call. The synthetic replay
+        # path never republishes stored markers (see _synth_mcp_pair).
         truncated, spill_path = mcp_truncation_metadata(content)
         self._emit(
             "mcp_completed",
@@ -4375,8 +4410,11 @@ class WorkflowEngine:
 
         Emits an ``agent_paused`` event and waits for the user to click
         Resume or Kill in the dashboard, or to submit guidance (issue #400).
-        If all browser clients disconnect while waiting, auto-resumes to
-        avoid hanging the workflow.
+        If all browser clients disconnect while waiting, the wait resolves
+        with ``reason="disconnect"`` (no ``agent_resumed`` is emitted):
+        whether that means auto-resume (the LLM path) or park as a
+        resumable stop (an interrupted ``type: mcp`` call) is the caller's
+        decision.
 
         Args:
             agent_name: The name of the interrupted agent.
@@ -4387,22 +4425,24 @@ class WorkflowEngine:
 
         Returns:
             A :class:`WebPauseOutcome`. ``handled=True`` means the pause was
-            resolved here (Resume clicked, guidance submitted, or all clients
-            disconnected) — ``guidance`` carries any submitted text(s), empty
-            for a plain Resume/disconnect. ``handled=False`` covers two
-            distinct cases the caller branches on separately: a dashboard is
-            attached but has no connected clients (auto-resume — there is no
-            one to wait on), or no dashboard is attached at all (fall
+            resolved here, with ``reason`` saying how: ``resume`` / ``guidance``
+            are explicit user decisions, ``disconnect`` means every browser
+            client went away mid-pause (NOT a resume decision — the
+            ``agent_resumed`` event is deliberately not emitted on that arm;
+            the caller emits it only if it actually resumes). ``handled=False``
+            (``reason="unavailable"``) covers two distinct cases the caller
+            branches on separately: a dashboard is attached but has no
+            connected clients, or no dashboard is attached at all (fall
             through to the CLI interactive handler, ``_handle_partial_output``).
 
         Raises:
             InterruptError: If the user chose Kill (``POST /api/kill``).
         """
         if self._web_dashboard is None or not self._web_dashboard.has_connections():
-            return WebPauseOutcome(False, [])
+            return WebPauseOutcome(False, [], reason="unavailable")
 
         if partial_output is None:
-            preview = "(no partial output — the interrupted step is deterministic)"
+            preview = "(no partial output available for this step)"
         else:
             try:
                 # ``ensure_ascii=False`` so the preview shows real non-ASCII
@@ -4525,13 +4565,24 @@ class WorkflowEngine:
                 resume_event.clear()
                 self._emit("agent_resumed", {"agent_name": agent_name, "with_guidance": True})
                 logger.info("Agent '%s' resumed with guidance — re-executing", agent_name)
-                return WebPauseOutcome(True, texts)
+                return WebPauseOutcome(True, texts, reason="guidance")
 
-        if disconnect_task in done:
+        if disconnect_task in done and resume_task not in done:
+            # Deliberately NO agent_resumed on this arm: whether the
+            # interrupted work is actually re-executed is the caller's
+            # decision — the LLM path auto-resumes (and emits the event
+            # there), while an interrupted mcp call is parked as a resumable
+            # stop, where a resumed event would be a lie. Disconnecting is
+            # not a resume decision. An explicit Resume click completed in
+            # the same wait batch WINS over the disconnect and takes the
+            # shared resume path below: the user made the decision, the lost
+            # client is incidental.
             logger.info(
-                "All dashboard clients disconnected while '%s' was paused — auto-resuming",
+                "All dashboard clients disconnected while '%s' was paused",
                 agent_name,
             )
+            resume_event.clear()
+            return WebPauseOutcome(True, [], reason="disconnect")
 
         # Clear resume_event after consumption so a stale signal from a
         # double-click or prior API call doesn't skip the next legitimate pause.
@@ -4539,7 +4590,7 @@ class WorkflowEngine:
 
         self._emit("agent_resumed", {"agent_name": agent_name, "with_guidance": False})
         logger.info("Agent '%s' resumed — re-executing", agent_name)
-        return WebPauseOutcome(True, [])
+        return WebPauseOutcome(True, [], reason="resume")
 
     async def _send_guidance_followup(
         self,
@@ -5824,30 +5875,36 @@ class WorkflowEngine:
                             except _McpStepInterrupted:
                                 # Stop landed mid-call: the call was cancelled
                                 # and is NOT replayed here — its external side
-                                # effects are unknown. Enter the same pause
-                                # flow an interrupted LLM agent gets: Resume
-                                # re-enters the step from the loop top (the
-                                # documented at-least-once semantics), Kill
-                                # unwinds via InterruptError.
+                                # effects are unknown. The call is re-entered
+                                # from the loop top ONLY on an explicit resume
+                                # decision: a dashboard Resume/guidance, or the
+                                # CLI interrupt menu. When no one can decide
+                                # (every browser disconnected mid-pause, or the
+                                # dashboard has no clients at all) the run
+                                # parks as a resumable stop instead of silently
+                                # repeating a side-effecting call — ``conductor
+                                # resume`` is then the explicit at-least-once
+                                # boundary. Kill unwinds via InterruptError.
                                 pause_outcome = await self._handle_web_pause(agent.name, None)
                                 if pause_outcome.handled:
-                                    # Pause resolved (Resume / guidance —
-                                    # guidance was applied to context inside
-                                    # _handle_web_pause — / disconnect).
+                                    if pause_outcome.reason == "disconnect":
+                                        raise _McpStepOutcomeUncertain(agent.name) from None
+                                    # Explicit Resume / guidance (the guidance
+                                    # was applied to context inside
+                                    # _handle_web_pause).
                                     if self._interrupt_event is not None:
                                         self._interrupt_event.clear()
                                     continue
                                 if self._web_dashboard is not None:
-                                    # Dashboard attached but no clients:
-                                    # auto-resume rather than block on stdin
-                                    # (mirrors the LLM partial-output branch;
-                                    # a --web-bg run has no tty).
-                                    if self._interrupt_event is not None:
-                                        self._interrupt_event.clear()
-                                    continue
+                                    # Dashboard attached but zero clients:
+                                    # park rather than auto-resume (see
+                                    # above) — unlike the LLM branch, whose
+                                    # re-run only costs tokens.
+                                    raise _McpStepOutcomeUncertain(agent.name) from None
                                 # No dashboard: the interrupt flag is still
                                 # set, so the shared check presents the CLI
-                                # interrupt menu and consumes it.
+                                # interrupt menu and consumes it — every menu
+                                # outcome is an explicit decision.
                                 interrupt_result = await self._check_interrupt(agent.name)
                                 if interrupt_result is not None:
                                     current_agent_name = await self._handle_interrupt_result(
@@ -5999,6 +6056,16 @@ class WorkflowEngine:
                         if output.partial:
                             pause_outcome = await self._handle_web_pause(agent.name, output)
                             if pause_outcome.handled:
+                                if pause_outcome.reason == "disconnect":
+                                    # _handle_web_pause deliberately emits no
+                                    # agent_resumed on the disconnect arm (an
+                                    # interrupted mcp step is parked, not
+                                    # resumed); the LLM path auto-resumes, so
+                                    # it emits the event here.
+                                    self._emit(
+                                        "agent_resumed",
+                                        {"agent_name": agent.name, "with_guidance": False},
+                                    )
                                 # Web mode: agent paused then resumed. Clear
                                 # interrupt_event to prevent a re-executed agent
                                 # from seeing the stale signal and returning

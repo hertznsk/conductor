@@ -96,6 +96,7 @@ def _patch_manager(envelope: Any = None) -> Any:
     manager_cls = patcher.start()
     manager = manager_cls.return_value
     manager.connect_server = AsyncMock(return_value=[])
+    manager.close = AsyncMock(return_value=None)
     manager.get_server_tools = MagicMock(
         return_value=[{"name": "srv__echo", "original_name": "echo"}]
     )
@@ -660,6 +661,182 @@ class TestMcpStepInterrupt:
         assert calls == ["call", "cancelled"]
         assert not any(ev.type == "mcp_completed" for ev in received)
         assert not any(ev.type == "mcp_failed" for ev in received)
+
+    @pytest.mark.asyncio
+    async def test_stop_during_call_disconnect_parks_resumable_stop(self) -> None:
+        # Requirement: when every dashboard client disconnects while the
+        # pause is pending, the interrupted call is NOT re-executed — there
+        # is no one to make the resume decision, and transparently repeating
+        # a side-effecting call could duplicate unknown external effects.
+        # The run parks as a resumable stop instead: an InterruptError
+        # subclass (stopped_by_user on workflow_failed), no mcp_failed, no
+        # agent_resumed, exactly one attempted call, so `conductor resume`
+        # becomes the explicit at-least-once re-execution boundary.
+        from types import SimpleNamespace
+
+        web_dashboard = SimpleNamespace(
+            has_connections=lambda: True,
+            resume_event=asyncio.Event(),
+            kill_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+        )
+        config = _mcp_workflow()
+        engine, interrupt_event = self._engine_with_interrupt(config, web_dashboard=web_dashboard)
+        received = _collect_events(engine)
+
+        calls: list[str] = []
+
+        async def call(_server: str, _tool: str, _arguments: dict[str, Any]) -> dict[str, Any]:
+            calls.append("call")
+            interrupt_event.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                calls.append("cancelled")
+                raise
+            raise AssertionError("unreachable")  # pragma: no cover
+
+        patcher = _patch_manager(call)
+        try:
+
+            async def disconnect_once_paused() -> None:
+                for _ in range(200):
+                    if any(ev.type == "agent_paused" for ev in received):
+                        web_dashboard.disconnect_event.set()
+                        return
+                    await asyncio.sleep(0.01)
+                raise AssertionError("agent_paused never emitted")
+
+            with pytest.raises(InterruptError) as exc_info:
+                await asyncio.gather(engine.run({}), disconnect_once_paused())
+        finally:
+            patcher.stop()
+
+        assert "not resumed" in str(exc_info.value)
+        assert calls == ["call", "cancelled"]
+        assert not any(ev.type == "mcp_completed" for ev in received)
+        assert not any(ev.type == "mcp_failed" for ev in received)
+        assert not any(ev.type == "agent_resumed" for ev in received)
+        failed = [ev for ev in received if ev.type == "workflow_failed"]
+        assert len(failed) == 1
+        assert failed[0].data["stopped_by_user"] is True
+
+    @pytest.mark.asyncio
+    async def test_stop_during_call_no_clients_parks_resumable_stop(self) -> None:
+        # Requirement: a dashboard attached with ZERO connected clients is
+        # also "no one to decide", so the interrupted call is not
+        # auto-replayed — diverging from the LLM auto-resume, whose re-run
+        # only costs tokens. The run parks as a resumable stop without ever
+        # presenting a pause (no agent_paused / agent_resumed).
+        from types import SimpleNamespace
+
+        web_dashboard = SimpleNamespace(
+            has_connections=lambda: False,
+            resume_event=asyncio.Event(),
+            kill_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+        )
+        config = _mcp_workflow()
+        engine, interrupt_event = self._engine_with_interrupt(config, web_dashboard=web_dashboard)
+        received = _collect_events(engine)
+
+        calls: list[str] = []
+
+        async def call(_server: str, _tool: str, _arguments: dict[str, Any]) -> dict[str, Any]:
+            calls.append("call")
+            interrupt_event.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                calls.append("cancelled")
+                raise
+            raise AssertionError("unreachable")  # pragma: no cover
+
+        patcher = _patch_manager(call)
+        try:
+            with pytest.raises(InterruptError) as exc_info:
+                await engine.run({})
+        finally:
+            patcher.stop()
+
+        assert "not resumed" in str(exc_info.value)
+        assert calls == ["call", "cancelled"]
+        assert not any(ev.type == "agent_paused" for ev in received)
+        assert not any(ev.type == "agent_resumed" for ev in received)
+        assert not any(ev.type == "mcp_failed" for ev in received)
+        failed = [ev for ev in received if ev.type == "workflow_failed"]
+        assert len(failed) == 1
+        assert failed[0].data["stopped_by_user"] is True
+
+    @pytest.mark.asyncio
+    async def test_disconnect_park_saves_failure_checkpoint(self, tmp_path: Path) -> None:
+        # Requirement: the parked run is genuinely resumable — the failure
+        # checkpoint is written with current_agent pointing at the parked
+        # mcp step, so `conductor resume` re-enters exactly that step (the
+        # explicit at-least-once boundary), not an earlier one.
+        from types import SimpleNamespace
+
+        from conductor.engine.checkpoint import CheckpointManager
+
+        workflow_file = tmp_path / "workflow.yaml"
+        workflow_file.write_text("name: mcp-only\n")
+
+        web_dashboard = SimpleNamespace(
+            has_connections=lambda: True,
+            resume_event=asyncio.Event(),
+            kill_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+        )
+        interrupt_event = asyncio.Event()
+        provider = MagicMock()
+        # The failure checkpoint serializes collected provider session ids —
+        # a bare MagicMock return value is not JSON-serializable.
+        provider.get_session_ids.return_value = {}
+        provider.get_session_cwds.return_value = {}
+        engine = WorkflowEngine(
+            _mcp_workflow(),
+            provider,
+            interrupt_event=interrupt_event,
+            web_dashboard=web_dashboard,
+            workflow_path=workflow_file,
+        )
+        received = _collect_events(engine)
+
+        calls: list[str] = []
+
+        async def call(_server: str, _tool: str, _arguments: dict[str, Any]) -> dict[str, Any]:
+            calls.append("call")
+            interrupt_event.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                calls.append("cancelled")
+                raise
+            raise AssertionError("unreachable")  # pragma: no cover
+
+        patcher = _patch_manager(call)
+        try:
+            with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+
+                async def disconnect_once_paused() -> None:
+                    for _ in range(200):
+                        if any(ev.type == "agent_paused" for ev in received):
+                            web_dashboard.disconnect_event.set()
+                            return
+                        await asyncio.sleep(0.01)
+                    raise AssertionError("agent_paused never emitted")
+
+                with pytest.raises(InterruptError):
+                    await asyncio.gather(engine.run({}), disconnect_once_paused())
+        finally:
+            patcher.stop()
+
+        saved = [ev for ev in received if ev.type == "checkpoint_saved"]
+        assert len(saved) == 1
+        checkpoint_path = engine._last_checkpoint_path
+        assert checkpoint_path is not None and checkpoint_path.exists()
+        data = json.loads(checkpoint_path.read_text())
+        assert data["current_agent"] == "call"
 
     @pytest.mark.asyncio
     async def test_call_completed_before_stop_returns_normally(self) -> None:
