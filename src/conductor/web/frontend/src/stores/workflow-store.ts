@@ -623,12 +623,13 @@ function buildStaticChildContext(
 
   const groupAgents = new Set<string>();
   const agentNames = new Set<string>();
+  const agentTypes = new Map<string, NodeType>(ctx.agents.map((a) => [a.name, (a.type || 'agent') as NodeType]));
   for (const pg of ctx.parallelGroups) {
     for (const a of pg.agents) groupAgents.add(a);
     agentNames.add(pg.name);
     ensureNode(ctx.nodes, pg.name, 'parallel_group');
     ctx.groupProgress[pg.name] = { total: pg.agents.length, completed: 0, failed: 0 };
-    for (const agentName of pg.agents) ensureNode(ctx.nodes, agentName, 'agent');
+    for (const agentName of pg.agents) ensureNode(ctx.nodes, agentName, agentTypes.get(agentName) || 'agent');
   }
   for (const fg of ctx.forEachGroups) {
     agentNames.add(fg.name);
@@ -1578,6 +1579,18 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
           }
         }
         ctx.agentsTotal = agentNames.size;
+
+        // The incoming runtime topology is authoritative over a reused
+        // static-preview placeholder (see buildStaticChildContext /
+        // placeChildContext): ensureNode never updates an existing node's
+        // type, so a placeholder member seeded before the declared type was
+        // honoured would keep rendering as a generic agent. Sync every
+        // declared agent's node type explicitly — walking ctx.agents leaves
+        // the group nodes (parallel_group / for_each_group) untouched.
+        for (const a of ctx.agents) {
+          const nd = ctx.nodes[a.name];
+          if (nd) nd.type = (a.type || 'agent') as NodeType;
+        }
 
         // Eagerly seed static sub-workflow previews for this child's own
         // `type: workflow` steps (see `buildStaticChildContext`).

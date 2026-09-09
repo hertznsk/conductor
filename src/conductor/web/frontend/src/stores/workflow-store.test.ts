@@ -735,6 +735,106 @@ describe('workflow-store — eager static sub-workflow preview (dashboard expand
     expect(child.children[0]!.slotKey).toBe('b');
     expect(child.children[0]!.workflowName).toBe('grandchild-workflow');
   });
+
+  it('types parallel-group members by their declared type in static previews', () => {
+    const { processEvent } = useWorkflowStore.getState();
+
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [
+        {
+          name: 'sub_wf',
+          type: 'workflow',
+          subworkflow: {
+            name: 'child-workflow',
+            entry_point: 'pg',
+            agents: [
+              { name: 'mcp_member', type: 'mcp' },
+              { name: 'plain_member' },
+            ],
+            routes: [],
+            parallel_groups: [{ name: 'pg', agents: ['mcp_member', 'plain_member'] }],
+            for_each_groups: [],
+          },
+        },
+      ],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'sub_wf',
+    }));
+
+    // Requirement: static child contexts preserve declared member types —
+    // a parallel member declared `type: mcp` must not be seeded as the
+    // generic 'agent', or DetailPanel routes it to AgentDetail instead of
+    // McpDetail.
+    const child = useWorkflowStore.getState().subworkflowContexts[0]!;
+    expect(child.nodes.mcp_member?.type).toBe('mcp');
+    expect(child.nodes.plain_member?.type).toBe('agent');
+  });
+
+  it('re-syncs node types from the runtime topology when the child workflow_started reuses a placeholder', () => {
+    const { processEvent } = useWorkflowStore.getState();
+
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [
+        {
+          name: 'sub_wf',
+          type: 'workflow',
+          subworkflow: {
+            name: 'child-workflow',
+            entry_point: 'pg',
+            agents: [
+              { name: 'mcp_member', type: 'mcp' },
+              { name: 'plain_member' },
+            ],
+            routes: [],
+            parallel_groups: [{ name: 'pg', agents: ['mcp_member', 'plain_member'] }],
+            for_each_groups: [],
+          },
+        },
+      ],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'sub_wf',
+    }));
+
+    // Simulate a placeholder seeded before declared types were honoured:
+    // the member node carries the generic type.
+    const staleChild = useWorkflowStore.getState().subworkflowContexts[0]!;
+    useWorkflowStore.setState({
+      subworkflowContexts: [{
+        ...staleChild,
+        nodes: {
+          ...staleChild.nodes,
+          mcp_member: { ...staleChild.nodes.mcp_member!, type: 'agent' },
+        },
+      }],
+    });
+
+    processEvent(event('subworkflow_started', { agent_name: 'sub_wf', workflow: 'child.yaml', iteration: 1, parent_path: [] }));
+    processEvent(event('workflow_started', {
+      name: 'child-workflow',
+      agents: [
+        { name: 'mcp_member', type: 'mcp' },
+        { name: 'plain_member' },
+      ],
+      routes: [],
+      parallel_groups: [{ name: 'pg', agents: ['mcp_member', 'plain_member'] }],
+      for_each_groups: [],
+      entry_point: 'pg',
+    }));
+
+    // Requirement: the runtime topology is authoritative over a reused
+    // placeholder — ensureNode never updates an existing node's type, so
+    // the child's workflow_started must re-sync declared types onto the
+    // placeholder nodes (group nodes stay untouched).
+    const child = useWorkflowStore.getState().subworkflowContexts[0]!;
+    expect(child.nodes.mcp_member?.type).toBe('mcp');
+    expect(child.nodes.pg?.type).toBe('parallel_group');
+  });
 });
 
 describe('workflow-store — navigating to a specific historical subworkflow iteration (#365)', () => {
