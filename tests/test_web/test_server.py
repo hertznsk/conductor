@@ -1928,9 +1928,12 @@ class TestSyntheticReplayMcpStep:
         )
         assert completed["result_bytes"] == self._expected_result_bytes(content, structured)
 
-    def test_is_error_and_truncation_metadata_come_from_envelope(self) -> None:
-        # Requirement: is_error is restored from the saved envelope, and
-        # truncated/spill_path reflect the content blocks — never fabricated.
+    def test_is_error_restored_but_stored_truncation_markers_suppressed(self) -> None:
+        # Requirement: is_error is restored from the saved envelope, but
+        # stored truncated/spill_path markers are NEVER republished on
+        # synthetic replay — a checkpoint written before ingestion stripping
+        # existed can carry server-supplied markers, and replaying them would
+        # present server-controlled data as Conductor-generated metadata.
         content = [
             {"type": "text", "text": "big", "truncated": True, "spill_path": "/tmp/spill.txt"}
         ]
@@ -1939,8 +1942,8 @@ class TestSyntheticReplayMcpStep:
             "fetch", self._mcp_agent(), envelope
         )
         assert completed["is_error"] is True
-        assert completed["truncated"] is True
-        assert completed["spill_path"] == "/tmp/spill.txt"
+        assert completed["truncated"] is False
+        assert completed["spill_path"] is None
 
     def test_forged_spill_path_in_stored_envelope_is_dropped(self) -> None:
         # Requirement: only Conductor's own truncation markers are replayed —
@@ -2075,3 +2078,38 @@ class TestSyntheticReplayMcpGroups:
         completed = dict(events)["for_each_completed"]
         assert completed["outputs"]["outputs"] == [{"a": 1}]
         assert completed["item_count"] == 1
+
+    def test_group_replay_suppresses_stored_truncation_markers(self) -> None:
+        # Requirement: stored truncated/spill_path markers are never
+        # republished on the group synthetic replay paths either — both
+        # converge on _synth_mcp_pair, and a checkpoint written before
+        # ingestion stripping existed can carry server-supplied markers.
+        from types import SimpleNamespace
+
+        marked_envelope = {
+            "content": [
+                {
+                    "type": "text",
+                    "text": "big",
+                    "truncated": True,
+                    "spill_path": "/tmp/server-chosen.txt",
+                }
+            ],
+            "structured": None,
+            "is_error": False,
+        }
+        agent_defs = {"fetch": self._mcp_agent()}
+        pg = SimpleNamespace(name="grp", agents=["fetch"])
+        parallel_events = WebDashboard._synth_parallel(
+            "grp", pg, {"outputs": {"fetch": marked_envelope}, "errors": {}}, agent_defs
+        )
+        fg = SimpleNamespace(name="loop", agent=self._mcp_agent("worker"))
+        for_each_events = WebDashboard._synth_for_each(
+            "loop", fg, {"outputs": {"k1": marked_envelope}, "errors": {}, "count": 1}
+        )
+
+        for events in (parallel_events, for_each_events):
+            for data in (d for t, d in events if t == "mcp_completed"):
+                assert data["truncated"] is False
+                assert data["spill_path"] is None
+            assert "/tmp/server-chosen.txt" not in json.dumps(events)

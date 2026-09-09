@@ -1072,19 +1072,27 @@ class WebDashboard:
         and the group syntheses (which add ``group_name`` / ``item_key``
         themselves). Mirrors the live runtime's mcp payload shape so
         synthetic replays render identically to live runs. The result size
-        is measured by the same helper the engine emitter uses and the
-        truncation markers by the shared trusted-metadata reader, so a
-        forged ``spill_path`` in a stored envelope cannot reach the event
-        (see ``mcp_truncation_metadata``).
+        is measured by the same helper the engine emitter uses.
+
+        Truncation markers are NEVER republished from a stored envelope.
+        ``truncated`` / ``spill_path`` on a content block are trustworthy
+        only on the live path, where
+        :meth:`conductor.mcp.manager.MCPManager.call_tool_structured` strips
+        server-supplied fields of those names at ingestion before its own
+        truncation pass sets them. A checkpoint may have been written before
+        that stripping existed, so a stored ``spill_path`` can be a
+        server-supplied string — republishing it would present
+        server-controlled data as Conductor-generated metadata. Synthetic
+        events therefore report no truncation; the stored envelope itself
+        stays intact in the workflow context for routing and templates.
         """
-        from conductor.executor.mcp_step import mcp_result_bytes, mcp_truncation_metadata
+        from conductor.executor.mcp_step import mcp_result_bytes
 
         server = getattr(agent_def, "server", None)
         tool = getattr(agent_def, "tool", None)
         arguments = getattr(agent_def, "arguments", None)
         output_dict = output if isinstance(output, dict) else {}
         content = output_dict.get("content")
-        truncated, spill_path = mcp_truncation_metadata(content)
         started_data: dict[str, Any] = {
             "agent_name": name,
             "iteration": 1,
@@ -1100,8 +1108,8 @@ class WebDashboard:
             "tool": tool,
             "is_error": output_dict.get("is_error", False),
             "result_bytes": mcp_result_bytes(content, output_dict.get("structured")),
-            "truncated": truncated,
-            "spill_path": spill_path,
+            "truncated": False,
+            "spill_path": None,
             "synthetic": True,
         }
         return started_data, completed_data

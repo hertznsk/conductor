@@ -94,15 +94,19 @@ def mcp_result_bytes(content: Any, structured: Any) -> int:
 
 
 def mcp_truncation_metadata(content: Any) -> tuple[bool, str | None]:
-    """Extract the trusted truncation markers from an envelope's content blocks.
+    """Extract the trusted truncation markers from a LIVE result envelope.
 
     ``truncated`` and ``spill_path`` on a content block are Conductor-local
     metadata: :meth:`conductor.mcp.manager.MCPManager.call_tool_structured`
-    strips any server-supplied fields of those names at ingestion and only its
-    own truncation pass sets them. This helper is the single read-side of that
-    contract, shared by the live engine events and the web server's synthetic
-    replay so both build the same representation; the type checks additionally
-    guard envelopes persisted (checkpoints) before the stripping existed.
+    strips any server-supplied fields of those names at ingestion and only
+    its own truncation pass sets them. This helper is therefore called ONLY
+    on a freshly returned envelope — the engine's live ``mcp_completed``
+    event — never on a checkpoint-restored one: a checkpoint may have been
+    written before the ingestion stripping existed, so a stored
+    ``spill_path`` can be a server-supplied string. The web server's
+    synthetic replay path does not republish stored markers at all (see
+    ``WebDashboard._synth_mcp_pair``). The defensive type checks remain
+    because the live contract is only ever a list of dict blocks.
 
     Args:
         content: The envelope's ``content`` value (expected list of dicts).

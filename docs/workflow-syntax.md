@@ -1259,7 +1259,7 @@ The step-level `timeout` field sets a per-call timeout in seconds for the MCP to
 
 MCP steps emit three lifecycle events:
 - `mcp_started`: contains `agent_name`, `iteration`, `server`, `tool`, and `argument_keys` (sorted list of key names only).
-- `mcp_completed`: contains `agent_name`, `elapsed`, `server`, `tool`, `is_error`, `result_bytes`, `truncated`, and optional `spill_path` (only ever a Conductor-generated spill file path — server-supplied `truncated`/`spill_path` block fields are stripped at ingestion and never forwarded).
+- `mcp_completed`: contains `agent_name`, `elapsed`, `server`, `tool`, `is_error`, `result_bytes`, `truncated`, and optional `spill_path` (only ever a Conductor-generated spill file path — server-supplied `truncated`/`spill_path` block fields are stripped at ingestion and never forwarded; on a resumed run the synthetic replay does not republish markers stored in a checkpoint at all, since a checkpoint written before the stripping existed can carry server-supplied ones).
 - `mcp_failed`: contains `agent_name`, `elapsed`, `server`, `tool`, `error_type`, and a `message` that is either authored and value-free (unknown server, non-stdio transport, disallowed/missing tool, a timeout with its duration) or a generic redacted pointer (see below).
 
 **Argument values and result payloads are never included in MCP step event payloads** — this guarantee covers exactly the tool arguments and the tool result bodies, nothing else. Two things stay visible *by design*, so plan around them:
