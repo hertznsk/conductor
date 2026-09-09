@@ -43,10 +43,24 @@ def init_tracer_provider(*, run_id: str) -> TracerProvider | None:
         return None
 
     protocol = _resolve_otlp_protocol()
+    provider: TracerProvider | None = None
     try:
         provider = _build_tracer_provider(run_id, endpoint, protocol)
         _install_delegating_global_provider()
     except Exception:  # noqa: BLE001 -- optional tracing must never stop a workflow.
+        # Roll back whatever was allocated so a failure after construction
+        # (e.g. global-provider discovery raising on a misconfigured
+        # OTEL_PYTHON_TRACER_PROVIDER) cannot leak the provider's batch
+        # worker and exporter. Only the provider built here is shut down —
+        # a host-owned global provider is never ours to close.
+        if provider is not None:
+            try:
+                provider.shutdown()
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "OpenTelemetry rollback of a partially initialized provider failed",
+                    exc_info=True,
+                )
         guards.reset_telemetry_context()
         logger.warning("OpenTelemetry tracing initialization failed", exc_info=True)
         return None
@@ -77,8 +91,19 @@ def _build_tracer_provider(run_id: str, endpoint: str, protocol: str) -> TracerP
             CONDUCTOR_RUN_ID: run_id,
         }
     )
-    provider = TracerProvider(resource=resource)
-    provider.add_span_processor(BatchSpanProcessor(_create_otlp_exporter(protocol, endpoint)))
+    # shutdown_on_exit=False: the SDK otherwise registers an atexit shutdown
+    # whose BatchSpanProcessor join (up to 30s) can stall interpreter exit on a
+    # hung collector. TelemetrySubscriber.close() is the single owner of the
+    # provider lifecycle instead; a crashed run simply exports nothing more.
+    provider = TracerProvider(resource=resource, shutdown_on_exit=False)
+    try:
+        exporter = _create_otlp_exporter(protocol, endpoint)
+    except Exception:
+        # Keep the failure atomic: a provider whose exporter never got built
+        # must not leak into the caller's success path.
+        provider.shutdown()
+        raise
+    provider.add_span_processor(BatchSpanProcessor(exporter))
     return provider
 
 
@@ -125,11 +150,31 @@ def _create_otlp_exporter(protocol: str, endpoint: str) -> SpanExporter:
     """Create the OTLP exporter selected by the captured protocol and endpoint."""
     if protocol == "grpc":
         module_name = "opentelemetry.exporter.otlp.proto.grpc.trace_exporter"
+        exporter_endpoint = endpoint
     else:
         module_name = "opentelemetry.exporter.otlp.proto.http.trace_exporter"
+        exporter_endpoint = _http_traces_endpoint(endpoint)
 
     exporter_module = import_module(module_name)
     return exporter_module.OTLPSpanExporter(
-        endpoint=endpoint,
+        endpoint=exporter_endpoint,
         timeout=_DEFAULT_EXPORT_TIMEOUT_SECONDS,
     )
+
+
+def _http_traces_endpoint(base_endpoint: str) -> str:
+    """Derive the per-signal traces URL from the captured base OTLP endpoint.
+
+    The HTTP exporter uses an explicit ``endpoint=`` constructor argument
+    verbatim — unlike the ``OTEL_EXPORTER_OTLP_ENDPOINT`` environment
+    variable, no ``/v1/traces`` path is appended for it. Passing the
+    documented base URL (``http://localhost:4318``) straight through would
+    post spans to ``/``, which a standard collector rejects. Apply the same
+    path-appending rule the SDK applies to the environment variable here.
+    An explicit ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` is already a
+    per-signal URL and wins when set.
+    """
+    override = os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "").strip()
+    if override:
+        return override
+    return base_endpoint.rstrip("/") + "/v1/traces"

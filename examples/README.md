@@ -161,10 +161,15 @@ within a single unified trace tree.
 
 ```bash
 uv sync --extra telemetry
-export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 export OTEL_SERVICE_NAME=conductor
 conductor run examples/simple-qa.yaml --input question="What is OpenTelemetry?"
 ```
+
+The HTTP protocol is what lets the Copilot CLI emit its native spans; with
+the default gRPC protocol this recipe exports Conductor's orchestration
+spans only.
 
 No prompt or response content is exported by default. See
 [OpenTelemetry Tracing](../docs/configuration.md#opentelemetry-tracing) before
