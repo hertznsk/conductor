@@ -32,10 +32,66 @@ if TYPE_CHECKING:
 MULTILINE_SENTINEL = "."
 """Line that terminates a multi-line answer when typed on its own."""
 
+DIALOG_SUBMIT_SENTINEL = "/send"
+"""Line that submits a multi-line dialog turn.
+
+Distinct from :data:`MULTILINE_SENTINEL` because a lone ``.`` is likelier to
+be an ordinary line of prose in a conversational reply than in a gate answer.
+"""
+
 
 def _eof_key_hint() -> str:
     """Return the platform-appropriate EOF keystroke for display."""
     return "Ctrl-Z then Enter" if sys.platform == "win32" else "Ctrl-D"
+
+
+def read_multiline_lines(console: MarkupFreeConsole, *, sentinel: str) -> tuple[str, bool]:
+    """Read a multi-line answer from stdin (blocking; call on a thread).
+
+    Terminates on a line whose stripped text equals ``sentinel`` or on EOF.
+    Internal newlines are preserved; trailing empty lines are dropped, but a
+    trailing line of whitespace is kept verbatim -- a real strip would eat the
+    meaningful indentation of a pasted code block.
+
+    Args:
+        console: Console to print the input hint to.
+        sentinel: Line that, typed alone, submits the accumulated text.
+            Keyword-only and required: the two gates use different sentinels,
+            so a caller states which one it means.
+
+    Returns:
+        ``(text, hit_eof)`` -- the collected text and whether the read ended at
+        EOF rather than at the sentinel. Callers need the distinction because
+        an EOF that yielded no text is a deliberate dismissal (Ctrl-D at an
+        empty prompt), whereas the sentinel with no text is merely an empty
+        submission.
+    """
+    console.print(
+        styled(
+            "  [dim]Enter your answer. Finish with '{}' on its own line (or {}).[/dim]",
+            sentinel,
+            _eof_key_hint(),
+        )
+    )
+    lines: list[str] = []
+    hit_eof = False
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            # The only end-of-input a real stdin produces here: an exhausted
+            # or non-tty stream raises EOFError, a closed one ValueError.
+            # StopIteration is deliberately *not* caught -- input() would only
+            # relay it from a contrived stdin replacement, and treating it as
+            # EOF would submit a truncated turn as if the user had pressed
+            # Ctrl-D. A test double that runs past what it supplied is a bug
+            # in the test, so it must surface rather than read as a dismissal.
+            hit_eof = True
+            break
+        if line.strip() == sentinel:
+            break
+        lines.append(line)
+    return "\n".join(lines).rstrip("\n"), hit_eof
 
 
 async def read_on_daemon_thread[T](fn: Callable[[], T]) -> T:
@@ -477,30 +533,15 @@ class HumanGateHandler:
     def _read_multiline(self) -> str:
         """Read a multi-line answer from stdin (blocking; call in a thread).
 
-        Terminates on a line containing only ``.`` or on EOF. The sentinel is
-        listed first in the hint because Ctrl-D/Ctrl-Z differs by platform.
+        Delegates to the shared :func:`read_multiline_lines` with this gate's
+        historical ``.`` sentinel.
 
         Returns:
-            The collected text with trailing blank lines stripped. Internal
-            newlines are preserved.
+            The collected text, with trailing empty lines dropped and internal
+            newlines preserved.
         """
-        self.console.print(
-            styled(
-                "  [dim]Enter your answer. Finish with '{}' on its own line (or {}).[/dim]",
-                MULTILINE_SENTINEL,
-                _eof_key_hint(),
-            )
-        )
-        lines: list[str] = []
-        while True:
-            try:
-                line = input()
-            except EOFError:
-                break
-            if line.strip() == MULTILINE_SENTINEL:
-                break
-            lines.append(line)
-        return "\n".join(lines).rstrip("\n")
+        text, _ = read_multiline_lines(self.console, sentinel=MULTILINE_SENTINEL)
+        return text
 
 
 @dataclass
