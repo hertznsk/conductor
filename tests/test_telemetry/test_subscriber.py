@@ -459,3 +459,127 @@ def test_child_workflow_failure_does_not_close_the_parent_run(
     root = _span(_spans(tracing.exporter), f"{INVOKE_WORKFLOW} parent")
     assert root.status.status_code.name == "ERROR"
     assert subscriber._open_spans == {}
+
+
+def test_overlapping_for_each_validators_close_their_own_spans(
+    tracing: Tracing,
+) -> None:
+    """Requirement: for-each validator spans resolve by item identity, not display name."""
+    # Given: two items of one for-each group whose validators overlap in time.
+    subscriber = tracing.subscriber
+    subscriber.on_event(_event("workflow_started", 10.0, name="parent", run_id="run-9"))
+    subscriber.on_event(_event("for_each_started", 11.0, group_name="items"))
+    subscriber.on_event(
+        _event("for_each_item_started", 12.0, group_name="items", item_key="0", index=0)
+    )
+    subscriber.on_event(
+        _event("for_each_item_started", 13.0, group_name="items", item_key="1", index=1)
+    )
+    subscriber.on_event(
+        _event("agent_validator_start", 14.0, agent_name="items", item_key="0", index=0)
+    )
+    subscriber.on_event(
+        _event("agent_validator_start", 15.0, agent_name="items", item_key="1", index=1)
+    )
+
+    # When: item 0's validator completes while item 1's is still running.
+    subscriber.on_event(
+        _event(
+            "agent_validator_complete",
+            16.0,
+            agent_name="items",
+            item_key="0",
+            index=0,
+            input_tokens=11,
+        )
+    )
+
+    # Then: item 0's validator span closed with its own metadata; item 1's is open.
+    spans = _spans(tracing.exporter)
+    validators = [s for s in spans if s.name.endswith("(validator)")]
+    assert len(validators) == 1
+    assert validators[0].attributes is not None
+    assert validators[0].attributes[GEN_AI_USAGE_INPUT_TOKENS] == 11
+    open_names = [key[0] for key in subscriber._open_spans]
+    assert open_names.count("invoke_agent items (validator)") == 1
+
+    # And: item 1's validator completes independently, keyed by its own index.
+    subscriber.on_event(
+        _event(
+            "agent_validator_complete",
+            17.0,
+            agent_name="items",
+            item_key="1",
+            index=1,
+            errored=True,
+        )
+    )
+    spans = _spans(tracing.exporter)
+    validators = [s for s in spans if s.name.endswith("(validator)")]
+    assert len(validators) == 2
+    errored = [s for s in validators if s.status.status_code.name == "ERROR"]
+    assert len(errored) == 1
+    assert errored[0].attributes is not None
+    assert GEN_AI_USAGE_INPUT_TOKENS not in errored[0].attributes
+
+
+def test_for_each_subworkflow_completion_leaves_the_item_span_open(
+    tracing: Tracing,
+) -> None:
+    """Requirement: subworkflow_completed never terminates a for-each item span early."""
+    # Given: a sub-workflow running inside a for-each item.
+    subscriber = tracing.subscriber
+    subscriber.on_event(_event("workflow_started", 10.0, name="parent", run_id="run-10"))
+    subscriber.on_event(_event("for_each_started", 11.0, group_name="items"))
+    subscriber.on_event(
+        _event("for_each_item_started", 12.0, group_name="items", item_key="0", index=0)
+    )
+    subscriber.on_event(
+        _event(
+            "subworkflow_started",
+            13.0,
+            agent_name="items",
+            item_key="0",
+            iteration=1,
+            parent_path=[],
+            slot_key="items[0]",
+        )
+    )
+    subscriber.on_event(
+        _event("workflow_started", 14.0, name="child", subworkflow_path=["items[0]"])
+    )
+
+    # When: the child workflow finishes and the subworkflow envelope completes.
+    subscriber.on_event(_event("workflow_completed", 15.0, subworkflow_path=["items[0]"]))
+    subscriber.on_event(
+        _event(
+            "subworkflow_completed",
+            16.0,
+            agent_name="items",
+            item_key="0",
+            iteration=1,
+            parent_path=[],
+            slot_key="items[0]",
+        )
+    )
+
+    # Then: the item span is still open — its terminal envelope has not fired.
+    assert len(subscriber._open_spans) == 3  # root + group + item
+    assert _spans(tracing.exporter) != []  # the child workflow span closed
+    item_open = [key for key in subscriber._open_spans if key[0] == "invoke_agent items[0]"]
+    assert len(item_open) == 1
+
+    # And: the item's own terminal event closes it with its aggregated cost.
+    subscriber.on_event(
+        _event(
+            "for_each_item_completed",
+            17.0,
+            group_name="items",
+            item_key="0",
+            index=0,
+            cost_usd=0.25,
+        )
+    )
+    item_span = _span(_spans(tracing.exporter), "invoke_agent items[0]")
+    assert item_span.attributes is not None
+    assert item_span.attributes["conductor.cost_usd"] == 0.25

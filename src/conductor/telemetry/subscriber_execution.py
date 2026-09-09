@@ -172,6 +172,21 @@ def validator_started(state: SpanState, event: WorkflowEvent) -> None:
     if agent is None:
         return
     validator = f"{agent} (validator)"
+    index = event_number(event, "index")
+    if index is not None:
+        # For-each validator callbacks all share the group's display name and
+        # are told apart only by index/item_key. Identity must come from the
+        # full (path, group, index) key — a name-keyed deque would let two
+        # overlapping item validators close each other's spans.
+        key = state.start(
+            event,
+            f"{INVOKE_AGENT} {validator}",
+            state.item_key(path, agent, event_text(event, "item_key"), index),
+            _agent_attributes(validator, "validator", event),
+            attach=True,
+        )
+        state.validator_item_keys[(path, agent, index)] = key
+        return
     key = state.start(
         event,
         f"{INVOKE_AGENT} {validator}",
@@ -186,12 +201,14 @@ def validator_completed(state: SpanState, event: WorkflowEvent) -> None:
     """Finish a validator span, marking execution errors as failures."""
     path = event_path(event, "subworkflow_path")
     agent = event_text(event, "agent_name")
-    if agent:
-        state.end(
-            state.latest_agent(path, f"{agent} (validator)"),
-            event,
-            failed=event.data.get("errored") is True,
-        )
+    if not agent:
+        return
+    index = event_number(event, "index")
+    if index is not None:
+        key = state.validator_item_keys.get((path, agent, index))
+    else:
+        key = state.latest_agent(path, f"{agent} (validator)")
+    state.end(key, event, failed=event.data.get("errored") is True)
 
 
 def tool_started(state: SpanState, event: WorkflowEvent) -> None:

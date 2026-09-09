@@ -26,6 +26,7 @@ from conductor.telemetry.subscriber_types import (
     AttributeValue,
     PathKey,
     SpanKey,
+    SubworkflowParent,
     ToolKey,
     event_number,
     event_path,
@@ -62,7 +63,8 @@ class SpanState:
         self.parallel_keys: dict[tuple[PathKey, str, str], SpanKey] = {}
         self.item_keys: dict[tuple[PathKey, str, int], SpanKey] = {}
         self.item_keys_by_name: dict[tuple[PathKey, str, str], deque[SpanKey]] = {}
-        self.subworkflow_parents: dict[PathKey, SpanKey] = {}
+        self.validator_item_keys: dict[tuple[PathKey, str, int], SpanKey] = {}
+        self.subworkflow_parents: dict[PathKey, SubworkflowParent] = {}
         self.tool_keys_by_id: dict[ToolKey, SpanKey] = {}
         self.tool_queues: dict[tuple[SpanKey, str], deque[SpanKey]] = {}
         self._attach_tokens: dict[SpanKey, tuple[Token[Context], asyncio.Task[None] | None]] = {}
@@ -167,10 +169,22 @@ class SpanState:
                 logger.debug("Discarded OpenTelemetry context token from completed worker task")
 
     def parent_for_path(self, path: PathKey) -> SpanKey | None:
-        """Return the nearest open workflow or remembered subworkflow parent."""
-        remembered_parent = self.subworkflow_parents.get(path)
-        if remembered_parent in self.open_spans:
-            return remembered_parent
+        """Return the nearest open workflow or remembered subworkflow parent.
+
+        An open workflow span at the exact path wins over the remembered
+        outer invocation: once a child workflow span exists, the child's
+        agents and groups attach to it, not to the delegate/item span that
+        launched the child. The remembered invocation is only the right
+        answer before that child span exists — while the child's own
+        ``workflow_started`` is being handled. Ancestor workflow spans are
+        the last resort.
+        """
+        exact_workflow = self.workflow_keys.get(path)
+        if exact_workflow in self.open_spans:
+            return exact_workflow
+        remembered = self.subworkflow_parents.get(path)
+        if remembered is not None and remembered.span_key in self.open_spans:
+            return remembered.span_key
         for length in range(len(path), -1, -1):
             key = self.workflow_keys.get(path[:length])
             if key in self.open_spans:
@@ -251,6 +265,7 @@ class SpanState:
         self.parallel_keys.clear()
         self.item_keys.clear()
         self.item_keys_by_name.clear()
+        self.validator_item_keys.clear()
         self.subworkflow_parents.clear()
         self.tool_keys_by_id.clear()
         self.tool_queues.clear()
@@ -286,11 +301,12 @@ class SpanState:
         self._discard_key_index(self.group_keys, key)
         self._discard_key_index(self.parallel_keys, key)
         self._discard_key_index(self.item_keys, key)
+        self._discard_key_index(self.validator_item_keys, key)
         self._discard_queue_index(self.agent_keys, key)
         self._discard_queue_index(self.item_keys_by_name, key)
         self._discard_queue_index(self.tool_queues, key)
         for child_path, parent in tuple(self.subworkflow_parents.items()):
-            if parent == key:
+            if parent.span_key == key:
                 self.subworkflow_parents.pop(child_path)
         for tool_identity, tool_key in tuple(self.tool_keys_by_id.items()):
             if tool_key == key:

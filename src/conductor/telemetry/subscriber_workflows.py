@@ -16,6 +16,7 @@ from conductor.telemetry.semconv import (
 from conductor.telemetry.subscriber_state import SpanState
 from conductor.telemetry.subscriber_types import (
     AttributeValue,
+    SubworkflowParent,
     event_number,
     event_path,
     event_text,
@@ -115,12 +116,14 @@ def subworkflow_started(state: SpanState, event: WorkflowEvent) -> None:
     if slot_key is None:
         return
     parent = state.latest_agent(parent_path, agent)
+    is_item = False
     if parent not in state.open_spans:
         iteration = event_number(event, "iteration")
         item_index = iteration - 1 if iteration is not None else None
         parent = state.item_key(parent_path, agent, event_text(event, "item_key"), item_index)
+        is_item = parent in state.open_spans
     if parent in state.open_spans:
-        state.subworkflow_parents[(*parent_path, slot_key)] = parent
+        state.subworkflow_parents[(*parent_path, slot_key)] = SubworkflowParent(parent, is_item)
 
 
 def subworkflow_completed(state: SpanState, event: WorkflowEvent) -> None:
@@ -138,6 +141,11 @@ def _finish_subworkflow_parent(state: SpanState, event: WorkflowEvent, *, failed
     slot_key = event_text(event, "slot_key")
     if slot_key is None:
         return
-    parent = state.subworkflow_parents.pop((*parent_path, slot_key), None)
-    if parent and parent[0].startswith(f"{INVOKE_AGENT} "):
-        state.end(parent, event, failed=failed)
+    remembered = state.subworkflow_parents.pop((*parent_path, slot_key), None)
+    if remembered is None or remembered.is_item:
+        # A for-each item parent is terminated by the item's own
+        # ``for_each_item_completed``/``for_each_item_failed`` envelope, which
+        # carries the item's terminal metadata (aggregated cost, tokens).
+        # Closing it here would end the span before that data can land.
+        return
+    state.end(remembered.span_key, event, failed=failed)
