@@ -333,6 +333,17 @@ interface ContextLayout {
   height: number;
 }
 
+function flowNodeTypeFor(nodeType: string): string {
+  if (nodeType === 'script') return 'scriptNode';
+  if (nodeType === 'set') return 'setNode';
+  if (nodeType === 'mcp') return 'mcpNode';
+  if (nodeType === 'human_gate' || nodeType === 'questions') return 'gateNode';
+  if (nodeType === 'workflow') return 'workflowNode';
+  if (nodeType === 'wait') return 'waitNode';
+  if (nodeType === 'terminate') return 'terminateNode';
+  return 'agentNode';
+}
+
 /**
  * Recursively lay out a single context and its inline-expanded descendants.
  *
@@ -366,6 +377,7 @@ function layoutContext(
   const deferredNodes: Node<GraphNodeData>[] = [];
   const deferredEdges: Edge[] = [];
 
+  const agentTypes = new Map<string, NodeType>(ctx.agents.map((a) => [a.name, (a.type || 'agent') as NodeType]));
   const agentToGroup = new Map<string, string>();
   for (const pg of ctx.parallelGroups) {
     for (const a of pg.agents) {
@@ -404,9 +416,10 @@ function layoutContext(
     for (let i = 0; i < pg.agents.length; i++) {
       const agentName = pg.agents[i]!;
       const agentNd = ctx.nodes[agentName];
+      const declaredType = (agentTypes.get(agentName) || 'agent') as NodeType;
       flowNodes.push({
         id: nid(agentName),
-        type: 'agentNode',
+        type: flowNodeTypeFor(declaredType),
         position: {
           x: GROUP_PADDING_X,
           y: GROUP_PADDING_TOP + i * (NODE_HEIGHT + GROUP_CHILD_GAP),
@@ -417,7 +430,7 @@ function layoutContext(
           label: agentName,
           name: agentName,
           contextPath: absPath,
-          type: 'agent',
+          type: declaredType,
           status: agentNd?.status || 'pending',
         },
       });
@@ -486,14 +499,7 @@ function layoutContext(
     if (agentNames.has(a.name) || groupAgents.has(a.name)) continue;
     const nodeType = (a.type || 'agent') as NodeType;
     const nd = ctx.nodes[a.name];
-    let flowNodeType = 'agentNode';
-    if (nodeType === 'script') flowNodeType = 'scriptNode';
-    else if (nodeType === 'set') flowNodeType = 'setNode';
-    else if (nodeType === 'mcp') flowNodeType = 'mcpNode';
-    else if (nodeType === 'human_gate' || nodeType === 'questions') flowNodeType = 'gateNode';
-    else if (nodeType === 'workflow') flowNodeType = 'workflowNode';
-    else if (nodeType === 'wait') flowNodeType = 'waitNode';
-    else if (nodeType === 'terminate') flowNodeType = 'terminateNode';
+    const flowNodeType = flowNodeTypeFor(nodeType);
 
     if (nodeType === 'workflow') {
       // Sequential subworkflow: slotKey === agent name. Locate its child

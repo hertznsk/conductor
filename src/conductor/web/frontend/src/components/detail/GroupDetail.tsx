@@ -128,13 +128,17 @@ function ForEachItemRow({ groupName, item }: { groupName: string; item: ForEachI
     item.prompt ||
     item.output != null ||
     (item.activity && item.activity.length > 0) ||
-    item.error_type
+    item.error_type || item.mcp_server != null
   );
 
   const metadataItems: Array<{ label: string; value: string | number | null | undefined }> = [];
   if (item.elapsed != null) metadataItems.push({ label: 'Elapsed', value: formatElapsed(item.elapsed) });
   if (item.tokens != null) metadataItems.push({ label: 'Tokens', value: formatTokens(item.tokens) });
   if (item.cost_usd != null) metadataItems.push({ label: 'Cost', value: formatCost(item.cost_usd) });
+  if (item.mcp_server) metadataItems.push({ label: 'Server', value: item.mcp_server });
+  if (item.mcp_tool) metadataItems.push({ label: 'Tool', value: item.mcp_tool });
+  if (item.mcp_result_bytes != null) metadataItems.push({ label: 'Result Bytes', value: `${item.mcp_result_bytes}${item.mcp_truncated ? ' (truncated)' : ''}` });
+  if (item.mcp_spill_path) metadataItems.push({ label: 'Spill Path', value: item.mcp_spill_path });
 
   return (
     <div className="rounded-lg border border-[var(--border)] bg-[var(--surface)] overflow-hidden">
@@ -213,6 +217,13 @@ function ForEachItemRow({ groupName, item }: { groupName: string; item: ForEachI
           {/* Metadata grid */}
           {metadataItems.length > 0 && (
             <MetadataGrid items={metadataItems} />
+          )}
+
+          {/* MCP Is Error warning */}
+          {item.mcp_is_error === true && (
+            <div className="text-xs text-amber-500 font-semibold px-1">
+              Tool reported an error (is_error)
+            </div>
           )}
 
           {/* Prompt / Input */}

@@ -1483,13 +1483,14 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
 
       const groupAgents = new Set<string>();
       const agentNames = new Set<string>();
+      const agentTypes = new Map<string, NodeType>(state.agents.map((a) => [a.name, (a.type || 'agent') as NodeType]));
 
       for (const pg of state.parallelGroups) {
         for (const a of pg.agents) groupAgents.add(a);
         agentNames.add(pg.name);
         ensureNode(state.nodes, pg.name, 'parallel_group');
         state.groupProgress[pg.name] = { total: pg.agents.length, completed: 0, failed: 0 };
-        for (const agentName of pg.agents) ensureNode(state.nodes, agentName, 'agent');
+        for (const agentName of pg.agents) ensureNode(state.nodes, agentName, agentTypes.get(agentName) || 'agent');
       }
       for (const fg of state.forEachGroups) {
         agentNames.add(fg.name);
@@ -1546,13 +1547,14 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
 
         const groupAgents = new Set<string>();
         const agentNames = new Set<string>();
+        const agentTypes = new Map<string, NodeType>(ctx.agents.map((a) => [a.name, (a.type || 'agent') as NodeType]));
 
         for (const pg of ctx.parallelGroups) {
           for (const a of pg.agents) groupAgents.add(a);
           agentNames.add(pg.name);
           ensureNode(ctx.nodes, pg.name, 'parallel_group');
           ctx.groupProgress[pg.name] = { total: pg.agents.length, completed: 0, failed: 0 };
-          for (const agentName of pg.agents) ensureNode(ctx.nodes, agentName, 'agent');
+          for (const agentName of pg.agents) ensureNode(ctx.nodes, agentName, agentTypes.get(agentName) || 'agent');
         }
         for (const fg of ctx.forEachGroups) {
           agentNames.add(fg.name);
@@ -1979,7 +1981,9 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     } else {
       const nd = ensureNode(t.nodes, data.agent_name, 'mcp');
       nd.status = 'completed';
-      t.incrCompleted();
+      if (data.group_name == null) {
+        t.incrCompleted();
+      }
       nd.elapsed = data.elapsed;
       nd.mcp_server = data.server;
       nd.mcp_tool = data.tool;

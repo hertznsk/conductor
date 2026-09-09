@@ -1413,6 +1413,53 @@ describe('workflow-store — mcp item-scoped branching', () => {
     expect(stateCompleted.nodes.my_mcp?.mcp_result_bytes).toBe(123);
   });
 
+  // Requirement: A parallel group MCP member must not increment agentsCompleted itself (Finding A).
+  it('does not double-count completion for parallel MCP members', () => {
+    useWorkflowStore.setState({ wfDepth: 0, agentsTotal: 0, agentsCompleted: 0 }); // reset
+    const { processEvent } = useWorkflowStore.getState();
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [{ name: 'member1', type: 'mcp' }],
+      routes: [],
+      parallel_groups: [{ name: 'pg1', agents: ['member1'] }],
+      for_each_groups: [],
+      entry_point: 'pg1',
+    }));
+    
+    processEvent(event('mcp_completed', {
+      agent_name: 'member1',
+      group_name: 'pg1',
+      elapsed: 1,
+      server: 'git',
+      tool: 'status',
+      is_error: false,
+    }));
+    
+    const state = useWorkflowStore.getState();
+    expect(state.agentsCompleted).toBe(0);
+    expect(state.nodes.member1?.status).toBe('completed');
+  });
+
+  // Requirement: Parallel group members must inherit their declared step type, not just 'agent' (Finding B).
+  it('assigns the declared node type to parallel group members in workflow_started', () => {
+    const { processEvent } = useWorkflowStore.getState();
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [
+        { name: 'mcp_member', type: 'mcp' },
+        { name: 'script_member', type: 'script' }
+      ],
+      routes: [],
+      parallel_groups: [{ name: 'pg1', agents: ['mcp_member', 'script_member'] }],
+      for_each_groups: [],
+      entry_point: 'pg1',
+    }));
+    
+    const state = useWorkflowStore.getState();
+    expect(state.nodes.mcp_member?.type).toBe('mcp');
+    expect(state.nodes.script_member?.type).toBe('script');
+  });
+
   // Requirement: Two concurrently active item_keys with interleaved completions must not cross-contaminate.
   it('updates for_each_items independently without touching the group node or each other (interleaved)', () => {
     const { processEvent } = useWorkflowStore.getState();
