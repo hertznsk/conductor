@@ -264,6 +264,18 @@ class TestResolver:
 
 
 class TestNativeOtelSpansActive:
+    @pytest.fixture(autouse=True)
+    def _active_telemetry(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Latch an active telemetry run so the active-run gate passes.
+
+        Every case in this class exercises the provider/protocol matrix; the
+        inactive-run half of the contract lives in
+        ``test_inactive_without_an_active_telemetry_run``.
+        """
+        monkeypatch.setattr(
+            "conductor.telemetry.guards.is_telemetry_active", lambda: True
+        )
+
     @pytest.mark.parametrize(
         ("provider_name", "telemetry_protocol", "expected"),
         [
@@ -383,6 +395,26 @@ class TestNativeOtelSpansActive:
             native_otel_spans_active(
                 "copilot", mismatched_settings, telemetry_protocol="http/protobuf"
             )
+            is False
+        )
+
+    def test_inactive_without_an_active_telemetry_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Given no telemetry initialized for the run, when even a natively
+        # capable provider is evaluated, then it reports inactive rather than
+        # answering from static capability alone.
+        monkeypatch.setattr(
+            "conductor.telemetry.guards.is_telemetry_active", lambda: False
+        )
+        native_capabilities = _stable_capabilities(native_otel_spans=True)
+        monkeypatch.setattr(
+            "conductor.providers.capabilities.get_capabilities",
+            lambda _provider_name: native_capabilities,
+        )
+
+        assert (
+            native_otel_spans_active("openai", None, telemetry_protocol="http/protobuf")
             is False
         )
 

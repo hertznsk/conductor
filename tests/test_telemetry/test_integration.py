@@ -58,6 +58,10 @@ class MockProviderRegistry:
     async def get_provider(self, agent: AgentDef) -> AgentProvider:
         return self.provider
 
+    def provider_settings_for(self, provider_type: str) -> None:
+        """The mock provider carries no structured runtime settings."""
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Helpers

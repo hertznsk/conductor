@@ -139,6 +139,10 @@ class _StubRegistry:
     async def get_provider(self, agent: object) -> AgentProvider:
         return self._provider
 
+    def provider_settings_for(self, provider_type: object) -> None:
+        """The stub provider carries no structured runtime settings."""
+        return None
+
     async def close(self) -> None:
         return None
 

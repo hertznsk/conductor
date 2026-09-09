@@ -50,6 +50,10 @@ class _ProviderRegistry:
     def get_active_providers(self) -> dict[str, Any]:
         return {}
 
+    def provider_settings_for(self, provider_type: str) -> None:
+        """The test provider carries no structured runtime settings."""
+        return None
+
 
 @pytest.fixture(autouse=True)
 def reset_telemetry_context() -> Generator[None]:

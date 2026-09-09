@@ -363,7 +363,7 @@ class TestAgentEvents:
     """Tests for agent_started, agent_completed, and agent_failed events."""
 
     @pytest.mark.asyncio
-    async def test_agent_started_and_completed(self) -> None:
+    async def test_agent_started_and_completed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """agent_started and agent_completed events are emitted for each agent."""
         emitter, collector = _make_emitter_and_collector()
         config = WorkflowConfig(
@@ -394,6 +394,10 @@ class TestAgentEvents:
             output={"result": "{{ b.output.val }}"},
         )
         provider = CopilotProvider(mock_handler=lambda a, p, c: {"val": a.name})
+        # Native-span reporting is gated on an active telemetry run: with no
+        # OTLP endpoint configured every provider reports inactive, so the
+        # differentiation below requires latching an active run.
+        monkeypatch.setattr("conductor.telemetry.guards.is_telemetry_active", lambda: True)
         engine = WorkflowEngine(config, provider, event_emitter=emitter)
         await engine.run({})
 
@@ -458,6 +462,7 @@ class TestAgentEvents:
             "conductor.engine.workflow.guards.current_otlp_protocol",
             lambda: "grpc",
         )
+        monkeypatch.setattr("conductor.telemetry.guards.is_telemetry_active", lambda: True)
         engine = WorkflowEngine(config, provider, event_emitter=emitter)
         await engine.run({})
 
@@ -523,7 +528,10 @@ class TestAgentEvents:
         event = collector.first("agent_started")
         assert event.data["provider"] == "copilot"
         assert event.data["native_otel_spans_active"] is True
-        assert calls == [("copilot", runtime.provider, "http/protobuf")]
+        # Settings naming a different provider are not forwarded at all —
+        # the engine resolves None rather than handing Copilot Claude's
+        # structured settings for the function to discard.
+        assert calls == [("copilot", None, "http/protobuf")]
 
     @pytest.mark.asyncio
     async def test_agent_failed_on_error(self) -> None:
@@ -894,6 +902,7 @@ class TestParallelGroupEvents:
             output={"result": "done"},
         )
         provider = CopilotProvider(mock_handler=lambda a, p, c: {"result": a.name})
+        monkeypatch.setattr("conductor.telemetry.guards.is_telemetry_active", lambda: True)
         monkeypatch.setattr(
             provider,
             "_execute_with_retry",
@@ -1111,7 +1120,7 @@ class TestForEachGroupEvents:
     """Tests for for-each group event emission."""
 
     @pytest.mark.asyncio
-    async def test_for_each_lifecycle_events(self) -> None:
+    async def test_for_each_lifecycle_events(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """for_each_started, item_started, item_completed, for_each_completed emitted."""
         emitter, collector = _make_emitter_and_collector()
         config = WorkflowConfig(
@@ -1157,6 +1166,7 @@ class TestForEachGroupEvents:
             return {"result": "processed"}
 
         provider = CopilotProvider(mock_handler=handler)
+        monkeypatch.setattr("conductor.telemetry.guards.is_telemetry_active", lambda: True)
         engine = WorkflowEngine(config, provider, event_emitter=emitter)
         await engine.run({})
 

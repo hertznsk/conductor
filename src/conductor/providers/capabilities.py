@@ -29,6 +29,7 @@ from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from conductor.plugins.manifest import PluginFlavor
 from conductor.providers.reasoning import ReasoningEffort
+from conductor.telemetry import guards
 
 if TYPE_CHECKING:
     from conductor.config.schema import ProviderSettings
@@ -560,6 +561,13 @@ def native_otel_spans_active(
     telemetry_protocol: str | None,
 ) -> bool:
     """Return whether the resolved provider can emit native OTEL spans for this run."""
+    # Native instrumentation is only ever wired when this run actually
+    # initialized tracing — a static capability alone says nothing about a
+    # run with no endpoint configured, tracing disabled, or a failed init.
+    # Keep the static answer in has_native_otel_spans(); this function is
+    # about the active run.
+    if not guards.is_telemetry_active():
+        return False
     try:
         native_otel_spans = get_capabilities(provider_name).native_otel_spans
     except (AttributeError, ImportError, KeyError):

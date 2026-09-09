@@ -14,7 +14,7 @@ from conductor.providers.base import AgentProvider
 from conductor.providers.factory import create_provider
 
 if TYPE_CHECKING:
-    from conductor.config.schema import AgentDef, WorkflowConfig
+    from conductor.config.schema import AgentDef, ProviderSettings, WorkflowConfig
 
 
 ProviderType = ProviderName
@@ -167,6 +167,20 @@ class ProviderRegistry:
 
             self._providers[provider_type] = provider
             return provider
+
+    def provider_settings_for(self, provider_type: ProviderType) -> ProviderSettings | None:
+        """Return the structured settings this registry constructs a provider with.
+
+        Sub-workflow engines share this registry, so the answer reflects the
+        root configuration that actually built the provider instance — not
+        the child workflow's own ``runtime.provider``, which may carry no
+        connection settings at all (e.g. an inherited external Copilot
+        ``runtime_url``). Mirrors the matching-name rule in
+        ``_get_or_create_provider``: settings apply only to the provider they
+        name.
+        """
+        provider = self._config.workflow.runtime.provider
+        return provider if provider.name == provider_type else None
 
     async def close(self) -> None:
         """Close all provider instances.

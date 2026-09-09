@@ -79,7 +79,13 @@ MAX_SUBWORKFLOW_DEPTH = 10
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from conductor.config.schema import AgentDef, ForEachDef, ParallelGroup, WorkflowConfig
+    from conductor.config.schema import (
+        AgentDef,
+        ForEachDef,
+        ParallelGroup,
+        ProviderName,
+        WorkflowConfig,
+    )
     from conductor.interrupt.listener import KeyboardListener
     from conductor.plugins.marketplace import Marketplace
     from conductor.providers.base import AgentProvider
@@ -2238,6 +2244,26 @@ class WorkflowEngine:
                 logger.debug("Provider lookup via registry failed for %s: %s", agent.name, e)
                 return None
         return self._single_provider
+
+    def _native_otel_spans_active_for(self, provider_name: ProviderName) -> bool:
+        """Report native-span availability from the provider actually executing.
+
+        Settings come from the registry that constructs provider instances —
+        child engines inherit the parent's registry, so reading this child
+        workflow's own ``runtime.provider`` would report an inherited external
+        Copilot runtime as natively traced even though Conductor never
+        configured that runtime's telemetry.
+        """
+        if self._registry is not None:
+            provider_settings = self._registry.provider_settings_for(provider_name)
+        else:
+            provider = self.config.workflow.runtime.provider
+            provider_settings = provider if provider.name == provider_name else None
+        return native_otel_spans_active(
+            provider_name,
+            provider_settings,
+            telemetry_protocol=guards.current_otlp_protocol(),
+        )
 
     def _note_pricing_hook_result(self, model: str, pricing: ModelPricing | None) -> None:
         """Record what the provider pricing hook returned for ``model``.
@@ -4571,10 +4597,8 @@ class WorkflowEngine:
                             # dashboard and the JSONL log never mention cannot
                             # be audited after the fact.
                             started_payload["settings_dir"] = resolved_agent.settings_dir
-                            started_payload["native_otel_spans_active"] = native_otel_spans_active(
-                                event_provider,
-                                self.config.workflow.runtime.provider,
-                                telemetry_protocol=guards.current_otlp_protocol(),
+                            started_payload["native_otel_spans_active"] = (
+                                self._native_otel_spans_active_for(event_provider)
                             )
                         self._emit("agent_started", started_payload)
 
@@ -6297,10 +6321,8 @@ class WorkflowEngine:
                         "working_dir": resolved_agent.working_dir,
                         "settings_dir": resolved_agent.settings_dir,
                         "provider": event_provider,
-                        "native_otel_spans_active": native_otel_spans_active(
-                            event_provider,
-                            self.config.workflow.runtime.provider,
-                            telemetry_protocol=guards.current_otlp_protocol(),
+                        "native_otel_spans_active": self._native_otel_spans_active_for(
+                            event_provider
                         ),
                     },
                 )
@@ -6808,10 +6830,8 @@ class WorkflowEngine:
                         "working_dir": qualified_agent.working_dir,
                         "settings_dir": qualified_agent.settings_dir,
                         "provider": event_provider,
-                        "native_otel_spans_active": native_otel_spans_active(
-                            event_provider,
-                            self.config.workflow.runtime.provider,
-                            telemetry_protocol=guards.current_otlp_protocol(),
+                        "native_otel_spans_active": self._native_otel_spans_active_for(
+                            event_provider
                         ),
                     },
                 )
