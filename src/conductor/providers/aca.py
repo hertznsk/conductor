@@ -1066,12 +1066,14 @@ class AcaRuntimeProvider(AgentProvider):
         agent: AgentDef,
         context: dict[str, Any],
         rendered_prompt: str,
+        *,
         tools: list[str] | None = None,
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
+        continuation_state: object | None = None,
     ) -> AgentOutput:
         """Delegate execution to the in-sandbox runner over Branch S streaming.
 
@@ -1088,10 +1090,14 @@ class AcaRuntimeProvider(AgentProvider):
         `custom_agents` and `extra_mcp_servers` are ignored for the same
         reason: a plugin's subagent definitions and MCP declarations are
         host paths too, so `CAPABILITIES.plugins` is `False` and
-        `plugins:` is rejected before this point.
+        `plugins:` is rejected before this point. `continuation_state` is
+        likewise ignored: the in-sandbox conversation is ephemeral, so
+        `supports_continuation` is `False`, this provider never populates
+        `AgentOutput.continuation_state`, and it is never handed one back.
         """
         del skill_directories  # Host paths are meaningless in-sandbox (see docstring).
         del custom_agents, extra_mcp_servers  # Same: host-side plugin content.
+        del continuation_state  # No continuation surface (see docstring).
         logical_id = self.identifier_for(agent, context)
         # Reserve the wire identifier for the full lifetime of this request
         # (acquired before the request starts, released once it finishes —

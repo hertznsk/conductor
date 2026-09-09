@@ -120,6 +120,55 @@ class TestValidatorMainLoop:
         assert _validator_rows(engine) == ["reviewer (validator)"]
 
     @pytest.mark.asyncio
+    async def test_fail_then_continues_provider_state(self) -> None:
+        # Requirement: a validator retry continues provider state with feedback only.
+        continuation = ["original request", "original response"]
+        calls: list[dict[str, Any]] = []
+
+        async def exec_fn(
+            *,
+            agent: AgentDef,
+            rendered_prompt: str,
+            continuation_state: Any = None,
+            **kwargs: Any,
+        ) -> AgentOutput:
+            calls.append(
+                {
+                    "agent": agent,
+                    "prompt": rendered_prompt,
+                    "continuation_state": continuation_state,
+                }
+            )
+            if _is_validator_agent(agent):
+                return AgentOutput(
+                    content={"passed": False, "issues": ["fix null safety"]},
+                    raw_response="",
+                    model="judge",
+                )
+            return AgentOutput(
+                content={"summary": "corrected"},
+                raw_response="",
+                model="gpt-4",
+            )
+
+        engine, executor, agent = TestValidatorCostAndFailurePaths()._engine_and_executor(
+            exec_fn, continuation_capable=True
+        )
+        original = AgentOutput(
+            content={"summary": "draft"},
+            raw_response="",
+            model="gpt-4",
+            continuation_state=continuation,
+        )
+
+        result = await engine._apply_validator(agent, original, 0.5, {}, executor, None, None)
+
+        assert result.content == {"summary": "corrected"}
+        primary_rerun = calls[-1]
+        assert primary_rerun["continuation_state"] is continuation
+        assert primary_rerun["prompt"].startswith("## Validation feedback")
+        assert "Review the diff." not in primary_rerun["prompt"]
+
     async def test_fail_then_rerun_succeeds(self) -> None:
         """Validator fails → primary re-runs once with feedback appended."""
         primary_prompts: list[str] = []
@@ -144,6 +193,9 @@ class TestValidatorMainLoop:
         # Primary ran twice (initial + re-run); validator graded once.
         assert primary_calls == 2
         assert result["summary"] == "answer 2"
+        # The stateless re-run rebuilds the full prompt: the second prompt is
+        # the first prompt plus the feedback, never a feedback-only stub.
+        assert primary_prompts[1].startswith(primary_prompts[0])
         # Re-run prompt carries the validation feedback section + the issue.
         assert "## Validation feedback" in primary_prompts[1]
         assert "missing null-safety check" in primary_prompts[1]
@@ -382,7 +434,11 @@ class TestValidatorCostAndFailurePaths:
     """
 
     def _engine_and_executor(
-        self, exec_fn: Any, *, timeout_seconds: float | None = None
+        self,
+        exec_fn: Any,
+        *,
+        timeout_seconds: float | None = None,
+        continuation_capable: bool = False,
     ) -> tuple[WorkflowEngine, AgentExecutor, AgentDef]:
         agent = AgentDef(
             name="reviewer",
@@ -404,7 +460,16 @@ class TestValidatorCostAndFailurePaths:
             agents=[agent],
             output={"summary": "{{ reviewer.output.summary }}"},
         )
-        provider = CopilotProvider(mock_handler=lambda a, p, c: {})
+
+        class _CapableCopilotProvider(CopilotProvider, abstract=True):
+            # Test double for continuation tests: declares the support the
+            # executor's guard requires so the state is let through.
+            @property
+            def supports_continuation(self) -> bool:
+                return True
+
+        provider_cls = _CapableCopilotProvider if continuation_capable else CopilotProvider
+        provider = provider_cls(mock_handler=lambda a, p, c: {})
         provider.execute = exec_fn  # type: ignore[method-assign]
         engine = WorkflowEngine(config, provider)
         executor = AgentExecutor(provider, workflow_tools=[])
@@ -489,6 +554,11 @@ class TestValidatorCostAndFailurePaths:
         assert len(vrows) == 1  # only the grading call
         failed = [d for (e, d) in events if e == "agent_validation_failed"]
         assert any(d.get("rerun_errored") for d in failed)
+        # The rerun-errored emission carries the failure cause, so the one
+        # user-visible surface says *why* the re-run failed, not just *that*.
+        rerun_failed = next(d for d in failed if d.get("rerun_errored"))
+        assert rerun_failed["error"] == "RuntimeError: rerun boom"
+        assert rerun_failed["continued"] is False
 
         # Requirement (issue #357): the handled fail-open path must not print a
         # traceback at WARNING level — a concise warning names the exception, and
@@ -510,6 +580,123 @@ class TestValidatorCostAndFailurePaths:
             if r.name == "conductor.engine.workflow" and r.levelno == logging.DEBUG
         ]
         assert any(r.exc_info is not None for r in debugs)
+
+    @pytest.mark.asyncio
+    async def test_continuation_rerun_failure_fails_open_to_original(self) -> None:
+        # Requirement: a validator re-run that fails while continuing the
+        # provider conversation must fail open to the original output — the
+        # same contract as the stateless re-run — with the continuation state
+        # having actually reached the failed re-run.
+        continuation = ["original request", "original response"]
+        seen_states: list[Any] = []
+
+        async def exec_fn(
+            *,
+            agent: AgentDef,
+            rendered_prompt: str,
+            continuation_state: Any = None,
+            **kw: Any,
+        ) -> AgentOutput:
+            if _is_validator_agent(agent):
+                return AgentOutput(
+                    content={"passed": False, "issues": ["fix"]},
+                    raw_response="",
+                    model="judge",
+                )
+            seen_states.append(continuation_state)
+            raise RuntimeError("continuation rerun boom")
+
+        engine, executor, agent = self._engine_and_executor(exec_fn, continuation_capable=True)
+        original = AgentOutput(
+            content={"summary": "orig"},
+            raw_response="",
+            model="gpt-4",
+            continuation_state=continuation,
+        )
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        result = await engine._apply_validator(
+            agent, original, 0.5, {}, executor, None, lambda e, d: events.append((e, d))
+        )
+
+        assert result is original
+        assert seen_states == [continuation]
+        rerun_failed = next(
+            d for (e, d) in events if e == "agent_validation_failed" and d.get("rerun_errored")
+        )
+        assert rerun_failed["error"] == "RuntimeError: continuation rerun boom"
+        assert rerun_failed["continued"] is True
+
+    @pytest.mark.asyncio
+    async def test_continuation_state_never_reaches_events_or_checkpoint(
+        self, tmp_path: Any
+    ) -> None:
+        # Requirement: continuation_state is provider-opaque and in-memory
+        # only — an arbitrary object must survive neither into emitted event
+        # payloads nor into a checkpoint's JSON.
+        import json
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from conductor.engine.checkpoint import CheckpointManager
+
+        sentinel = object()
+
+        async def exec_fn(*, agent: AgentDef, rendered_prompt: str, **kw: Any) -> AgentOutput:
+            if _is_validator_agent(agent):
+                return AgentOutput(
+                    content={"passed": False, "issues": ["fix"]},
+                    raw_response="",
+                    model="judge",
+                )
+            return AgentOutput(content={"summary": "v2"}, raw_response="", model="gpt-4")
+
+        engine, executor, agent = self._engine_and_executor(exec_fn, continuation_capable=True)
+        original = AgentOutput(
+            content={"summary": "orig"},
+            raw_response="",
+            model="gpt-4",
+            continuation_state=sentinel,
+        )
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        result = await engine._apply_validator(
+            agent, original, 0.5, {}, executor, None, lambda e, d: events.append((e, d))
+        )
+        assert result.content == {"summary": "v2"}
+
+        def _contains(obj: Any) -> bool:
+            if obj is sentinel:
+                return True
+            if isinstance(obj, dict):
+                return any(_contains(k) or _contains(v) for k, v in obj.items())
+            if isinstance(obj, list | tuple):
+                return any(_contains(i) for i in obj)
+            return False
+
+        assert events  # the retry emitted validator events
+        assert not any(_contains(d) for _, d in events)
+        for _, data in events:
+            json.dumps(data)  # payloads stay JSON-clean without coercion
+
+        # The engine stores output.content (a plain dict), so a checkpoint
+        # taken after the retry round-trips through JSON with no trace of the
+        # sentinel.
+        engine.context.store(agent.name, result.content)
+        workflow_file = Path(tmp_path) / "w.yaml"
+        workflow_file.write_text("workflow: {}")
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=Path(tmp_path)):
+            checkpoint_path = CheckpointManager.save_checkpoint(
+                workflow_path=workflow_file,
+                context=engine.context,
+                limits=engine.limits,
+                current_agent=agent.name,
+                error=RuntimeError("boom"),
+                inputs={},
+            )
+        assert checkpoint_path is not None
+        saved = json.loads(checkpoint_path.read_text())
+        assert not _contains(saved)
 
     @pytest.mark.asyncio
     async def test_partial_rerun_keeps_original(self) -> None:

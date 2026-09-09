@@ -20,7 +20,7 @@ from typing import Any
 import pytest
 from pydantic_ai import Agent, AgentRetries, UsageLimits
 from pydantic_ai.exceptions import UnexpectedModelBehavior
-from pydantic_ai.messages import ModelResponse, TextPart
+from pydantic_ai.messages import ModelResponse, TextPart, UserPromptPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.output import ToolOutput
@@ -135,6 +135,121 @@ class TestInterruptBeforeRun:
         assert outcome.is_partial is True
         assert outcome.last_call_input_tokens is not None
         assert outcome.last_call_input_tokens > 0
+
+    @pytest.mark.asyncio
+    async def test_interrupt_before_run_with_history_uses_history_not_new_prompt(self) -> None:
+        # Requirement: a pre-run interrupt on a continued run asks for a
+        # partial result based on the *prior conversation*; the new user
+        # prompt (validator feedback) never reaches the model. The engine
+        # discards partial re-runs, so this fails safe — pinned here as a
+        # decision rather than an accident.
+        seen: list[list[Any]] = []
+
+        async def _spy(messages: list[Any], info: Any) -> ModelResponse:
+            seen.append(messages)
+            return ModelResponse(parts=[TextPart(content="some text")])
+
+        agent = Agent(FunctionModel(_spy), output_type=str, retries=0)
+        first = await run_with_interrupt(
+            agent,
+            "original request",
+            interrupt_signal=None,
+            event_callback=None,
+            has_output_schema=False,
+        )
+        assert first.result is not None
+        history = first.result.all_messages()
+
+        signal = asyncio.Event()
+        signal.set()
+        outcome = await run_with_interrupt(
+            agent,
+            "validation feedback",
+            interrupt_signal=signal,
+            event_callback=None,
+            has_output_schema=False,
+            message_history=history,
+        )
+
+        assert outcome.is_partial is True
+        blob = "\n".join(str(m) for m in seen[-1])
+        assert "original request" in blob
+        assert "validation feedback" not in blob
+
+
+class TestMessageHistoryContinuation:
+    """Requirement: a follow-up run continues the completed message history."""
+
+    @pytest.mark.asyncio
+    async def test_message_history_is_followed_by_new_user_turn(self) -> None:
+        # Requirement: validator feedback must be a new user turn after the first run.
+        agent = _make_text_agent()
+        first = await run_with_interrupt(
+            agent,
+            "original request",
+            interrupt_signal=None,
+            event_callback=None,
+            has_output_schema=False,
+        )
+        assert first.result is not None
+        history = first.result.all_messages()
+
+        second = await run_with_interrupt(
+            agent,
+            "validation feedback",
+            interrupt_signal=None,
+            event_callback=None,
+            has_output_schema=False,
+            message_history=history,
+        )
+
+        assert second.result is not None
+        messages = second.result.all_messages()
+        assert messages[: len(history)] == history
+        final_request = messages[-2]
+        assert isinstance(final_request.parts[0], UserPromptPart)
+        assert final_request.parts[0].content == "validation feedback"
+
+    @pytest.mark.asyncio
+    async def test_structured_output_history_is_continued(self) -> None:
+        # Requirement: validator retries only apply to schema-output agents,
+        # whose completed history ends in the output tool's
+        # ToolCallPart/ToolReturnPart pair — the continuation case production
+        # actually hits.
+        output_schema = {"answer": OutputField(type="string")}
+        dynamic_model = output_schema_to_pydantic_model("FormatterOutput", output_schema)
+        assert dynamic_model is not None
+        agent = Agent(
+            TestModel(custom_output_args={"answer": "first"}),
+            output_type=ToolOutput(dynamic_model),
+            retries=0,
+        )
+        first = await run_with_interrupt(
+            agent,
+            "format this",
+            interrupt_signal=None,
+            event_callback=None,
+            has_output_schema=True,
+        )
+        assert first.result is not None
+        history = first.result.all_messages()
+
+        second = await run_with_interrupt(
+            agent,
+            "validation feedback",
+            interrupt_signal=None,
+            event_callback=None,
+            has_output_schema=True,
+            message_history=history,
+        )
+
+        assert second.result is not None
+        messages = second.result.all_messages()
+        assert messages[: len(history)] == history
+        assert len(messages) > len(history)
+        new_turn = messages[len(history)]
+        assert isinstance(new_turn.parts[0], UserPromptPart)
+        assert new_turn.parts[0].content == "validation feedback"
 
 
 class TestInterruptMidRun:

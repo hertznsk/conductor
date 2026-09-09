@@ -25,7 +25,7 @@ import asyncio
 import inspect
 import logging
 import os
-from typing import Any, get_args
+from typing import TYPE_CHECKING, Any, cast, get_args
 
 from pydantic import BaseModel
 
@@ -46,6 +46,11 @@ from conductor.providers.reasoning import (
     effort_to_budget_tokens,
     is_claude_thinking_model,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from pydantic_ai.messages import ModelMessage
 
 # Try to import the Anthropic SDK
 try:
@@ -176,6 +181,11 @@ class ClaudeProvider(AgentProvider):
         upstream_pin=None,
         maintainer="@microsoft/conductor",
     )
+
+    @property
+    def supports_continuation(self) -> bool:
+        """Pydantic AI message history resumes a completed run in memory."""
+        return True
 
     def __init__(
         self,
@@ -1042,12 +1052,14 @@ class ClaudeProvider(AgentProvider):
         agent: AgentDef,
         context: dict[str, Any],
         rendered_prompt: str,
+        *,
         tools: list[str] | None = None,
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
+        continuation_state: object | None = None,
     ) -> AgentOutput:
         """Execute an agent using the Pydantic AI pipeline.
 
@@ -1070,6 +1082,10 @@ class ClaudeProvider(AgentProvider):
                 :class:`AgentExecutor` refuses ``plugins:`` on this
                 provider before reaching here and this is always ``None``.
             extra_mcp_servers: Ignored, for the same reason.
+            continuation_state: Optional Pydantic AI message history from a
+                completed run on this provider. When provided, the run
+                continues that conversation with ``rendered_prompt`` as the
+                next user turn (``supports_continuation`` is ``True``).
 
         Returns:
             Normalized AgentOutput with structured content.
@@ -1202,6 +1218,11 @@ class ClaudeProvider(AgentProvider):
 
         self._retry_history.clear()
 
+        # continuation_state is ``object`` at the AgentOutput boundary because
+        # the value is provider-opaque; on this provider it can only be the
+        # ``all_messages()`` list a prior execute() produced.
+        message_history = cast("Sequence[ModelMessage] | None", continuation_state)
+
         return await run_agent_pipeline(
             agent=agent,
             rendered_prompt=rendered_prompt,
@@ -1216,5 +1237,6 @@ class ClaudeProvider(AgentProvider):
             default_model=self._default_model,
             retry_history=self._retry_history,
             build_agent_fn=build_agent_fn,
+            message_history=message_history,
             compaction=compaction_cfg,
         )

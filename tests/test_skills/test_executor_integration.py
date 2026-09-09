@@ -49,6 +49,7 @@ class _StubNonNativeProvider(AgentProvider, abstract=True):
         skill_directories: list[str] | None = None,
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
+        continuation_state: Any = None,
     ) -> AgentOutput:
         self.captured = skill_directories
         return AgentOutput(content={"echo": rendered_prompt}, raw_response=rendered_prompt)
@@ -102,6 +103,7 @@ class _CapturingNativeProvider(AgentProvider, abstract=True):
         skill_directories: list[str] | None = None,
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
+        continuation_state: Any = None,
     ) -> AgentOutput:
         self.captured = skill_directories
         return AgentOutput(content={"ok": True}, raw_response="ok")

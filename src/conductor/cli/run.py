@@ -1085,6 +1085,8 @@ class ConsoleEventSubscriber:
             )
             for issue in issues:
                 verbose_log(f"    - {issue}", style="dim")
+            if d.get("rerun_errored") and d.get("error"):
+                verbose_log(f"    cause: {d.get('error')}", style=style)
 
         elif t == "skill_injection_warning":
             # Only reaches the console through this branch: the executor's
@@ -2751,12 +2753,14 @@ def build_dry_run_plan(workflow_path: Path) -> ExecutionPlan:
             agent: AgentDef,
             context: dict[str, Any],
             rendered_prompt: str,
+            *,
             tools: list[str] | None = None,
             interrupt_signal: asyncio.Event | None = None,
             event_callback: Any = None,
             skill_directories: list[str] | None = None,
             custom_agents: list[dict[str, Any]] | None = None,
             extra_mcp_servers: dict[str, Any] | None = None,
+            continuation_state: object | None = None,
         ) -> AgentOutput:
             return AgentOutput(content={}, raw_response="")
 

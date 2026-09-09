@@ -360,7 +360,7 @@ async def _stream_execute(
                 agent,
                 payload.context,
                 payload.rendered_prompt,
-                payload.tools,
+                tools=payload.tools,
                 event_callback=emit,
             )
         except Exception as exc:  # broad: forwarded as an error frame, never swallowed

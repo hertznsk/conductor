@@ -1674,7 +1674,12 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
     const t = activeTarget(state, _data);
     const nd = ensureNode(t.nodes, data.agent_name);
-    nd.prompt = data.rendered_prompt;
+    // A continuation retry sends only the new follow-up turn — the original
+    // task prompt lives in the provider-held conversation — so the panel
+    // keeps the existing prompt and appends the turn instead of replacing it.
+    nd.prompt = data.continuation
+      ? `${nd.prompt ?? ''}\n\n${data.rendered_prompt}`
+      : data.rendered_prompt;
     nd.context_keys = data.context_keys;
     if (itemKey) {
       addForEachItemActivity(t.nodes, data.agent_name, itemKey, {
@@ -1684,7 +1689,11 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
       const itemNd = t.nodes[data.agent_name];
       if (itemNd?.for_each_items) {
         const item = itemNd.for_each_items.find((i) => i.key === itemKey);
-        if (item) item.prompt = data.rendered_prompt;
+        if (item) {
+          item.prompt = data.continuation
+            ? `${item.prompt ?? ''}\n\n${data.rendered_prompt}`
+            : data.rendered_prompt;
+        }
       }
     }
     replaceNode(t.nodes, data.agent_name);
@@ -2633,7 +2642,10 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
         : data.will_retry
           ? 're-running once with feedback'
           : 'validation failed (no retry)',
-      detail: data.issues && data.issues.length ? data.issues.join('\n') : null,
+      detail: [
+        ...(data.issues && data.issues.length ? [data.issues.join('\n')] : []),
+        ...(rerunErrored && data.error ? [`cause: ${data.error}`] : []),
+      ].join('\n') || null,
     };
     addActivity(t.nodes, data.agent_name, entry);
     if (itemKey != null) {

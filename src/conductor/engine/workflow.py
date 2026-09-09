@@ -4072,8 +4072,12 @@ class WorkflowEngine:
         4. Otherwise emit ``agent_validation_failed`` (always, on every
            failure — including ``max_retries == 0``). When ``max_retries > 0``,
            re-run the primary agent exactly once with a ``## Validation
-           feedback`` section appended and take the re-run output as final
-           (no second validation loop). When ``max_retries == 0``, return
+           feedback`` section and take the re-run output as final
+           (no second validation loop). The re-run continues the provider's
+           in-memory conversation when the primary output carries a
+           ``continuation_state`` (the feedback is the sole new user turn),
+           and rebuilds the prompt statelessly with the feedback appended
+           otherwise. When ``max_retries == 0``, return
            ``output`` unchanged.
 
         Validation is fail-open: a validator error never blocks the workflow
@@ -4094,7 +4098,9 @@ class WorkflowEngine:
             agent_context: Context the primary agent executed against.
             executor: Executor (and provider) for the primary agent.
             guidance_section: Any guidance already appended to the primary
-                prompt; the validation feedback is appended after it on re-run.
+                prompt. On a stateless re-run the validation feedback is
+                appended after it; on a continuation re-run it is already
+                inside the provider-held conversation and is not re-sent.
             event_callback: Callback used to emit validator events and stream
                 re-run events with the correct agent/item tagging. May be
                 ``None`` when no emitter is configured.
@@ -4197,14 +4203,26 @@ class WorkflowEngine:
             return output
 
         feedback = self._build_validation_feedback(outcome.issues)
-        new_guidance = (guidance_section or "") + feedback
+        continuation_state = output.continuation_state
+        if continuation_state is None:
+            # Stateless re-run: the whole prompt is rebuilt, so the feedback
+            # lands after any guidance already appended to the primary prompt.
+            rerun_guidance = (guidance_section or "") + feedback
+        else:
+            # The provider still holds the first run's conversation, which
+            # already contains the rendered prompt *and* guidance_section —
+            # re-sending either would duplicate it. The feedback is the sole
+            # new user turn, lstripped because _build_validation_feedback
+            # prefixes newlines for the append case.
+            rerun_guidance = feedback.lstrip()
         try:
             new_output = await self._execute_with_agent_timeout(
                 agent,
                 executor.execute(
                     agent,
                     agent_context,
-                    guidance_section=new_guidance,
+                    guidance_section=rerun_guidance,
+                    continuation_state=continuation_state,
                     interrupt_signal=self._interrupt_event,
                     event_callback=event_callback,
                 ),
@@ -4233,7 +4251,16 @@ class WorkflowEngine:
             )
             _emit_v(
                 "agent_validation_failed",
-                {"issues": outcome.issues, "will_retry": False, "rerun_errored": True},
+                {
+                    "issues": outcome.issues,
+                    "will_retry": False,
+                    "rerun_errored": True,
+                    # The one user-visible surface for this failure: without
+                    # the cause the event says *that* the re-run failed but
+                    # never *why*.
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "continued": output.continuation_state is not None,
+                },
             )
             return output
 
@@ -4252,7 +4279,12 @@ class WorkflowEngine:
 
     @staticmethod
     def _build_validation_feedback(issues: list[str]) -> str:
-        """Build the ``## Validation feedback`` section appended on re-run."""
+        """Build the ``## Validation feedback`` section for the re-run.
+
+        Prefixed with newlines for the append case (stateless re-run);
+        callers handing it to a continuation re-run strip them, since the
+        section is then the entire user turn.
+        """
         if issues:
             bullets = "\n".join(f"- {issue}" for issue in issues)
         else:

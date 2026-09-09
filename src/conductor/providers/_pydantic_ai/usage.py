@@ -103,6 +103,7 @@ def build_agent_output(
     usage: RunUsage | None = None,
     model: str | None = None,
     last_call_input_tokens: int | None = None,
+    continuation_state: object | None = None,
 ) -> AgentOutput:
     """Build a normalized ``AgentOutput`` from Pydantic AI result pieces.
 
@@ -118,6 +119,7 @@ def build_agent_output(
         last_call_input_tokens: Prompt tokens of the most recent single API
             call, for the context-window bar (issue #412). See
             :func:`last_request_input_tokens`.
+        continuation_state: Provider-specific state for a follow-up execution.
 
     Returns:
         A fully populated ``AgentOutput`` ready for the Conductor engine.
@@ -133,6 +135,7 @@ def build_agent_output(
         cache_read_tokens=fields["cache_read_tokens"],
         cache_write_tokens=fields["cache_write_tokens"],
         last_call_input_tokens=last_call_input_tokens,
+        continuation_state=continuation_state,
     )
 
 

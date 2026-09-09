@@ -19,7 +19,7 @@ import json
 import logging
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from conductor.exceptions import ProviderError, ValidationError
 from conductor.executor.output import parse_json_output, validate_output
@@ -121,6 +121,13 @@ class HermesProvider(AgentProvider):
         maintainer="(community contribution)",
     )
 
+    @property
+    def supports_continuation(self) -> bool:
+        """Hermes resumes a completed run via ``run_conversation``'s
+        ``conversation_history`` — the same mechanism checkpoint resume
+        already uses."""
+        return True
+
     def __init__(
         self,
         model: str | None = None,
@@ -201,12 +208,14 @@ class HermesProvider(AgentProvider):
         agent: AgentDef,
         context: dict[str, Any],
         rendered_prompt: str,
+        *,
         tools: list[str] | None = None,
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
+        continuation_state: object | None = None,
     ) -> AgentOutput:
         """Execute an agent via the hermes-agent library.
 
@@ -232,6 +241,13 @@ class HermesProvider(AgentProvider):
                 :class:`AgentExecutor` refuses ``plugins:`` on this
                 provider before reaching here and this is always ``None``.
             extra_mcp_servers: Ignored, for the same reason.
+            continuation_state: Optional message list from a completed run
+                on this provider (``result["messages"]``). When provided,
+                the run continues that conversation with
+                ``rendered_prompt`` as the next user turn
+                (``supports_continuation`` is ``True``). It wins over the
+                checkpoint-resume history file: in-memory state from this
+                run is always newer.
 
         Returns:
             Normalized AgentOutput with structured content.
@@ -350,10 +366,19 @@ class HermesProvider(AgentProvider):
                 event_callback, "agent_reasoning", {"content": text}
             )
 
-        # Load conversation history from a prior checkpoint if available
+        # Resolve the conversation history: in-memory continuation state from
+        # this run wins over the checkpoint-resume file, the same precedence
+        # claude_agent_sdk's session map uses — it is strictly newer.
         conversation_history: list[dict[str, Any]] | None = None
-        resume_path = self._resume_session_ids.get(agent.name)
-        if resume_path:
+        resume_path = (
+            None if continuation_state is not None else self._resume_session_ids.get(agent.name)
+        )
+        if continuation_state is not None:
+            # ``object`` at the AgentOutput boundary because the value is
+            # provider-opaque; here it can only be the ``messages`` list a
+            # prior execute() on this provider returned.
+            conversation_history = cast("list[dict[str, Any]]", continuation_state)
+        elif resume_path:
             try:
                 conversation_history = json.loads(Path(resume_path).read_text())
                 logger.info(
@@ -509,6 +534,17 @@ class HermesProvider(AgentProvider):
         if messages:
             self._save_session(agent.name, messages)
 
+        # Offer the completed run's own messages as resumable continuation
+        # state. Withheld on a partial run (no completed conversation to
+        # resume) and when a parse-recovery call produced the output: that
+        # output lives in the recovery conversation's messages, which the
+        # outer result never carries, so the original run's list would show
+        # the model an answer the validator never graded.
+        is_partial = bool(result.get("partial", False))
+        continuation_state_out: object | None = None
+        if messages and not recovered and not is_partial:
+            continuation_state_out = messages
+
         return AgentOutput(
             content=content,
             raw_response={
@@ -525,7 +561,8 @@ class HermesProvider(AgentProvider):
             output_tokens=output_tokens,
             last_call_input_tokens=last_call_input_tokens,
             model=actual_model,
-            partial=bool(result.get("partial", False)),
+            partial=is_partial,
+            continuation_state=continuation_state_out,
         )
 
     async def validate_connection(self) -> bool:

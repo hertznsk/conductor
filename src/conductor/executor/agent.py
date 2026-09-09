@@ -342,14 +342,18 @@ class AgentExecutor:
         self,
         agent: AgentDef,
         context: dict[str, Any],
+        *,
         guidance_section: str | None = None,
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
+        continuation_state: object | None = None,
     ) -> AgentOutput:
         """Execute an agent with the given context.
 
         This method:
-        1. Renders the agent's prompt template with context
+        1. Renders the agent's prompt template with context — unless
+           ``continuation_state`` is set, in which case the provider already
+           holds the rendered conversation and rendering is skipped entirely
         2. Resolves which tools the agent has access to
         3. Calls the provider to execute the agent
         4. Validates output against the agent's schema (if defined)
@@ -357,15 +361,25 @@ class AgentExecutor:
         Args:
             agent: Agent definition from workflow config.
             context: Context for prompt rendering, built by WorkflowContext.
-            guidance_section: Optional user guidance section to append to the
-                rendered prompt. When provided, this is appended after the
-                rendered prompt text.
+            guidance_section: Optional user guidance section. Without
+                ``continuation_state`` it is appended after the rendered
+                prompt text. With ``continuation_state`` it *is* the prompt —
+                the sole new user turn appended to the provider's existing
+                conversation.
             interrupt_signal: Optional event for mid-agent interrupt signaling.
                 Forwarded to the provider's execute method.
             event_callback: Optional callback for streaming SDK events upstream.
                 When provided, the executor emits an ``agent_prompt_rendered``
                 event with the rendered prompt, then forwards the callback
                 to the provider for SDK-level streaming events.
+            continuation_state: Optional provider-specific state from a
+                completed run. When not ``None``, the prompt template, the
+                workspace-instructions preamble, and the eager skill
+                injection are all skipped — they are already present in the
+                provider-held conversation. Only accepted from a provider
+                that declares :attr:`AgentProvider.supports_continuation`;
+                anything else raises ``ExecutionError`` before the prompt is
+                discarded.
 
         Returns:
             Validated agent output.
@@ -375,7 +389,9 @@ class AgentExecutor:
             ProviderError: If agent execution fails.
             ValidationError: If output doesn't match schema or tools are invalid.
             ExecutionError: If the agent declares a capability its provider
-                does not support (``session_key``, ``skills``, ``plugins``).
+                does not support (``session_key``, ``skills``, ``plugins``),
+                or the continuation state comes from a provider that cannot
+                resume it.
         """
         # Checked before any work: a declaration the provider cannot honour is
         # decided by the agent and the provider alone, so there is nothing to
@@ -425,17 +441,35 @@ class AgentExecutor:
             )
             agent = agent.model_copy(update={"context_tier": resolved_tier})
 
-        # Render prompt with context
-        rendered_prompt = self.renderer.render(agent.prompt, context)
-
-        # Prepend prompt prefix (workspace instructions + optional skills)
-        prefix = self._build_prompt_prefix(agent, event_callback)
-        if prefix:
-            rendered_prompt = prefix + rendered_prompt
-
-        # Append user guidance section if provided
-        if guidance_section:
-            rendered_prompt = rendered_prompt + guidance_section
+        # Render a new task or add one user turn to provider-owned state.
+        if continuation_state is not None:
+            # Discarding the rendered prompt is only safe when the provider
+            # actually holds the completed conversation: the task, the
+            # workspace-instructions preamble, and the eager skill injection
+            # all live in that state, so this run sends only the follow-up
+            # turn. A provider that hands back state it cannot resume would
+            # otherwise reduce the model's input to the bare follow-up text.
+            if not self.provider.supports_continuation:
+                raise ExecutionError(
+                    f"Agent '{agent.name}': provider "
+                    f"'{type(self.provider).__name__}' returned continuation state "
+                    f"it cannot resume (supports_continuation=False). Continuing "
+                    f"would send the model only the follow-up turn, without the "
+                    f"original task prompt.",
+                    agent_name=agent.name,
+                    suggestion=(
+                        "A provider that cannot continue a completed run must "
+                        "leave AgentOutput.continuation_state unset."
+                    ),
+                )
+            rendered_prompt = guidance_section or ""
+        else:
+            rendered_prompt = self.renderer.render(agent.prompt, context)
+            prefix = self._build_prompt_prefix(agent, event_callback)
+            if prefix:
+                rendered_prompt = prefix + rendered_prompt
+            if guidance_section:
+                rendered_prompt = rendered_prompt + guidance_section
 
         # Emit prompt rendered event via callback
         if event_callback is not None:
@@ -445,6 +479,10 @@ class AgentExecutor:
                     {
                         "rendered_prompt": rendered_prompt,
                         "context_keys": list(context.keys()) if isinstance(context, dict) else [],
+                        # On the continuation path rendered_prompt is only the
+                        # new follow-up turn; the flag lets consumers append it
+                        # to the original prompt instead of replacing it.
+                        "continuation": continuation_state is not None,
                     },
                 )
 
@@ -536,6 +574,7 @@ class AgentExecutor:
             skill_directories=skill_dirs,
             custom_agents=custom_agents,
             extra_mcp_servers=extra_mcp_servers,
+            continuation_state=continuation_state,
         )
 
         # Ensure output.content is a dict

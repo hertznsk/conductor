@@ -724,9 +724,12 @@ class ValidatorConfig(BaseModel):
     (``{"passed": bool, "issues": [str, ...]}``).
 
     If the validator returns ``passed: false`` and ``max_retries > 0``, the
-    primary agent is re-run **once** with the validator's feedback appended
-    to its prompt. The second output is taken as final — there is no second
-    validation loop.
+    primary agent is re-run **once** and the second output is taken as
+    final — there is no second validation loop. On the ``claude``,
+    ``openai``, and ``hermes`` providers the re-run continues the completed
+    conversation,
+    with the validator's feedback as the next user turn; other providers
+    rebuild the prompt with the feedback appended.
 
     This is distinct from ``retry:`` (transient/provider failures, same
     prompt) and the ``output:`` schema (shape/type, not content quality).

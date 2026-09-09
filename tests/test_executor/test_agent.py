@@ -887,6 +887,7 @@ class _StubProvider(AgentProvider, abstract=True):
         skill_directories: list[str] | None = None,
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
+        continuation_state: Any = None,
     ) -> AgentOutput:
         return AgentOutput(content={"answer": "ok"}, raw_response="")
 
@@ -1105,3 +1106,84 @@ class TestAgentExecutorNonDictContentPreservesUsage:
         assert output.output_tokens == 30
         assert output.last_call_input_tokens == 45
         assert output.tokens_used == 90
+
+
+class TestContinuationState:
+    """Continuation state may only discard the rendered prompt when the
+    provider declares it can resume that state (``supports_continuation``)."""
+
+    @pytest.mark.asyncio
+    async def test_continuation_rejected_when_provider_cannot_resume(self) -> None:
+        # Requirement: a provider handed continuation state it cannot resume
+        # must fail loudly — continuing would send the model only the
+        # follow-up turn, with no task prompt and no history.
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {"answer": "x"})
+        executor = AgentExecutor(provider)
+        agent = AgentDef(name="test", model="gpt-4", prompt="Do work", output=None)
+
+        with pytest.raises(ExecutionError, match="cannot resume"):
+            await executor.execute(
+                agent, {}, guidance_section="## Validation feedback", continuation_state=["turn"]
+            )
+
+    @pytest.mark.asyncio
+    async def test_continuation_sends_only_the_follow_up_turn(self) -> None:
+        # Requirement: on the continuation path the prompt template, the
+        # workspace-instructions preamble and the guidance append are all
+        # skipped — the provider-held conversation already contains them, so
+        # the follow-up turn is the entire prompt.
+        captured: dict[str, Any] = {}
+
+        class _CapableProvider(CopilotProvider, abstract=True):
+            @property
+            def supports_continuation(self) -> bool:
+                return True
+
+        provider = _CapableProvider(mock_handler=lambda a, p, c: {})
+
+        async def exec_fn(
+            *, agent: AgentDef, rendered_prompt: str, continuation_state: Any = None, **kw: Any
+        ) -> AgentOutput:
+            captured["prompt"] = rendered_prompt
+            captured["state"] = continuation_state
+            return AgentOutput(content={"result": "ok"}, raw_response="")
+
+        provider.execute = exec_fn  # type: ignore[method-assign]
+        executor = AgentExecutor(provider, instructions_preamble="WORKSPACE INSTRUCTIONS\n")
+        agent = AgentDef(
+            name="test", model="gpt-4", prompt="Do {{ workflow.input.x }}", output=None
+        )
+        sentinel = object()
+        emitted: list[dict[str, Any]] = []
+
+        await executor.execute(
+            agent,
+            {"workflow": {"input": {"x": "things"}}},
+            guidance_section="FEEDBACK",
+            continuation_state=sentinel,
+            event_callback=lambda t, d: emitted.append(d) if t == "agent_prompt_rendered" else None,
+        )
+
+        assert captured["prompt"] == "FEEDBACK"
+        assert captured["state"] is sentinel
+        # The rendered-prompt event is tagged so the dashboard appends the
+        # follow-up turn to the original prompt instead of replacing it.
+        assert emitted == [
+            {"rendered_prompt": "FEEDBACK", "context_keys": ["workflow"], "continuation": True}
+        ]
+
+    def test_continuation_support_is_declared_only_by_conversation_providers(self) -> None:
+        # Requirement: only providers able to resume a completed conversation
+        # override the base declaration; everyone else inherits False.
+        from conductor.providers.aca import AcaRuntimeProvider
+        from conductor.providers.claude import ClaudeProvider
+        from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider
+        from conductor.providers.hermes import HermesProvider
+        from conductor.providers.openai import OpenAIProvider
+
+        assert ClaudeProvider.supports_continuation is not AgentProvider.supports_continuation
+        assert OpenAIProvider.supports_continuation is not AgentProvider.supports_continuation
+        assert HermesProvider.supports_continuation is not AgentProvider.supports_continuation
+        for cls in (CopilotProvider, AcaRuntimeProvider, ClaudeAgentSdkProvider):
+            assert cls.supports_continuation is AgentProvider.supports_continuation
+        assert CopilotProvider(mock_handler=lambda a, p, c: {}).supports_continuation is False

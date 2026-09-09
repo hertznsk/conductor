@@ -1316,3 +1316,59 @@ describe('workflow-store — compaction lifecycle events appear in the activity 
     expect(stateAfter).toEqual(stateBefore);
   });
 });
+
+describe('workflow-store processEvent — agent_prompt_rendered continuation', () => {
+  // A validator retry on a continuation-capable provider sends only the new
+  // follow-up turn as rendered_prompt; the node's Prompt panel must keep the
+  // original task prompt and append the turn rather than replace it.
+  it('appends a continuation turn to the existing prompt instead of replacing it', () => {
+    const { processEvent } = useWorkflowStore.getState();
+
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [{ name: 'reviewer' }],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'reviewer',
+    }));
+    processEvent(event('agent_prompt_rendered', {
+      agent_name: 'reviewer',
+      rendered_prompt: 'Review the diff.',
+      context_keys: ['workflow'],
+    }));
+    processEvent(event('agent_prompt_rendered', {
+      agent_name: 'reviewer',
+      rendered_prompt: '## Validation feedback\n- fix null safety',
+      context_keys: [],
+      continuation: true,
+    }));
+
+    const prompt = useWorkflowStore.getState().nodes.reviewer?.prompt;
+    expect(prompt).toBe('Review the diff.\n\n## Validation feedback\n- fix null safety');
+  });
+
+  it('replaces the prompt when the event is not a continuation', () => {
+    const { processEvent } = useWorkflowStore.getState();
+
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [{ name: 'reviewer' }],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'reviewer',
+    }));
+    processEvent(event('agent_prompt_rendered', {
+      agent_name: 'reviewer',
+      rendered_prompt: 'first prompt',
+    }));
+    processEvent(event('agent_prompt_rendered', {
+      agent_name: 'reviewer',
+      rendered_prompt: 'first prompt\n\n## Validation feedback\n- fix',
+    }));
+
+    const prompt = useWorkflowStore.getState().nodes.reviewer?.prompt;
+    expect(prompt).toBe('first prompt\n\n## Validation feedback\n- fix');
+  });
+});
