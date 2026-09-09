@@ -137,6 +137,7 @@ _FORBIDDEN_FIELDS: list[tuple[str, Any, str]] = [
     ("args", ["a"], r"'args'"),
     ("env", {"A": "b"}, r"'env'"),
     ("working_dir", "/tmp", r"'working_dir'"),
+    ("settings_dir", "/tmp", r"'settings_dir'"),
     ("options", [GateOption(label="OK", value="ok", route="$end")], r"'options'"),
     ("workflow", "sub.yaml", r"'workflow'"),
     ("input_mapping", {"a": "{{ b }}"}, r"'input_mapping'"),

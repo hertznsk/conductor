@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -50,7 +52,7 @@ from conductor.config.schema import (
 from conductor.engine.context import WorkflowContext
 from conductor.engine.workflow import WorkflowEngine
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
-from conductor.exceptions import ExecutionError
+from conductor.exceptions import ExecutionError, InterruptError
 
 _SECRET_ARG = "s3cr3t-token-value"
 _SECRET_RESULT = "classified-result-body"
@@ -327,10 +329,19 @@ class TestMcpEventPayloads:
             patcher.stop()
 
         # The raised error is the generic redacted form, not the manager's
-        # raw text (which embedded the secret argument value).
+        # raw text (which embedded the secret argument value), and it points
+        # at the private diagnostic file — the one place raw details land
+        # (`--log-file` is a console mirror, not a Python logging sink).
         assert "call exploded" not in str(exc_info.value)
         assert _SECRET_ARG not in str(exc_info.value)
-        assert "see debug logs" in str(exc_info.value)
+        assert "full diagnostic: " in str(exc_info.value)
+
+        # The diagnostic sink holds the full traceback, canary included.
+        diag_match = re.search(r"full diagnostic: (.+)$", str(exc_info.value))
+        assert diag_match is not None
+        diag_text = Path(diag_match.group(1)).read_text(encoding="utf-8")
+        assert "call exploded" in diag_text
+        assert _SECRET_ARG in diag_text
 
         failed = [ev for ev in received if ev.type == "mcp_failed"]
         assert len(failed) == 1
@@ -338,6 +349,7 @@ class TestMcpEventPayloads:
         assert failed_data["error_type"] == "RuntimeError"
         assert _SECRET_ARG not in json.dumps(failed_data)
         assert _SECRET_RESULT not in json.dumps(failed_data)
+        assert "full diagnostic: " in failed_data["message"]
         # The manager saw the call; the failure came from inside the step.
         assert failed_data["server"] == "srv"
         assert failed_data["tool"] == "echo"
@@ -378,9 +390,15 @@ class TestMcpOutputSchemaValidation:
             patcher.stop()
 
         # The raised error is the generic redacted form — the schema
-        # ValidationError's "received: '<value>'" text must not surface.
+        # ValidationError's "received: '<value>'" text must not surface — and
+        # it points at the private diagnostic file holding the full details.
         assert canary not in str(exc_info.value)
-        assert "see debug logs" in str(exc_info.value)
+        assert "full diagnostic: " in str(exc_info.value)
+
+        diag_match = re.search(r"full diagnostic: (.+)$", str(exc_info.value))
+        assert diag_match is not None
+        diag_text = Path(diag_match.group(1)).read_text(encoding="utf-8")
+        assert canary in diag_text
 
         failed = [ev for ev in received if ev.type == "mcp_failed"]
         assert len(failed) == 1
@@ -479,8 +497,198 @@ class TestMcpRuntimeChecks:
         assert canary not in json.dumps(wf_failed[0].data)
         assert "{{ workflow.input.secret_path }}" not in json.dumps(wf_failed[0].data)
 
+    @pytest.mark.asyncio
+    async def test_mixed_wildcard_tools_list_allows_any_tool(self) -> None:
+        # Requirement: the runtime allowlist check uses wildcard MEMBERSHIP,
+        # exactly like config/validator.py — ["*", "health"] must allow any
+        # tool here precisely when `conductor validate` accepts it (a
+        # size/exact-list rule would fail the step before it even connects).
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="mcp-wildcard",
+                entry_point="call",
+                runtime=RuntimeConfig(
+                    provider="copilot",
+                    mcp_servers={
+                        "srv": MCPServerDef(type="stdio", command="npx", tools=["*", "health"])
+                    },
+                ),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="call",
+                    type="mcp",
+                    server="srv",
+                    tool="echo",
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={},
+        )
+        engine = _make_engine(config)
 
-class TestMcpBaseExceptionRedaction:
+        patcher = _patch_manager()
+        try:
+            await engine.run({})
+        finally:
+            patcher.stop()
+
+        assert engine.context.agent_outputs["call"]["is_error"] is False
+
+
+class TestMcpStepInterrupt:
+    """Dashboard/keyboard Stop wiring for `type: mcp` steps (main loop)."""
+
+    def _engine_with_interrupt(
+        self, config: WorkflowConfig, *, web_dashboard: Any = None
+    ) -> tuple[WorkflowEngine, asyncio.Event]:
+        interrupt_event = asyncio.Event()
+        engine = WorkflowEngine(
+            config,
+            MagicMock(),
+            interrupt_event=interrupt_event,
+            web_dashboard=web_dashboard,
+        )
+        return engine, interrupt_event
+
+    @pytest.mark.asyncio
+    async def test_stop_during_call_pauses_and_resume_reexecutes(self) -> None:
+        # Requirement: a Stop landing mid-call cancels the in-flight
+        # invocation (never auto-replayed inside the cancelled execution),
+        # enters the dashboard pause flow (agent_paused), and Resume
+        # re-executes the step from the top — the documented at-least-once
+        # semantics — rather than the workflow silently continuing past the
+        # pause as if provider-level interruption had handled it.
+        from types import SimpleNamespace
+
+        web_dashboard = SimpleNamespace(
+            has_connections=lambda: True,
+            resume_event=asyncio.Event(),
+            kill_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+        )
+        config = _mcp_workflow()
+        engine, interrupt_event = self._engine_with_interrupt(config, web_dashboard=web_dashboard)
+        received = _collect_events(engine)
+
+        calls: list[str] = []
+
+        async def call(_server: str, _tool: str, _arguments: dict[str, Any]) -> dict[str, Any]:
+            calls.append("call")
+            if len(calls) == 1:
+                # First execution: signal the Stop from inside the call, then
+                # block until the interrupt race cancels us.
+                interrupt_event.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    calls.append("cancelled")
+                    raise
+                raise AssertionError("unreachable")  # pragma: no cover
+            return _envelope()
+
+        patcher = _patch_manager(call)
+        try:
+
+            async def resume_once_paused() -> None:
+                for _ in range(200):
+                    if any(ev.type == "agent_paused" for ev in received):
+                        web_dashboard.resume_event.set()
+                        return
+                    await asyncio.sleep(0.01)
+                raise AssertionError("agent_paused never emitted")
+
+            result, _ = await asyncio.gather(engine.run({}), resume_once_paused())
+        finally:
+            patcher.stop()
+
+        # The interrupted call was cancelled, then Resume re-executed the
+        # step: exactly one successful completion, no mcp_failed.
+        assert calls == ["call", "cancelled", "call"]
+        assert result == {"answer": 42}
+        assert [ev.type for ev in received].count("mcp_completed") == 1
+        assert not any(ev.type == "mcp_failed" for ev in received)
+        assert any(ev.type == "agent_paused" for ev in received)
+        assert any(ev.type == "agent_resumed" for ev in received)
+
+    @pytest.mark.asyncio
+    async def test_stop_during_call_kill_unwinds(self) -> None:
+        # Requirement: choosing Kill at the pause unwinds the workflow via
+        # InterruptError (stopped_by_user), never completing the step.
+        from types import SimpleNamespace
+
+        web_dashboard = SimpleNamespace(
+            has_connections=lambda: True,
+            resume_event=asyncio.Event(),
+            kill_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+        )
+        config = _mcp_workflow()
+        engine, interrupt_event = self._engine_with_interrupt(config, web_dashboard=web_dashboard)
+        received = _collect_events(engine)
+
+        calls: list[str] = []
+
+        async def call(_server: str, _tool: str, _arguments: dict[str, Any]) -> dict[str, Any]:
+            calls.append("call")
+            interrupt_event.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                calls.append("cancelled")
+                raise
+            raise AssertionError("unreachable")  # pragma: no cover
+
+        patcher = _patch_manager(call)
+        try:
+
+            async def kill_once_paused() -> None:
+                for _ in range(200):
+                    if any(ev.type == "agent_paused" for ev in received):
+                        web_dashboard.kill_event.set()
+                        return
+                    await asyncio.sleep(0.01)
+                raise AssertionError("agent_paused never emitted")
+
+            with pytest.raises(InterruptError):
+                await asyncio.gather(engine.run({}), kill_once_paused())
+        finally:
+            patcher.stop()
+
+        assert calls == ["call", "cancelled"]
+        assert not any(ev.type == "mcp_completed" for ev in received)
+        assert not any(ev.type == "mcp_failed" for ev in received)
+
+    @pytest.mark.asyncio
+    async def test_call_completed_before_stop_returns_normally(self) -> None:
+        # Requirement: when the call has already completed by the time the
+        # interrupt fires, the result is returned (no spurious
+        # interruption); the pending Stop is consumed by the between-step
+        # interrupt check as on every other step type.
+        config = _mcp_workflow()
+        engine, interrupt_event = self._engine_with_interrupt(config)
+        _collect_events(engine)
+
+        async def call(_server: str, _tool: str, _arguments: dict[str, Any]) -> dict[str, Any]:
+            return _envelope()
+
+        patcher = _patch_manager(call)
+        try:
+            interrupt_event.set()  # already pending before the step runs
+            # The pending flag fires the race immediately; simulate the
+            # dashboard-less CLI path by clearing it as the menu would.
+            engine._interrupt_handler = MagicMock()
+            engine._interrupt_handler.handle_interrupt = AsyncMock(
+                return_value=MagicMock(action="continue")
+            )
+            await engine.run({})
+        finally:
+            patcher.stop()
+
+        assert engine.context.agent_outputs["call"]["answer"] == 42
+
     @pytest.mark.asyncio
     async def test_system_exit_from_manager_wraps_redacted(self) -> None:
         # Requirement: a value-bearing BaseException raised from MCP

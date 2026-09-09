@@ -286,7 +286,7 @@ agents:
 
 **Set agent restrictions:** Cannot have `prompt`, `provider`, `model`, `tools`, `system_prompt`, `options`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `input_mapping`, `max_depth`, `retry`, `dialog`, `validator`, `reasoning`, `timeout_seconds`, `max_session_seconds`, `max_agent_iterations`, or `session_key`. Requires exactly one of `value:` or `values:`. `output_type:` is forbidden with `values:` (per-key typing not yet supported). `output:` schema validation is permitted only when the rendered output is a dict (always for `values:`, sometimes for `value:`); a scalar with a declared schema raises `ValidationError`. Set agents are allowed inside `parallel` groups and as `for_each` inline agents, and count toward `limits.max_iterations` like any other step.
 
-**MCP agent restrictions (`type: mcp`):** Cannot have `prompt`, `system_prompt`, `provider`, `model`, `tools`, `reasoning`, `context_tier`, `skills`, `plugins`, `validator`, `dialog`, `sandbox`, `session_key`, `max_agent_iterations`, `max_session_seconds`, `output_mode`, `retry`, `timeout_seconds` (use `timeout`), `command`, `args`, `env`, `working_dir`, `options`, `workflow`, `input_mapping`, `max_depth`, `value`, `values`, or `output_type`. Requires `server` and `tool`. Output is `{content, structured, is_error}` with top-level `structured` keys merged on top. Logical tool errors set `is_error: true` and complete normally, allowing `when: "{{ output.is_error }}"` routing. Stdio servers only. Calls to the same server serialize on a slot lock.
+**MCP agent restrictions (`type: mcp`):** Cannot have `prompt`, `system_prompt`, `provider`, `model`, `tools`, `reasoning`, `context_tier`, `skills`, `plugins`, `validator`, `dialog`, `sandbox`, `session_key`, `max_agent_iterations`, `max_session_seconds`, `output_mode`, `retry`, `timeout_seconds` (use `timeout`), `command`, `args`, `env`, `working_dir`, `settings_dir`, `options`, `workflow`, `input_mapping`, `max_depth`, `value`, `values`, or `output_type`. Requires `server` and `tool`. Output is `{content, structured, is_error}` with top-level `structured` keys merged on top. Logical tool errors set `is_error: true` and complete normally, allowing `when: "{{ output.is_error }}"` routing. Stdio servers only. Calls to the same server serialize on a slot lock.
 
 **Workflow agent restrictions (`type: workflow`):** Cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, `options`, `retry`, `reasoning`, `dialog`, `validator`, `max_session_seconds`, `max_agent_iterations`, `session_key`, or `timeout_seconds`. Requires `workflow:` path. Supports `input_mapping` and `max_depth`. Allowed inside `for_each` groups for dynamic fan-out.
 
@@ -483,7 +483,7 @@ MCP steps produce an envelope containing `content`, `structured`, and `is_error`
 {{ step.output.custom_field }}      # Directly accessible merged structured field
 ```
 
-Envelope keys (`content`, `structured`, `is_error`) take precedence over colliding structured keys.
+Envelope keys (`content`, `structured`, `is_error`) take precedence over colliding structured keys, and `outputs` / `errors` are likewise reserved (the engine recognizes group outputs by those two keys); colliding structured keys stay reachable under `output.structured.<key>`.
 
 ### Routing on MCP Output
 
@@ -502,7 +502,7 @@ routes:
 - Allowed as the inline agent of `for_each` groups.
 - `runtime.tool_output` bounds summed text characters across `content` blocks. `structured` data is never truncated.
 - Stdio servers only.
-- Events (`mcp_started`, `mcp_completed`, `mcp_failed`) exclude argument values and result data; error messages are redacted in events and full tracebacks are logged at debug level only.
+- Events (`mcp_started`, `mcp_completed`, `mcp_failed`) exclude argument values and result data; error messages in events are redacted, and full exception details land only in the run's private `*.mcp-diagnostics.log` file (next to the `*.events.jsonl` log), which the redacted message names.
 
 ## File Includes (`!file` Tag)
 

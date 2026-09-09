@@ -590,7 +590,7 @@ agents:
 
 ### Argument Rendering and Type Coercion
 
-Dict and list structures in `arguments:` are traversed recursively. String leaves are Jinja2-rendered against workflow context and auto-coerced (e.g. `"105"` -> `105`, `"true"` -> `True`, `"null"` -> `None`). Non-scalar values and embedded templates remain strings. YAML-native scalars (integers, floats, booleans, `None`) pass through untouched.
+Dict and list structures in `arguments:` are traversed recursively. String leaves are Jinja2-rendered against workflow context, and each **fully rendered string** is then YAML-parsed (the `set` step's `auto` rule) — whatever the rendered text parses as becomes the argument value: `"105"` -> `105`, `"true"` -> `True`, `"null"` -> `None`, and also collections (`"[1, 2]"` -> a list, `"a: 1"` -> a mapping). This applies to templates too: `"1{{ x }}"` with `x=2` renders `"12"` and becomes the integer `12`; only renders whose text parses as a plain string (e.g. `"pre-{{ x }}"` -> `"pre-2"`, multi-word prose) stay strings. YAML-native scalars (integers, floats, booleans, `None`) pass through untouched. Quote and type-check values where the exact type matters.
 
 ### Output Envelope and Merging
 
@@ -606,7 +606,7 @@ MCP steps produce an output envelope:
 }
 ```
 
-When `structured` is a dictionary, its top-level keys are merged onto the step output dict. Envelope keys (`content`, `structured`, `is_error`) are reserved and take precedence over colliding structured keys.
+When `structured` is a dictionary, its top-level keys are merged onto the step output dict. Reserved keys are never overridden by the merge: the envelope's own `content`, `structured`, `is_error`, plus `outputs` and `errors` (the workflow engine duck-types parallel/for-each group outputs by those two keys — a structured result flattening them would corrupt how the step's output is addressed downstream). Colliding structured keys are dropped with a debug-level log and stay reachable under `output.structured.<key>`.
 
 ### Error Handling and `is_error` Routing
 
@@ -627,7 +627,7 @@ Calls to the same MCP server process are serialized via a per-server slot lock. 
 
 ### MCP Step Restrictions
 
-MCP agents **cannot** have: `prompt`, `system_prompt`, `provider`, `model`, `tools`, `reasoning`, `context_tier`, `skills`, `plugins`, `validator`, `dialog`, `sandbox`, `session_key`, `max_agent_iterations`, `max_session_seconds`, `output_mode`, `retry`, `timeout_seconds` (use `timeout`), `command`, `args`, `env`, `working_dir`, `options`, `workflow`, `input_mapping`, `max_depth`, `value`, `values`, or `output_type`.
+MCP agents **cannot** have: `prompt`, `system_prompt`, `provider`, `model`, `tools`, `reasoning`, `context_tier`, `skills`, `plugins`, `validator`, `dialog`, `sandbox`, `session_key`, `max_agent_iterations`, `max_session_seconds`, `output_mode`, `retry`, `timeout_seconds` (use `timeout`), `command`, `args`, `env`, `working_dir`, `settings_dir`, `options`, `workflow`, `input_mapping`, `max_depth`, `value`, `values`, or `output_type`.
 
 MCP steps currently support `stdio` servers only.
 

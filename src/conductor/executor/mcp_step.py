@@ -8,21 +8,25 @@ between the workflow engine and an MCP server.
 Argument rendering:
 
 - ``arguments`` values are Jinja2-rendered recursively: dicts and lists are
-  walked, string leaves are rendered against the workflow context and coerced
-  with the set-step ``auto`` rule (a whole-string YAML scalar like ``"105"``
-  becomes ``int``, an embedded template like ``"pre-{{ x }}"`` stays a string),
-  while YAML-native scalars (int / float / bool / None) pass through unchanged.
+  walked, string leaves are rendered against the workflow context, and each
+  FULLY RENDERED string is then YAML-parsed (the set-step ``auto`` rule).
+  Whatever the rendered text parses as is the value: ``"105"`` -> ``int``,
+  ``"true"`` -> ``bool``, ``"[1, 2]"`` -> ``list`` — including renders built
+  from embedded templates, so ``"1{{ x }}"`` with ``x=2`` renders ``"12"``
+  and becomes the integer ``12``, and ``"label: {{ x }}"`` becomes a mapping.
+  A render that does not parse as YAML stays the raw string, and YAML-native
+  scalars (int / float / bool / None) pass through untouched.
 - ``FileString`` values (from the ``!file`` tag) are ``str`` subclasses and
   render like normal templates.
 
 The result envelope (produced by
 :meth:`conductor.mcp.manager.MCPManager.call_tool_structured`) has the shape
-``{"content": [...], "structured": dict | None, "is_error": bool}``. When
+``{"content": [...], "structured": {...}|null, "is_error": bool}``. When
 ``structured`` is a dict, its keys are merged on top of the envelope so routes
-and templates can address individual result fields directly — except
-``content`` / ``structured`` / ``is_error``, which are envelope-owned and can
-never be overridden (collisions are dropped with a debug-level log, mirroring
-the script-step JSON shadow precedent in ``engine/workflow.py``).
+and templates can address individual result fields directly — except the
+reserved keys (see :data:`_RESERVED_ENVELOPE_KEYS`), which are never
+overridden (collisions are dropped with a debug-level log, mirroring the
+script-step JSON shadow precedent in ``engine/workflow.py``).
 """
 
 from __future__ import annotations
@@ -47,7 +51,15 @@ logger = logging.getLogger(__name__)
 # Envelope keys owned by the MCP result envelope itself. A structured result
 # carrying same-named keys must never override them — the merge drops these
 # collisions rather than corrupting the envelope contract.
-_RESERVED_ENVELOPE_KEYS = frozenset({"content", "structured", "is_error"})
+#
+# ``outputs`` / ``errors`` are envelope-external but equally reserved:
+# ``WorkflowContext`` duck-types parallel/for-each group outputs by exactly
+# those two top-level keys, so a structured result flattening them onto the
+# envelope would make an ordinary step output misclassify as a group output
+# (losing its normal ``.output`` wrapper in all three context modes) and would
+# confuse for-each source resolution. They stay reachable under
+# ``output.structured.outputs`` / ``output.structured.errors``.
+_RESERVED_ENVELOPE_KEYS = frozenset({"content", "structured", "is_error", "outputs", "errors"})
 
 # Explicit null markers recognised by the auto-coercion rule; a render that
 # parses to None through any other string keeps its raw form (mirrors the
@@ -81,6 +93,48 @@ def mcp_result_bytes(content: Any, structured: Any) -> int:
     )
 
 
+def mcp_truncation_metadata(content: Any) -> tuple[bool, str | None]:
+    """Extract the trusted truncation markers from an envelope's content blocks.
+
+    ``truncated`` and ``spill_path`` on a content block are Conductor-local
+    metadata: :meth:`conductor.mcp.manager.MCPManager.call_tool_structured`
+    strips any server-supplied fields of those names at ingestion and only its
+    own truncation pass sets them. This helper is the single read-side of that
+    contract, shared by the live engine events and the web server's synthetic
+    replay so both build the same representation; the type checks additionally
+    guard envelopes persisted (checkpoints) before the stripping existed.
+
+    Args:
+        content: The envelope's ``content`` value (expected list of dicts).
+
+    Returns:
+        ``(truncated, spill_path)`` — ``truncated`` is True when any block was
+        locally truncated; ``spill_path`` is the first local spill path (a
+        non-empty string) or ``None``.
+    """
+    blocks = content if isinstance(content, list) else []
+    truncated = any(isinstance(b, dict) and b.get("truncated") is True for b in blocks)
+    spill_path = next(
+        (
+            b["spill_path"]
+            for b in blocks
+            if isinstance(b, dict) and isinstance(b.get("spill_path"), str) and b["spill_path"]
+        ),
+        None,
+    )
+    return truncated, spill_path
+
+
+class McpStepTimeoutError(ExecutionError):
+    """A ``type: mcp`` step's per-call ``timeout`` elapsed.
+
+    A distinct, value-free category: the message (``timed out after Ns``) is
+    authored at the raise site and safe to surface verbatim, so the engine
+    propagates it unchanged (unlike transport/render/validation failures,
+    whose raw text can embed argument or result values and is redacted).
+    """
+
+
 class McpStepExecutor:
     """Executes ``type: mcp`` workflow steps.
 
@@ -112,10 +166,11 @@ class McpStepExecutor:
         Returns:
             The JSON-safe envelope ``{"content": [...], "structured": dict |
             None, "is_error": bool}`` with ``structured`` keys merged on top
-            (envelope keys are never overridden).
+            (reserved keys are never overridden — see
+            :data:`_RESERVED_ENVELOPE_KEYS`).
 
         Raises:
-            ExecutionError: If the call exceeds ``agent.timeout`` seconds.
+            McpStepTimeoutError: If the call exceeds ``agent.timeout`` seconds.
             ValueError: Unknown server / tool — propagated from the manager.
             RuntimeError: Call failure or malformed structured content —
                 propagated from the manager.
@@ -136,7 +191,7 @@ class McpStepExecutor:
             else:
                 envelope = await coro
         except TimeoutError:
-            raise ExecutionError(
+            raise McpStepTimeoutError(
                 f"MCP step '{agent.name}' timed out after {timeout}s",
                 agent_name=agent.name,
             ) from None
@@ -195,12 +250,16 @@ def _render_arguments(
 def _coerce_auto(rendered: str, label: str) -> Any:
     """Coerce a rendered template string using the set-step ``auto`` rule.
 
-    A whole-string YAML scalar (``"105"`` → ``int``, ``"true"`` → ``bool``,
-    ``"null"`` → ``None``) coerces to its typed form; anything else (embedded
-    templates, multi-word prose) stays the raw string. Empty and
-    whitespace-only renders bind ``""`` rather than ``None``. A render that
-    parses to ``None`` through any string other than an explicit null marker
-    keeps its raw form, so users don't get a surprise null argument.
+    The WHOLE rendered string is YAML-parsed and whatever it parses as is the
+    value: a scalar (``"105"`` -> ``int``, ``"true"`` -> ``bool``, ``"null"``
+    -> ``None``) or a collection (``"[1, 2]"`` -> ``list``, ``"a: 1"`` ->
+    ``dict``). This applies to embedded templates too — ``"1{{ x }}"`` with
+    ``x=2`` renders ``"12"`` and becomes the integer ``12``; only renders
+    whose text parses as a plain string (e.g. ``"pre-{{ x }}"`` ->
+    ``"pre-2"``, multi-word prose) stay strings. Empty and whitespace-only
+    renders bind ``""`` rather than ``None``. A render that parses to ``None``
+    through any string other than an explicit null marker keeps its raw form,
+    so users don't get a surprise null argument.
 
     Args:
         rendered: The template's rendered string output.

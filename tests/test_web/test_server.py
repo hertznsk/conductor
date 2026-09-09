@@ -11,6 +11,7 @@ Tests cover:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -1940,3 +1941,137 @@ class TestSyntheticReplayMcpStep:
         assert completed["is_error"] is True
         assert completed["truncated"] is True
         assert completed["spill_path"] == "/tmp/spill.txt"
+
+    def test_forged_spill_path_in_stored_envelope_is_dropped(self) -> None:
+        # Requirement: only Conductor's own truncation markers are replayed —
+        # a stored envelope carrying a non-string ``spill_path`` (e.g. forged
+        # by a server before ingestion stripping existed) must not reach the
+        # event, whose frontend contract types the field as a string.
+        content = [{"type": "text", "text": "x", "spill_path": {"private_result": "value"}}]
+        envelope = {"content": content, "structured": None, "is_error": False}
+        _, _, _, completed = WebDashboard._synth_agent_or_script(
+            "fetch", self._mcp_agent(), envelope
+        )
+        assert completed["truncated"] is False
+        assert completed["spill_path"] is None
+
+
+class TestSyntheticReplayMcpGroups:
+    """Coverage for group synthesis of ``type: mcp`` members (PR review).
+
+    Live group events (``parallel_completed`` / ``for_each_completed``) carry
+    counts only, never member outputs — but the aggregate ``outputs`` field
+    the synthetic replay builds from the restored context used to include
+    saved MCP envelopes (content + structured values), publishing on resume
+    what live execution deliberately excludes. MCP members must be stripped
+    from the aggregate and replayed as metadata-only events instead.
+    """
+
+    def _mcp_agent(self, name: str = "fetch") -> object:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            name=name,
+            type="mcp",
+            server="filesystem",
+            tool="read_file",
+            arguments={"path": "/tmp/x"},
+        )
+
+    def _envelope(self, answer: object) -> dict[str, object]:
+        return {
+            "content": [{"type": "text", "text": f"result-{answer}", "truncated": False}],
+            "structured": {"answer": answer},
+            "is_error": False,
+        }
+
+    def test_parallel_group_strips_mcp_member_envelopes(self) -> None:
+        # Requirement: a mixed parallel group replays its mcp member as
+        # metadata-only mcp_* events (tagged with group_name) plus the
+        # LLM-less parallel_agent_completed, the aggregate outputs keep only
+        # the non-mcp member, and no result value appears in any event.
+        from types import SimpleNamespace
+
+        agent_defs = {
+            "fetch": self._mcp_agent(),
+            "summarize": SimpleNamespace(name="summarize", type="agent"),
+        }
+        pg = SimpleNamespace(name="grp", agents=["fetch", "summarize"])
+        output = {
+            "outputs": {
+                "fetch": self._envelope("SECRET_VALUE"),
+                "summarize": {"text": "notes"},
+            },
+            "errors": {},
+        }
+
+        events = WebDashboard._synth_parallel("grp", pg, output, agent_defs)
+
+        types = [t for t, _ in events]
+        assert types[0] == "parallel_started"
+        assert types[-1] == "parallel_completed"
+        assert "mcp_started" in types and "mcp_completed" in types
+        completed = dict(events)["parallel_completed"]
+        assert "fetch" not in completed["outputs"]["outputs"]
+        assert completed["outputs"]["outputs"]["summarize"] == {"text": "notes"}
+        mcp_completed = next(data for t, data in events if t == "mcp_completed")
+        assert mcp_completed["group_name"] == "grp"
+        assert mcp_completed["server"] == "filesystem"
+        assert mcp_completed["result_bytes"] > 0
+        assert mcp_completed["synthetic"] is True
+        member_completed = next(
+            data
+            for t, data in events
+            if t == "parallel_agent_completed" and data["agent_name"] == "fetch"
+        )
+        assert member_completed["agent_type"] == "mcp"
+        assert "output" not in member_completed
+        assert "SECRET_VALUE" not in json.dumps(events)
+
+    def test_for_each_mcp_group_replays_items_metadata_only(self) -> None:
+        # Requirement: an mcp for-each group replays each item as the live
+        # event sequence (item_started -> mcp pair -> item_completed with no
+        # output), strips the envelopes from the aggregate, and keeps the
+        # authoritative item count.
+        from types import SimpleNamespace
+
+        fg = SimpleNamespace(name="loop", agent=self._mcp_agent("worker"))
+        output = {
+            "outputs": {"k1": self._envelope(1), "k2": self._envelope(2)},
+            "errors": {},
+            "count": 2,
+        }
+
+        events = WebDashboard._synth_for_each("loop", fg, output)
+
+        types = [t for t, _ in events]
+        assert types[0] == "for_each_started"
+        assert types[-1] == "for_each_completed"
+        item_starts = [data for t, data in events if t == "for_each_item_started"]
+        assert {d["item_key"] for d in item_starts} == {"k1", "k2"}
+        mcp_pairs = [data for t, data in events if t == "mcp_completed"]
+        assert {d["item_key"] for d in mcp_pairs} == {"k1", "k2"}
+        assert all(d["group_name"] == "loop" for d in mcp_pairs)
+        item_completions = [data for t, data in events if t == "for_each_item_completed"]
+        assert all("output" not in d for d in item_completions)
+        completed = dict(events)["for_each_completed"]
+        assert completed["outputs"]["outputs"] == {}
+        assert completed["item_count"] == 2
+        assert "result-1" not in json.dumps(events)
+
+    def test_for_each_non_mcp_group_keeps_aggregate_outputs(self) -> None:
+        # Requirement: non-mcp groups replay unchanged — the stripping is
+        # scoped to the step type whose live events enforce the no-values
+        # policy.
+        from types import SimpleNamespace
+
+        fg = SimpleNamespace(name="loop", agent=SimpleNamespace(name="worker", type="agent"))
+        output = {"outputs": [{"a": 1}], "errors": {}, "count": 1}
+
+        events = WebDashboard._synth_for_each("loop", fg, output)
+
+        types = [t for t, _ in events]
+        assert types == ["for_each_started", "for_each_completed"]
+        completed = dict(events)["for_each_completed"]
+        assert completed["outputs"]["outputs"] == [{"a": 1}]
+        assert completed["item_count"] == 1

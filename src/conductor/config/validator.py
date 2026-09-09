@@ -716,6 +716,23 @@ def _validate_mcp_steps(config: WorkflowConfig) -> list[str]:
                 f"(got '{server_def.type}'); http/sse support is not implemented yet"
             )
 
+        # Syntax-check every argument template explicitly. Reference
+        # analysis (_extract_template_refs) deliberately swallows
+        # TemplateSyntaxError (semantic validation must not hard-fail on
+        # templates render-time would report), so without this pass a
+        # malformed nested argument like '{{ workflow.input.foo' would pass
+        # `conductor validate` and only fail at execution.
+        for source_label, template_str in _collect_argument_strings(
+            f"{label} arguments", agent.arguments
+        ):
+            try:
+                _JINJA_ENV.parse(template_str)
+            except jinja2.TemplateSyntaxError as exc:
+                errors.append(
+                    f"{source_label}: invalid Jinja2 template syntax: {exc.message} "
+                    f"(line {exc.lineno})"
+                )
+
     return errors
 
 

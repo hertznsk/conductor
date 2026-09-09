@@ -2445,7 +2445,9 @@ class TestConsoleEventSubscriberMcpSteps:
                 "server": "filesystem",
                 "tool": "read_file",
                 "error_type": "ConnectionError",
-                "message": "MCP step 'fetch' failed; see debug logs for details",
+                "message": (
+                    "MCP step 'fetch' failed; full diagnostic: /tmp/conductor/x.mcp-diagnostics.log"
+                ),
             },
         )
         assert "filesystem" in text

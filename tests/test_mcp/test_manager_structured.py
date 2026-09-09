@@ -207,6 +207,35 @@ async def test_text_budget_not_applied_when_disabled() -> None:
 
 
 @pytest.mark.asyncio
+async def test_server_supplied_truncation_fields_are_stripped() -> None:
+    # Requirement: ``truncated`` / ``spill_path`` on a content block are
+    # Conductor-local metadata — a server returning extension fields of
+    # those names must not have them forwarded as trusted markers (a forged
+    # ``spill_path`` would leak result values into ``mcp_completed`` events
+    # and break the frontend's str type for the field). This holds even with
+    # spilling disabled, so the two can never be confused.
+    from mcp.types import TextContent
+
+    config = ToolOutputConfig(enabled=False)
+    manager = _make_manager(tool_output=config)
+    block = TextContent.model_construct(
+        type="text",
+        text="x",
+        truncated=True,
+        spill_path={"private_result": "value"},
+    )
+    manager.sessions["server"].call_tool.return_value = _make_result(content=[block])
+
+    envelope = await manager.call_tool_structured("server", "my_tool", {})
+
+    [dumped] = envelope["content"]
+    assert dumped["type"] == "text"
+    assert dumped["text"] == "x"
+    assert "truncated" not in dumped
+    assert "spill_path" not in dumped
+
+
+@pytest.mark.asyncio
 async def test_structured_is_never_truncated(tmp_path: Path) -> None:
     # Requirement: the per-result text budget applies to text blocks only;
     # the structured payload passes through untouched regardless of its size.

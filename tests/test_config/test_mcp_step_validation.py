@@ -140,6 +140,70 @@ class TestToolAllowlist:
             validate_workflow_config(config)
         assert "not allowed by server" not in str(exc_info.value)
 
+    def test_singleton_wildcard_allows_any_tool(self) -> None:
+        # Requirement: ["*"] means all tools (schema docstring contract).
+        config = _make_workflow(
+            _mcp_agent(tool="anything_at_all"),
+            mcp_servers={"srv": MCPServerDef(command="my-mcp-server", tools=["*"])},
+        )
+        assert validate_workflow_config(config) == []
+
+    def test_mixed_wildcard_list_allows_any_tool(self) -> None:
+        # Requirement: wildcard MEMBERSHIP is the rule at both boundaries —
+        # ["*", "health"] is accepted here exactly when the runtime check in
+        # engine/workflow.py::_run_mcp_step accepts it (shared rule).
+        config = _make_workflow(
+            _mcp_agent(tool="anything_at_all"),
+            mcp_servers={"srv": MCPServerDef(command="my-mcp-server", tools=["*", "health"])},
+        )
+        assert validate_workflow_config(config) == []
+
+    def test_empty_tools_list_allows_nothing(self) -> None:
+        # Requirement: an explicitly empty allowlist permits no tool.
+        config = _make_workflow(
+            _mcp_agent(tool="anything_at_all"),
+            mcp_servers={"srv": MCPServerDef(command="my-mcp-server", tools=[])},
+        )
+        with pytest.raises(ConfigurationError, match="not allowed by server 'srv'"):
+            validate_workflow_config(config)
+
+
+class TestArgumentTemplateSyntax:
+    def test_malformed_template_in_arguments_errors(self) -> None:
+        # Requirement: a syntax-broken argument template fails at validate
+        # time with the step and nested path named — reference analysis
+        # (_extract_template_refs) deliberately swallows TemplateSyntaxError,
+        # so without the explicit parse this only failed at execution.
+        config = _make_workflow(
+            _mcp_agent(arguments={"path": "{{ workflow.input.foo"}),
+            mcp_servers={"srv": MCPServerDef(command="my-mcp-server")},
+            inputs={"foo": InputDef(type="string")},
+        )
+        with pytest.raises(ConfigurationError) as exc_info:
+            validate_workflow_config(config)
+        assert "invalid Jinja2 template syntax" in str(exc_info.value)
+        assert "arguments.path" in str(exc_info.value)
+
+    def test_malformed_template_nested_in_list_errors(self) -> None:
+        # Requirement: the syntax check walks lists too, not just mappings.
+        config = _make_workflow(
+            _mcp_agent(arguments={"opts": {"labels": ["ok", "{% if x"]}}),
+            mcp_servers={"srv": MCPServerDef(command="my-mcp-server")},
+        )
+        with pytest.raises(ConfigurationError) as exc_info:
+            validate_workflow_config(config)
+        assert "invalid Jinja2 template syntax" in str(exc_info.value)
+        assert "arguments.opts.labels[1]" in str(exc_info.value)
+
+    def test_valid_nested_templates_still_pass(self) -> None:
+        # Requirement: well-formed nested templates produce no syntax error.
+        config = _make_workflow(
+            _mcp_agent(arguments={"opts": {"labels": ["a", "{{ workflow.input.x }}"], "n": 3}}),
+            mcp_servers={"srv": MCPServerDef(command="my-mcp-server")},
+            inputs={"x": InputDef(type="string")},
+        )
+        assert validate_workflow_config(config) == []
+
 
 class TestTransport:
     def test_http_server_errors(self) -> None:

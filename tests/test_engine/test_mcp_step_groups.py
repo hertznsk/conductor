@@ -836,10 +836,20 @@ class TestMcpInForEach:
     @pytest.mark.asyncio
     async def test_fail_fast_cancels_and_drains_sibling_item(self) -> None:
         # Requirement (for_each variant): a failing item under fail_fast
-        # cancels and drains the sibling item blocked inside its mcp call
-        # before the exception propagates — the sibling observes cancellation
-        # before the pool close in run()'s finally, and item failure events
-        # carry no raw exception text.
+        # cancels and drains the sibling item before the exception
+        # propagates — the sibling observes cancellation before the pool
+        # close in run()'s finally, item failure events carry no raw
+        # exception text, and mcp_failed reports the real error type.
+        #
+        # Roles follow CALL order, not item identity: both items share one
+        # server, so the per-server slot serializes them and no coordination
+        # event could ever let both be inside a call at once (an earlier
+        # version of this test waited on exactly such an event — the wait
+        # timed out, the canary-bearing RuntimeError never fired, and the
+        # redaction assertions were vacuous). The first item to acquire the
+        # slot fails immediately; the sibling is cancelled wherever the
+        # fail-fast drain finds it (blocked at the slot boundary or blocked
+        # inside its call) — both land in `order` before the pool close.
         canary = "secret-argument-value"
         engine = _make_engine(self._config(max_concurrent=2))
         received = _collect_events(engine)
@@ -853,16 +863,14 @@ class TestMcpInForEach:
 
         engine._close_mcp_step_managers = recording_close  # type: ignore[method-assign]
 
-        blocking = asyncio.Event()
-
-        async def item_call(_server: str, _tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
-            if arguments["q"] == "a":
-                # Fail only once the sibling is genuinely blocked inside its call.
-                await asyncio.wait_for(blocking.wait(), timeout=5)
-                raise RuntimeError(f"a exploded with {canary}")
-            blocking.set()
+        async def item_call(_server: str, _tool: str, _arguments: dict[str, Any]) -> dict[str, Any]:
+            if not any(entry.startswith("call") for entry in order):
+                order.append("call-raised")
+                raise RuntimeError(f"call exploded with {canary}")
+            # The sibling blocks until the fail-fast drain cancels it.
+            order.append("sibling-blocked")
             try:
-                await asyncio.Event().wait()  # blocks until cancelled
+                await asyncio.Event().wait()
             except asyncio.CancelledError:
                 order.append("sibling-cancelled")
                 raise
@@ -875,10 +883,15 @@ class TestMcpInForEach:
         finally:
             patcher.stop()
 
-        assert order == ["sibling-cancelled", "pool-close"]
+        assert order == ["call-raised", "sibling-blocked", "sibling-cancelled", "pool-close"]
+        # The canary-bearing RuntimeError genuinely happened (an earlier
+        # version never raised it) and its type reached mcp_failed.
+        mcp_failed = [ev for ev in received if ev.type == "mcp_failed"]
+        assert len(mcp_failed) == 1
+        assert mcp_failed[0].data["error_type"] == "RuntimeError"
+        assert canary not in json.dumps(mcp_failed[0].data)
         failed = [ev for ev in received if ev.type == "for_each_item_failed"]
         assert len(failed) == 1
-        assert failed[0].data["item_key"] == "0"
         assert canary not in json.dumps(failed[0].data)
         wf_failed = [ev for ev in received if ev.type == "workflow_failed"]
         assert len(wf_failed) == 1

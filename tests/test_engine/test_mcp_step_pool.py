@@ -273,6 +273,101 @@ class TestPoolBound:
         }
 
     @pytest.mark.asyncio
+    async def test_concurrent_first_connects_reserve_capacity(self) -> None:
+        # Requirement: admission reserves a slot for an in-flight connect —
+        # with the pool one below the cap, two concurrent first-time
+        # connects to DISTINCT servers must not both pass a size-only check
+        # (which would leave cap+1 managers cached and nothing evicted); the
+        # second evicts an idle entry and the pool finishes AT the cap.
+        engine = _make_engine(
+            {
+                "srvA": MCPServerDef(type="stdio", command="npx"),
+                "srvB": MCPServerDef(type="stdio", command="npx"),
+            }
+        )
+        prefilled: list[MagicMock] = []
+        for i in range(_MCP_STEP_POOL_MAX - 1):
+            manager = MagicMock()
+            manager.close = AsyncMock()
+            engine._mcp_step_managers[(f"old{i}", f"/tmp/{i}")] = manager
+            engine._mcp_step_locks[f"old{i}"] = asyncio.Lock()
+            prefilled.append(manager)
+
+        started = 0
+        both_started = asyncio.Event()
+
+        async def gated_connect(**_kwargs: Any) -> list[dict[str, Any]]:
+            # Both connects must be genuinely in flight before either
+            # returns, or the test proves nothing about the admission race.
+            nonlocal started
+            started += 1
+            if started == 2:
+                both_started.set()
+            await asyncio.wait_for(both_started.wait(), timeout=5)
+            return []
+
+        def factory(**_kwargs: Any) -> MagicMock:
+            manager = _manager_factory()
+            manager.connect_server = AsyncMock(side_effect=gated_connect)
+            return manager
+
+        async def get(server: str) -> Any:
+            async with await engine._mcp_step_slot(server):
+                return await engine._get_mcp_step_manager(server, "/tmp/new")
+
+        with _patch_manager_class() as manager_cls:
+            manager_cls.side_effect = factory
+            first, second = await asyncio.gather(get("srvA"), get("srvB"))
+
+        assert first is not second
+        # One prefilled entry was evicted to make room; the pool ends exactly
+        # at the cap (cap-1 prefilled, one evicted, two new = cap).
+        assert sum(m.close.await_count for m in prefilled) == 1
+        assert len(engine._mcp_step_managers) == _MCP_STEP_POOL_MAX
+        assert engine._mcp_step_pending == 0
+
+    @pytest.mark.asyncio
+    async def test_eviction_close_reraises_cancellation(self) -> None:
+        # Requirement: MCPManager.close() deliberately absorbs CancelledError
+        # while draining connection teardown — awaited directly during
+        # eviction, that would swallow the workflow's cancellation and let a
+        # NEW tool call start after it. The eviction close runs shielded, the
+        # close still completes, and CancelledError is re-raised BEFORE any
+        # new connect happens.
+        engine = _make_engine({"srv": MCPServerDef(type="stdio", command="npx")})
+        managers = await self._fill_pool(engine, locked=False)
+
+        close_gate = asyncio.Event()
+
+        async def blocking_close() -> None:
+            await asyncio.wait_for(close_gate.wait(), timeout=5)
+
+        managers[0].close = AsyncMock(side_effect=blocking_close)
+
+        with _patch_manager_class() as manager_cls:
+            manager_cls.side_effect = _manager_factory
+
+            async def connect_and_get() -> Any:
+                async with await engine._mcp_step_slot("srv"):
+                    return await engine._get_mcp_step_manager("srv", "/tmp/new")
+
+            task = asyncio.create_task(connect_and_get())
+            await asyncio.sleep(0.05)  # let it reach the eviction close
+            task.cancel()
+            await asyncio.sleep(0.05)
+            # The close is still draining: cancellation was absorbed by the
+            # manager's close, not lost — the eviction has not returned yet.
+            assert not task.done()
+            close_gate.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        # The evicted manager finished closing; the new connect never ran.
+        managers[0].close.assert_awaited_once()
+        assert ("srv", "/tmp/new") not in engine._mcp_step_managers
+        assert engine._mcp_step_pending == 0
+
+    @pytest.mark.asyncio
     async def test_close_clears_locks_even_when_pool_is_empty(self) -> None:
         # Requirement: cleanup clears BOTH dicts unconditionally — a failed
         # connect leaves slot locks behind without pooling any manager, and

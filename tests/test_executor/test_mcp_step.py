@@ -213,6 +213,59 @@ class TestEnvelopeMerge:
         result = await executor.execute(agent, {}, manager)  # type: ignore[arg-type]
         assert result == {"content": [], "structured": None, "is_error": False}
 
+    async def test_outputs_errors_keys_are_reserved_from_flattening(
+        self, executor: McpStepExecutor
+    ) -> None:
+        # Requirement: structured keys named ``outputs``/``errors`` are never
+        # flattened onto the envelope — WorkflowContext duck-types
+        # parallel/for-each group outputs by exactly those two top-level
+        # keys, so flattening them would misclassify this step's output as a
+        # group output in every context mode (and confuse for-each source
+        # resolution). They stay reachable under ``structured``.
+        manager = FakeMCPManager(
+            envelope={
+                "content": [{"type": "text", "text": "ok"}],
+                "structured": {"outputs": [1, 2], "errors": [], "answer": 7},
+                "is_error": False,
+            }
+        )
+        agent = make_agent()
+        result = await executor.execute(agent, {}, manager)  # type: ignore[arg-type]
+        assert "outputs" not in result
+        assert "errors" not in result
+        assert result["answer"] == 7
+        assert result["structured"] == {"outputs": [1, 2], "errors": [], "answer": 7}
+        assert result["is_error"] is False
+
+
+class TestGroupOutputMisclassification:
+    """A merged envelope must never read as a parallel/for-each group output."""
+
+    async def test_envelope_with_structured_outputs_keys_keeps_output_wrapper(
+        self, executor: McpStepExecutor
+    ) -> None:
+        # Requirement: stored in the workflow context, the envelope keeps its
+        # normal ``.output`` wrapper — ``{{ step.output.is_error }}`` works
+        # even when the tool's structured payload carries ``outputs`` /
+        # ``errors`` keys of its own.
+        from conductor.engine.context import WorkflowContext
+
+        manager = FakeMCPManager(
+            envelope={
+                "content": [{"type": "text", "text": "ok"}],
+                "structured": {"outputs": [1, 2], "errors": [], "answer": 7},
+                "is_error": False,
+            }
+        )
+        agent = make_agent()
+        envelope = await executor.execute(agent, {}, manager)  # type: ignore[arg-type]
+
+        context = WorkflowContext()
+        context.store("call", envelope)
+        built = context.build_for_agent("downstream", [])
+        assert built["call"]["output"]["is_error"] is False
+        assert built["call"]["output"]["answer"] == 7
+
 
 class TestTimeoutAndErrors:
     """Timeout and error propagation contracts."""

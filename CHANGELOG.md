@@ -50,7 +50,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `runtime.tool_output` with spill-to-file support while structured data is
   preserved intact. Step and result values are excluded from all lifecycle
   events (`mcp_started`, `mcp_completed`, `mcp_failed`), with failure messages
-  redacted and full traces logged at debug level only. See
+  redacted to a safe category and full exception traces written only to a
+  private per-run `*.mcp-diagnostics.log` file (named by the redacted
+  message). See
   [`docs/workflow-syntax.md`](docs/workflow-syntax.md#mcp-steps) and
   [`examples/mcp-step.yaml`](examples/mcp-step.yaml).
 
