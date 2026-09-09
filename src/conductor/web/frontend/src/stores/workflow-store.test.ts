@@ -1372,3 +1372,136 @@ describe('workflow-store processEvent — agent_prompt_rendered continuation', (
     expect(prompt).toBe('first prompt\n\n## Validation feedback\n- fix');
   });
 });
+
+describe('workflow-store — mcp item-scoped branching', () => {
+  // Requirement: Normal MCP steps without a group_name/item_key update their own top-level node.
+  it('updates normal mcp nodes correctly', () => {
+    const { processEvent } = useWorkflowStore.getState();
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [{ name: 'my_mcp', type: 'mcp' }],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [],
+      entry_point: 'my_mcp',
+    }));
+
+    processEvent(event('mcp_started', {
+      agent_name: 'my_mcp',
+      server: 'git',
+      tool: 'status',
+      argument_keys: [],
+    }));
+
+    const stateRunning = useWorkflowStore.getState();
+    expect(stateRunning.nodes.my_mcp?.status).toBe('running');
+
+    processEvent(event('mcp_completed', {
+      agent_name: 'my_mcp',
+      elapsed: 1.5,
+      server: 'git',
+      tool: 'status',
+      is_error: false,
+      result_bytes: 123,
+      truncated: false,
+    }));
+
+    const stateCompleted = useWorkflowStore.getState();
+    expect(stateCompleted.nodes.my_mcp?.status).toBe('completed');
+    expect(stateCompleted.nodes.my_mcp?.mcp_server).toBe('git');
+    expect(stateCompleted.nodes.my_mcp?.mcp_tool).toBe('status');
+    expect(stateCompleted.nodes.my_mcp?.mcp_result_bytes).toBe(123);
+  });
+
+  // Requirement: Two concurrently active item_keys with interleaved completions must not cross-contaminate.
+  it('updates for_each_items independently without touching the group node or each other (interleaved)', () => {
+    const { processEvent } = useWorkflowStore.getState();
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [],
+      routes: [],
+      parallel_groups: [],
+      for_each_groups: [{ name: 'mcp_group' }],
+      entry_point: 'mcp_group',
+    }));
+
+    processEvent(event('for_each_started', { group_name: 'mcp_group', item_count: 2 }));
+
+    // Items started
+    processEvent(event('for_each_item_started', { group_name: 'mcp_group', item_key: 'item1', index: 0 }));
+    processEvent(event('for_each_item_started', { group_name: 'mcp_group', item_key: 'item2', index: 1 }));
+
+    // Interleaved MCP starts
+    processEvent(event('mcp_started', {
+      agent_name: 'mcp_inline',
+      group_name: 'mcp_group',
+      item_key: 'item1',
+      server: 's1',
+      tool: 't1',
+      argument_keys: [],
+    }));
+
+    processEvent(event('mcp_started', {
+      agent_name: 'mcp_inline',
+      group_name: 'mcp_group',
+      item_key: 'item2',
+      server: 's2',
+      tool: 't2',
+      argument_keys: [],
+    }));
+
+    // Verify they are both running
+    const stateRunning = useWorkflowStore.getState();
+    const groupRunning = stateRunning.nodes.mcp_group;
+    expect(groupRunning?.for_each_items).toHaveLength(2);
+    expect(groupRunning?.for_each_items?.[0]?.status).toBe('running');
+    expect(groupRunning?.for_each_items?.[1]?.status).toBe('running');
+
+    // Interleaved MCP completions
+    processEvent(event('mcp_completed', {
+      agent_name: 'mcp_inline',
+      group_name: 'mcp_group',
+      item_key: 'item2',
+      elapsed: 2.0,
+      server: 's2',
+      tool: 't2',
+      is_error: false,
+      result_bytes: 42,
+      truncated: false,
+    }));
+
+    processEvent(event('mcp_failed', {
+      agent_name: 'mcp_inline',
+      group_name: 'mcp_group',
+      item_key: 'item1',
+      elapsed: 1.0,
+      server: 's1',
+      tool: 't1',
+      error_type: 'TimeoutError',
+      message: 'timeout',
+    }));
+
+    const stateFinal = useWorkflowStore.getState();
+    const groupFinal = stateFinal.nodes.mcp_group;
+    expect(groupFinal?.for_each_items).toHaveLength(2);
+
+    const item1 = groupFinal?.for_each_items?.find(i => i.key === 'item1');
+    const item2 = groupFinal?.for_each_items?.find(i => i.key === 'item2');
+
+    expect(item1?.status).toBe('failed');
+    expect(item1?.mcp_server).toBe('s1');
+    expect(item1?.mcp_tool).toBe('t1');
+    expect(item1?.error_type).toBe('TimeoutError');
+
+    expect(item2?.status).toBe('completed');
+    expect(item2?.mcp_server).toBe('s2');
+    expect(item2?.mcp_tool).toBe('t2');
+    expect(item2?.mcp_result_bytes).toBe(42);
+
+    // Group node status itself is not mutated by item events
+    expect(groupFinal?.status).toBe('running'); // since for_each_completed hasn't fired
+
+    // The shared inline agent should not be created as a top-level node
+    expect(stateFinal.nodes.mcp_inline).toBeUndefined();
+  });
+});

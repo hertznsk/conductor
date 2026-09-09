@@ -2386,3 +2386,101 @@ class TestSilentAwareConsole:
         from conductor.cli.run import _SilentAwareConsole, _verbose_console
 
         assert isinstance(_verbose_console, _SilentAwareConsole)
+
+
+class TestConsoleEventSubscriberMcpSteps:
+    """ConsoleEventSubscriber rendering of mcp step lifecycle events."""
+
+    def _drive(self, event_type: str, data: dict) -> str:
+        """Drive the subscriber with one event in verbose mode and return its output."""
+        import time
+        from io import StringIO
+
+        from rich.console import Console
+
+        from conductor.cli.run import ConsoleEventSubscriber
+        from conductor.events import WorkflowEvent
+
+        subscriber = ConsoleEventSubscriber()
+        output = StringIO()
+        token = verbose_mode.set(True)
+        try:
+            with patch(
+                "conductor.cli.run._verbose_console",
+                Console(file=output, force_terminal=True, no_color=True),
+            ):
+                event = WorkflowEvent(type=event_type, timestamp=time.time(), data=data)
+                subscriber.on_event(event)
+                return output.getvalue()
+        finally:
+            verbose_mode.reset(token)
+
+    def test_mcp_completed_renders_server_tool_and_elapsed(self) -> None:
+        # Requirement: an mcp step's completion is visible in the console with
+        # its server, tool, and elapsed time (mirror of the wait_completed branch).
+        text = self._drive(
+            "mcp_completed",
+            {
+                "agent_name": "fetch",
+                "elapsed": 1.25,
+                "server": "filesystem",
+                "tool": "read_file",
+                "is_error": False,
+                "result_bytes": 128,
+                "truncated": False,
+            },
+        )
+        assert "filesystem" in text
+        assert "read_file" in text
+        assert "1.25" in text
+
+    def test_mcp_failed_renders_error_line(self) -> None:
+        # Requirement: a connect/invoke failure is visible immediately, not only
+        # at workflow_failed — the branch exists where script_failed has none.
+        text = self._drive(
+            "mcp_failed",
+            {
+                "agent_name": "fetch",
+                "elapsed": 0.5,
+                "server": "filesystem",
+                "tool": "read_file",
+                "error_type": "ConnectionError",
+                "message": "MCP step 'fetch' failed; see debug logs for details",
+            },
+        )
+        assert "filesystem" in text
+        assert "read_file" in text
+        assert "ConnectionError" in text
+
+    def test_mcp_started_is_not_printed(self) -> None:
+        # Requirement: started events never reach the console (precedent of all
+        # other step types) — only the completion/failure lines may appear.
+        text = self._drive(
+            "mcp_started",
+            {
+                "agent_name": "fetch",
+                "iteration": 1,
+                "server": "filesystem",
+                "tool": "read_file",
+                "argument_keys": ["path"],
+            },
+        )
+        assert "filesystem" not in text
+
+    def test_mcp_completed_bracketed_server_name_renders_verbatim(self) -> None:
+        # Requirement: markup-injection guard — a server name containing a
+        # bracketed token must render literally, not be parsed as styling,
+        # deleted, or raise MarkupError (#406 rules).
+        text = self._drive(
+            "mcp_completed",
+            {
+                "agent_name": "fetch",
+                "elapsed": 0.1,
+                "server": "my[bracket]server",
+                "tool": "read_file",
+                "is_error": False,
+                "result_bytes": 8,
+                "truncated": False,
+            },
+        )
+        assert "my[bracket]server" in text

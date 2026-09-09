@@ -1847,3 +1847,96 @@ class TestSyntheticReplaySetStep:
         big_value = "x" * 2000
         _, _, _, completed = WebDashboard._synth_agent_or_script("big", agent, big_value)
         assert completed["value_repr"] == render_set_value_repr(big_value)
+
+
+class TestSyntheticReplayMcpStep:
+    """Coverage for ``WebDashboard._synth_agent_or_script`` mcp branch.
+
+    The synthetic replay path emits ``mcp_started``/``mcp_completed`` when
+    restoring an mcp step's envelope from a checkpoint on resume. The payload
+    must match the live engine emitter byte-for-byte — including the
+    ``result_bytes`` measurement, which is the shared size contract.
+    """
+
+    def _mcp_agent(self) -> object:
+        """Build a minimal AgentDef-like duck typed object for an mcp step."""
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            type="mcp",
+            server="filesystem",
+            tool="read_file",
+            arguments={"path": "/tmp/x"},
+        )
+
+    def _expected_result_bytes(self, content: object, structured: object) -> int:
+        """Independent re-derivation of the envelope byte size.
+
+        Deliberately restates the measurement formula instead of importing the
+        production helper, so the test fails if the helper's contract drifts.
+        """
+        import json
+
+        return len(
+            json.dumps(
+                {"content": content, "structured": structured},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+
+    def test_envelope_synthesises_mcp_events(self) -> None:
+        # Requirement: the mcp branch emits mcp_started/mcp_completed with the
+        # live payload shape (server/tool from the agent def, argument_keys
+        # sorted, elapsed 0.0 like the set branch).
+        content = [{"type": "text", "text": "hello", "truncated": False}]
+        envelope = {"content": content, "structured": None, "is_error": False}
+        started_type, started, completed_type, completed = WebDashboard._synth_agent_or_script(
+            "fetch", self._mcp_agent(), envelope
+        )
+        assert started_type == "mcp_started"
+        assert completed_type == "mcp_completed"
+        assert started["server"] == "filesystem"
+        assert started["tool"] == "read_file"
+        assert started["argument_keys"] == ["path"]
+        assert started["synthetic"] is True
+        assert completed["is_error"] is False
+        assert completed["elapsed"] == 0.0
+        assert completed["result_bytes"] == self._expected_result_bytes(content, None)
+
+    def test_result_bytes_match_live_measurement_for_multibyte_text(self) -> None:
+        # Requirement: result_bytes is byte-identical between live and
+        # synthetic events — multibyte text must count UTF-8 bytes, not chars.
+        content = [{"type": "text", "text": "héllo wörld — 中文文本", "truncated": False}]
+        envelope = {"content": content, "structured": None, "is_error": False}
+        _, _, _, completed = WebDashboard._synth_agent_or_script(
+            "fetch", self._mcp_agent(), envelope
+        )
+        expected = self._expected_result_bytes(content, None)
+        assert completed["result_bytes"] == expected
+        assert expected > len("héllo wörld — 中文文本")  # bytes, not characters
+
+    def test_result_bytes_match_live_measurement_with_structured_payload(self) -> None:
+        # Requirement: a non-empty structured mapping participates in the size
+        # measurement exactly as the live emitter measures it.
+        content = [{"type": "text", "text": "ok", "truncated": False}]
+        structured = {"answer": "中文字符串", "score": 42}
+        envelope = {"content": content, "structured": structured, "is_error": False}
+        _, _, _, completed = WebDashboard._synth_agent_or_script(
+            "fetch", self._mcp_agent(), envelope
+        )
+        assert completed["result_bytes"] == self._expected_result_bytes(content, structured)
+
+    def test_is_error_and_truncation_metadata_come_from_envelope(self) -> None:
+        # Requirement: is_error is restored from the saved envelope, and
+        # truncated/spill_path reflect the content blocks — never fabricated.
+        content = [
+            {"type": "text", "text": "big", "truncated": True, "spill_path": "/tmp/spill.txt"}
+        ]
+        envelope = {"content": content, "structured": None, "is_error": True}
+        _, _, _, completed = WebDashboard._synth_agent_or_script(
+            "fetch", self._mcp_agent(), envelope
+        )
+        assert completed["is_error"] is True
+        assert completed["truncated"] is True
+        assert completed["spill_path"] == "/tmp/spill.txt"

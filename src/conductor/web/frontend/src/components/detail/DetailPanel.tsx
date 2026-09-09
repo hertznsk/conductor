@@ -6,6 +6,7 @@ import { parseNodeKey } from '@/lib/node-id';
 import { AgentDetail } from './AgentDetail';
 import { ScriptDetail } from './ScriptDetail';
 import { SetDetail } from './SetDetail';
+import { McpDetail } from './McpDetail';
 import { GateDetail } from './GateDetail';
 import { QuestionsDetail } from './QuestionsDetail';
 import { GroupDetail } from './GroupDetail';
@@ -55,6 +56,8 @@ export function DetailPanel() {
         return WaitDetail;
       case 'set':
         return SetDetail;
+      case 'mcp':
+        return McpDetail;
       case 'human_gate':
         return GateDetail;
       case 'questions':

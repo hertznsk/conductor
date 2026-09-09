@@ -26,6 +26,7 @@ import { claimCameraForAnimation, isCameraAnimating } from '@/lib/camera-authori
 import { AgentNode } from './AgentNode';
 import { ScriptNode } from './ScriptNode';
 import { SetNode } from './SetNode';
+import { McpNode } from './McpNode';
 import { GateNode } from './GateNode';
 import { GroupNode } from './GroupNode';
 import { WorkflowNode } from './WorkflowNode';
@@ -47,6 +48,7 @@ const nodeTypes: NodeTypes = {
   agentNode: AgentNode,
   scriptNode: ScriptNode,
   setNode: SetNode,
+  mcpNode: McpNode,
   gateNode: GateNode,
   groupNode: GroupNode,
   workflowNode: WorkflowNode,

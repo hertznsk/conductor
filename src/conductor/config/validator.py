@@ -436,6 +436,12 @@ def validate_workflow_config(
     # Unconditional: default-on exposure means every workflow is a candidate.
     errors.extend(_validate_mcp_exposure(config))
 
+    # Static half of the ``type: mcp`` step checks. ``conductor run`` never
+    # calls this validator, so the same rules (plus actual tool existence on
+    # the server) are enforced again at runtime; this is early off-network
+    # diagnostics for ``conductor validate`` only.
+    errors.extend(_validate_mcp_steps(config))
+
     if errors:
         raise ConfigurationError(
             "Workflow configuration validation failed:\n  - " + "\n  - ".join(errors),
@@ -654,6 +660,65 @@ def _validate_mcp_exposure(config: WorkflowConfig) -> list[str]:
     return errors
 
 
+def _validate_mcp_steps(config: WorkflowConfig) -> list[str]:
+    """Validate ``type: mcp`` step server/tool references.
+
+    Checks that each mcp step's ``server`` is declared in
+    ``workflow.runtime.mcp_servers``, that the server's ``tools`` filter
+    allows the step's ``tool``, and that the server is a stdio server
+    (http/sse support is not implemented yet). Inline for-each agents are
+    walked explicitly since they are absent from ``config.agents``;
+    parallel-group members are names into ``config.agents`` and covered by
+    that list. This is the static half of the checks only — ``conductor
+    run`` never calls this validator, so the engine repeats them at runtime
+    (plus actual tool existence on the server).
+
+    Returns:
+        List of error messages.
+    """
+    errors: list[str] = []
+    servers = config.workflow.runtime.mcp_servers
+
+    # (agent, enclosing for_each group name or None)
+    mcp_agents: list[tuple[AgentDef, str | None]] = [
+        (agent, None) for agent in config.agents if agent.type == "mcp"
+    ]
+    mcp_agents += [(fe.agent, fe.name) for fe in config.for_each if fe.agent.type == "mcp"]
+
+    for agent, for_each_group in mcp_agents:
+        label = (
+            f"Agent '{agent.name}'"
+            if for_each_group is None
+            else f"Agent '{agent.name}' in for-each group '{for_each_group}'"
+        )
+        if agent.server is None or agent.tool is None:
+            # Schema validation already rejects mcp agents without
+            # server/tool; this guard only narrows the types below.
+            continue
+        server_def = servers.get(agent.server)
+        if server_def is None:
+            available = ", ".join(sorted(servers)) or "(none declared)"
+            errors.append(
+                f"{label} references unknown MCP server '{agent.server}'. "
+                f"Available servers: {available}"
+            )
+            continue
+        if "*" not in server_def.tools and agent.tool not in server_def.tools:
+            errors.append(
+                f"{label} uses tool '{agent.tool}' which is not allowed by "
+                f"server '{agent.server}' tools filter "
+                f"({', '.join(server_def.tools)}). Add the tool to the server's "
+                'tools list or use ["*"] to allow all tools.'
+            )
+        if server_def.type != "stdio":
+            errors.append(
+                f"{label}: type: mcp supports stdio servers only "
+                f"(got '{server_def.type}'); http/sse support is not implemented yet"
+            )
+
+    return errors
+
+
 def _validate_output_references(
     output: dict[str, str],
     valid_names: set[str],
@@ -813,11 +878,12 @@ def _validate_parallel_groups(config: WorkflowConfig) -> list[str]:
                             "on each other."
                         )
 
-            # For 'set' steps, also walk value/values.* templates — they can
-            # reference siblings directly without declaring them in input:.
+            # For 'set' and 'mcp' steps, also walk their value/values.*
+            # (resp. arguments.*) templates — they can reference siblings
+            # directly without declaring them in input:.
             # Parallel execution uses a pre-group snapshot, so any reference
             # to a same-group member would silently miss its output.
-            if agent.type == "set":
+            if agent.type in ("set", "mcp"):
                 for source_label, template_str in _collect_template_strings(agent):
                     refs = _extract_template_refs(template_str)
                     cross_refs = refs.agent_refs & pg_agents_set
@@ -1252,6 +1318,25 @@ def _validate_output_path_coverage(config: WorkflowConfig) -> list[str]:
     return warnings
 
 
+def _collect_argument_strings(label: str, value: Any) -> list[tuple[str, str]]:
+    """Recursively collect string leaves of an ``arguments`` value.
+
+    Dict keys extend the dot-joined label (``arguments.<key>``); list items
+    use index labels (``arguments.<key>[<i>]``). Non-string scalars pass
+    through untouched — only rendered strings can carry template references.
+    """
+    collected: list[tuple[str, str]] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            collected.extend(_collect_argument_strings(f"{label}.{key}", item))
+    elif isinstance(value, list):
+        for i, item in enumerate(value):
+            collected.extend(_collect_argument_strings(f"{label}[{i}]", item))
+    elif isinstance(value, str):
+        collected.append((label, value))
+    return collected
+
+
 def _collect_template_strings(
     agent: AgentDef,
 ) -> list[tuple[str, str]]:
@@ -1288,6 +1373,13 @@ def _collect_template_strings(
     if values:
         for key, expr in values.items():
             templates.append((f"agent '{agent.name}' values.{key}", expr))
+
+    # 'mcp' step arguments — values are Jinja2-rendered at runtime, including
+    # string leaves nested in dicts/lists, so collect them recursively to
+    # catch stale references at validate-time like every other rendered field.
+    arguments: dict[str, Any] | None = getattr(agent, "arguments", None)
+    if arguments:
+        templates.extend(_collect_argument_strings(f"agent '{agent.name}' arguments", arguments))
 
     # input_mapping is on AgentDef in main (added by #109 closing #101) but may not
     # exist on the schema in branches that haven't merged that yet. getattr keeps
@@ -1768,7 +1860,7 @@ def _validate_template_references(
                 elif (
                     is_explicit
                     and agent.type
-                    not in ("script", "set", "workflow", "human_gate", "questions", "wait")
+                    not in ("script", "set", "workflow", "human_gate", "questions", "wait", "mcp")
                     and input_name not in declared_workflow_inputs
                 ):
                     warnings.append(

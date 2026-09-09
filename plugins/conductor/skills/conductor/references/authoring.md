@@ -95,7 +95,7 @@ event + console warning. See
 ```yaml
 agents:
   - name: my_agent               # Required: unique identifier
-    type: agent                  # agent (default), human_gate, script, workflow, wait, or terminate
+    type: agent                  # agent (default), human_gate, script, workflow, wait, terminate, or mcp
     description: What it does
     model: gpt-5.2               # Override workflow default
     provider: claude             # Optional: per-agent provider override
@@ -568,6 +568,68 @@ Routes attached to a set step see the bound value directly. Dict outputs expose 
 Set agents **cannot** have: `prompt`, `provider`, `model`, `tools`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `options`, `input_mapping`, `max_depth`, `retry`, `dialog`, `validator`, `reasoning`, `timeout_seconds`, `max_session_seconds`, `max_agent_iterations`, or `session_key`. They count toward `limits.max_iterations` like any other step.
 
 `output:` schema validation is permitted only when the rendered output is a dict (always for `values:`, sometimes for `value:`). A single-`value:` step with a declared schema that produces a scalar raises a `ValidationError` pointing to `values:`.
+
+## MCP Steps (`type: mcp`)
+
+Directly invoke tools on configured MCP servers (`workflow.runtime.mcp_servers`) without an LLM. MCP steps run deterministically, spend zero prompt tokens, and capture structured output into the workflow context.
+
+```yaml
+agents:
+  - name: read_spec
+    type: mcp
+    server: filesystem                      # Required: literal server name in runtime.mcp_servers
+    tool: read_file                         # Required: literal tool name on the server
+    arguments:                              # Optional: dict of Jinja2-templated arguments
+      path: "docs/spec.md"
+    timeout: 30                             # Optional: per-call timeout in seconds
+    routes:
+      - to: handle_error
+        when: "{{ output.is_error }}"
+      - to: analyze_spec
+```
+
+### Argument Rendering and Type Coercion
+
+Dict and list structures in `arguments:` are traversed recursively. String leaves are Jinja2-rendered against workflow context and auto-coerced (e.g. `"105"` -> `105`, `"true"` -> `True`, `"null"` -> `None`). Non-scalar values and embedded templates remain strings. YAML-native scalars (integers, floats, booleans, `None`) pass through untouched.
+
+### Output Envelope and Merging
+
+MCP steps produce an output envelope:
+
+```json
+{
+  "content": [
+    {"type": "text", "text": "..."}
+  ],
+  "structured": {"record_id": 42, "status": "ok"},
+  "is_error": false
+}
+```
+
+When `structured` is a dictionary, its top-level keys are merged onto the step output dict. Envelope keys (`content`, `structured`, `is_error`) are reserved and take precedence over colliding structured keys.
+
+### Error Handling and `is_error` Routing
+
+Logical tool errors reported by the server set `output.is_error = True` and complete the step normally without raising an error, enabling conditional routing:
+
+```yaml
+routes:
+  - to: handle_error
+    when: "{{ output.is_error }}"
+  - to: next_step
+```
+
+Transport failures, unlisted tools, unknown servers, timeouts, and output schema validation failures raise exceptions and fail the step.
+
+### Concurrency and Server Serialization
+
+Calls to the same MCP server process are serialized via a per-server slot lock. Calls to distinct MCP servers in parallel groups run concurrently.
+
+### MCP Step Restrictions
+
+MCP agents **cannot** have: `prompt`, `system_prompt`, `provider`, `model`, `tools`, `reasoning`, `context_tier`, `skills`, `plugins`, `validator`, `dialog`, `sandbox`, `session_key`, `max_agent_iterations`, `max_session_seconds`, `output_mode`, `retry`, `timeout_seconds` (use `timeout`), `command`, `args`, `env`, `working_dir`, `options`, `workflow`, `input_mapping`, `max_depth`, `value`, `values`, or `output_type`.
+
+MCP steps currently support `stdio` servers only.
 
 ## Sub-Workflow Agents (`type: workflow`)
 

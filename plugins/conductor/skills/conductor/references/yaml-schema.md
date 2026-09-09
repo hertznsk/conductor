@@ -155,7 +155,7 @@ agents:
     name: string                    # Unique agent identifier
 
     # Optional fields
-    type: string                    # "agent" (default), "human_gate", "script", "workflow", "wait", or "terminate"
+    type: string                    # "agent" (default), "human_gate", "script", "workflow", "wait", "terminate", or "mcp"
     description: string             # What this agent does
     model: string                   # Override default_model
     provider: string                # Per-agent provider override ("copilot", "claude", "claude-agent-sdk", or "hermes")
@@ -274,11 +274,19 @@ agents:
     output_template:                # Optional: replaces workflow-level output: for this path
       <key>: string                 # Each value Jinja2-templated, then JSON-coerced
                                     # ("true" -> True, "42" -> 42, JSON literals parsed)
+
+    # MCP-only fields (type: mcp)
+    server: string                  # Server name from runtime.mcp_servers (literal string, required)
+    tool: string                    # Tool name on the MCP server (literal string, required)
+    arguments: {string: any}        # Tool arguments (Jinja2-templated recursively)
+    timeout: integer                # Per-call timeout in seconds
 ```
 
 **Script agent restrictions:** Cannot have `prompt`, `provider`, `model`, `tools`, `output`, `system_prompt`, `options`, `retry`, `reasoning`, `dialog`, `validator`, `max_session_seconds`, `max_agent_iterations`, `session_key`, `timeout_seconds` (use `timeout`), `input_mapping`, or `max_depth`. Output is always `{stdout, stderr, exit_code}`. If `stdout` is valid JSON, its top-level keys are auto-merged into the output dict.
 
 **Set agent restrictions:** Cannot have `prompt`, `provider`, `model`, `tools`, `system_prompt`, `options`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `input_mapping`, `max_depth`, `retry`, `dialog`, `validator`, `reasoning`, `timeout_seconds`, `max_session_seconds`, `max_agent_iterations`, or `session_key`. Requires exactly one of `value:` or `values:`. `output_type:` is forbidden with `values:` (per-key typing not yet supported). `output:` schema validation is permitted only when the rendered output is a dict (always for `values:`, sometimes for `value:`); a scalar with a declared schema raises `ValidationError`. Set agents are allowed inside `parallel` groups and as `for_each` inline agents, and count toward `limits.max_iterations` like any other step.
+
+**MCP agent restrictions (`type: mcp`):** Cannot have `prompt`, `system_prompt`, `provider`, `model`, `tools`, `reasoning`, `context_tier`, `skills`, `plugins`, `validator`, `dialog`, `sandbox`, `session_key`, `max_agent_iterations`, `max_session_seconds`, `output_mode`, `retry`, `timeout_seconds` (use `timeout`), `command`, `args`, `env`, `working_dir`, `options`, `workflow`, `input_mapping`, `max_depth`, `value`, `values`, or `output_type`. Requires `server` and `tool`. Output is `{content, structured, is_error}` with top-level `structured` keys merged on top. Logical tool errors set `is_error: true` and complete normally, allowing `when: "{{ output.is_error }}"` routing. Stdio servers only. Calls to the same server serialize on a slot lock.
 
 **Workflow agent restrictions (`type: workflow`):** Cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, `options`, `retry`, `reasoning`, `dialog`, `validator`, `max_session_seconds`, `max_agent_iterations`, `session_key`, or `timeout_seconds`. Requires `workflow:` path. Supports `input_mapping` and `max_depth`. Allowed inside `for_each` groups for dynamic fan-out.
 
@@ -440,6 +448,61 @@ routes:
 - Allowed inside `parallel` groups (each member publishes to context). Templates cannot reference sibling group members — the validator catches this at config time.
 - Allowed as the inline agent of a `for_each` group (one bound value per item).
 - Each invocation emits `set_started` / `set_completed` / `set_failed` events with `output_type`, `output_keys`, and a 512-char-truncated `value_repr`.
+
+## MCP Agent Schema
+
+MCP agents directly call tools on configured MCP servers without an LLM:
+
+```yaml
+agents:
+  - name: string
+    type: mcp                       # Required
+    description: string             # Optional
+    server: string                  # Required: server name in runtime.mcp_servers (literal string)
+    tool: string                    # Required: tool name on the MCP server (literal string)
+    arguments:                      # Optional: tool arguments dict (Jinja2-rendered recursively)
+      <param_name>: any
+    timeout: integer                # Optional: per-call timeout in seconds
+    input: [string]                 # Optional: context dependencies for explicit context mode
+    output:                         # Optional: output schema for result validation
+      <field_name>:
+        type: string
+    routes:                         # Optional: routing rules
+      - to: string
+        when: string
+```
+
+### MCP Output
+
+MCP steps produce an envelope containing `content`, `structured`, and `is_error`. When `structured` is a dictionary, its top-level keys are merged directly into the output dictionary:
+
+```jinja2
+{{ step.output.content }}           # List of content blocks
+{{ step.output.structured }}        # Raw structured dictionary (or null)
+{{ step.output.is_error }}          # Boolean flag indicating logical tool error
+{{ step.output.custom_field }}      # Directly accessible merged structured field
+```
+
+Envelope keys (`content`, `structured`, `is_error`) take precedence over colliding structured keys.
+
+### Routing on MCP Output
+
+Logical tool errors set `output.is_error = True` and complete the step normally, enabling conditional error routing:
+
+```yaml
+routes:
+  - to: handle_error
+    when: "{{ output.is_error }}"
+  - to: process_success
+```
+
+### MCP Step Composition and Concurrency
+
+- Allowed inside `parallel` groups. Calls to the same MCP server serialize via a slot lock; calls to different servers run concurrently.
+- Allowed as the inline agent of `for_each` groups.
+- `runtime.tool_output` bounds summed text characters across `content` blocks. `structured` data is never truncated.
+- Stdio servers only.
+- Events (`mcp_started`, `mcp_completed`, `mcp_failed`) exclude argument values and result data; error messages are redacted in events and full tracebacks are logged at debug level only.
 
 ## File Includes (`!file` Tag)
 

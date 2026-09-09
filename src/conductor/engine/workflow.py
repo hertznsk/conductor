@@ -45,6 +45,7 @@ from conductor.exceptions import (
 from conductor.executor import questions as questions_mod
 from conductor.executor.agent import AgentExecutor
 from conductor.executor.linkify import linkify_markdown
+from conductor.executor.mcp_step import McpStepExecutor, mcp_result_bytes
 from conductor.executor.output import validate_output
 from conductor.executor.script import ScriptExecutor, ScriptOutput
 from conductor.executor.set_step import (
@@ -65,6 +66,7 @@ from conductor.gates.human import (
     option_for_value,
 )
 from conductor.gates.interrupt import InterruptAction, InterruptHandler, InterruptResult
+from conductor.mcp_auth import resolve_mcp_server_config
 from conductor.providers.base import AgentOutput, EventCallback
 
 logger = logging.getLogger(__name__)
@@ -79,6 +81,7 @@ if TYPE_CHECKING:
 
     from conductor.config.schema import AgentDef, ForEachDef, ParallelGroup, WorkflowConfig
     from conductor.interrupt.listener import KeyboardListener
+    from conductor.mcp.manager import MCPManager
     from conductor.plugins.marketplace import Marketplace
     from conductor.providers.base import AgentProvider
     from conductor.providers.registry import ProviderRegistry
@@ -287,6 +290,86 @@ class ExecutionPlan:
 _ANSWER_SOURCES = frozenset({"choice", "free_text", "default", "skipped"})
 """Legal ``AnswerRecord.source`` values, for validating restored checkpoints."""
 
+_MCP_STEP_POOL_MAX = 16
+"""Upper bound on engine-owned MCP managers pooled for ``type: mcp`` steps.
+
+One pool entry is a live server process keyed by ``(server_name, cwd)``; a
+for_each whose ``runtime.working_dir`` renders a unique directory per item
+would otherwise spawn an unbounded number of processes within a single run.
+When the pool is at this cap and a new key needs connecting, the oldest
+evictable entry is closed to make room: entries of the server that is
+connecting are always evictable (the per-server slot lock the caller holds
+serializes every use of that server's entries), then the oldest entry of any
+other server whose slot lock is free. If every entry is locked, the overflow
+is allowed rather than blocking a call.
+"""
+
+
+class _McpStepRuntimeCheckError(ExecutionError):
+    """Authored mcp-step runtime-check failure.
+
+    Raised only by the runtime checks inside ``_run_mcp_step`` whose messages
+    name literal configuration only (unknown server, non-stdio transport,
+    tool not allowlisted, tool missing on the connected server) — server and
+    tool names come from the step's own literal config, never from the
+    execution context, so these may propagate verbatim through failure
+    events and the checkpoint message. Every other failure — manager/SDK
+    errors, output-schema mismatches, argument rendering, the cwd check
+    (whose rendered path and template can carry context values, so it raises
+    :class:`_McpStepRedactedCheckError` instead) — is wrapped in a generic
+    redacted ``ExecutionError`` or carries an authored value-free message.
+    """
+
+
+class _McpStepRedactedCheckError(ExecutionError):
+    """Authored mcp-step failure whose message is value-free by construction.
+
+    The runtime ``working_dir`` not-a-directory check renders its path and
+    template from the execution context, so unlike the name-only runtime
+    checks the propagated message must not quote either — the full resolved
+    path and raw template go to the debug log only. ``_run_mcp_step``
+    re-raises this verbatim like the runtime checks; every other exception
+    is wrapped in the generic redacted error.
+    """
+
+
+async def _cancel_and_drain_group_tasks(tasks: list[asyncio.Task[Any]]) -> None:
+    """Cancel every child task and await their teardown, re-cancellation-proof.
+
+    Used by the parallel / for-each fail-fast drains. Mirrors the
+    re-shielding loop in ``MCPManager.connect_server()`` / ``close()``: the
+    drain runs as its own gather future awaited under ``asyncio.shield``
+    inside a loop, so a repeated ``cancel()`` of the waiting task lands on
+    the shield instead of the drain — a sibling delayed in cancellation
+    cleanup (or temporarily suppressing cancellation) always finishes before
+    this returns and cannot race the pool close in ``run()``'s finally.
+    Cancellation requests that arrive during the drain are noted at debug
+    level; the caller re-raises the exception that entered its except arm,
+    so the original exception is the one that propagates (an extra cancel
+    during the drain never replaces it).
+    """
+    for task in tasks:
+        # gather already cancelled the children when it was THIS task's own
+        # cancellation that entered the except arm — a second cancel() would
+        # land on a sibling that is mid-cleanup (CancelledError already
+        # delivered, cancelling() > 0) and kill its cleanup via _must_cancel.
+        # Only children with no pending cancellation still need cancelling
+        # (a sibling still running because another child raised).
+        if task.cancelling() == 0:
+            task.cancel()
+    cleanup = asyncio.gather(*tasks, return_exceptions=True)
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            logger.debug(
+                "group drain received a cancellation request; continuing until all "
+                "sibling tasks finish their cleanup"
+            )
+    # With return_exceptions=True the gather only completes normally; surface
+    # anything else rather than swallow it.
+    cleanup.result()
+
 
 def _answer_counts(output: dict[str, Any]) -> dict[str, int]:
     """Project a questions output down to the counts events carry.
@@ -425,7 +508,18 @@ class WorkflowEngine:
         self.max_iterations_handler = MaxIterationsHandler(skip_gates=skip_gates)
         self.script_executor = ScriptExecutor()
         self.set_executor = SetExecutor()
+        self.mcp_step_executor = McpStepExecutor()
         self.wait_executor = WaitExecutor()
+        # Engine-owned MCP manager pool for `type: mcp` steps (lazy connect,
+        # keyed by (server_name, resolved_cwd) — a server-only key would
+        # silently reuse the first for_each item's cwd for the rest, since
+        # runtime.working_dir Jinja-renders per execution). The pool guard
+        # only ever covers dict mutation, never I/O, so distinct servers
+        # connect concurrently; the per-server slot lock is held across the
+        # lazy connect + call by _run_mcp_step.
+        self._mcp_step_managers: dict[tuple[str, str], MCPManager] = {}
+        self._mcp_step_locks: dict[str, asyncio.Lock] = {}
+        self._mcp_step_pool_guard: asyncio.Lock = asyncio.Lock()
         self.usage_tracker = UsageTracker(
             pricing_overrides=self._build_pricing_overrides(),
         )
@@ -593,6 +687,141 @@ class WorkflowEngine:
         """Resolved parent directory of the workflow file, or None if unset."""
         return Path(self.workflow_path).resolve().parent if self.workflow_path else None
 
+    async def _mcp_step_slot(self, server_name: str) -> asyncio.Lock:
+        """Return the per-server slot lock for an MCP step, creating it if needed.
+
+        Creation/lookup runs under the short pool guard, which never spans
+        I/O — otherwise distinct servers would serialize their connects.
+        The returned lock is held by ``_run_mcp_step`` across lazy
+        connect, runtime tool checks, and the call, keyed by server name
+        (all cwds for one server are serialized — conservative).
+        """
+        async with self._mcp_step_pool_guard:
+            lock = self._mcp_step_locks.get(server_name)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._mcp_step_locks[server_name] = lock
+            return lock
+
+    async def _get_mcp_step_manager(self, server_name: str, resolved_cwd: str) -> MCPManager:
+        """Return the pooled MCPManager for ``(server_name, resolved_cwd)``, connecting lazily.
+
+        Call only under the per-server slot lock from :meth:`_mcp_step_slot`;
+        the pool is re-checked inside (double-checked locking, mirroring
+        ``ClaudeProvider._get_mcp_manager_for_cwd``). A failed
+        ``connect_server`` propagates and leaves nothing in the pool, so the
+        next call retries the connect.
+
+        Args:
+            server_name: Key into ``runtime.mcp_servers``.
+            resolved_cwd: Working directory the server process is spawned
+                in; arrives as a parameter because ``runtime.working_dir``
+                Jinja-renders per execution and can differ between
+                for_each items.
+        """
+        # Lazy import: conductor.mcp.__init__ eagerly imports the MCP SDK, and
+        # this module is imported by cli/app.py on every conductor invocation.
+        from conductor.mcp.manager import MCPManager
+
+        key = (server_name, resolved_cwd)
+        manager = self._mcp_step_managers.get(key)
+        if manager is not None:
+            return manager
+
+        if len(self._mcp_step_managers) >= _MCP_STEP_POOL_MAX:
+            await self._evict_idle_mcp_step_manager(server_name)
+
+        server_def = self.config.workflow.runtime.mcp_servers[server_name]
+        # MCPServerDef -> connect kwargs. DRIFT HAZARD: this translation is
+        # duplicated from cli/run.py::_build_mcp_servers (mcp steps execute in
+        # the engine, which must not import conductor.cli — a reverse cycle).
+        # Keep the two in sync when the translation changes.
+        server_config: dict[str, Any] = {
+            "type": "stdio",
+            "command": server_def.command,
+            "args": server_def.args,
+            "tools": server_def.tools,
+        }
+        if server_def.env:
+            server_config["env"] = server_def.env
+        if server_def.timeout:
+            server_config["timeout"] = server_def.timeout
+        resolved = await resolve_mcp_server_config(server_name, server_config)
+
+        manager = MCPManager(tool_output=self.config.workflow.runtime.tool_output)
+        await manager.connect_server(
+            name=server_name,
+            command=resolved["command"],
+            args=resolved.get("args"),
+            env=resolved.get("env"),
+            timeout=resolved.get("timeout"),
+            cwd=resolved_cwd,
+        )
+        self._mcp_step_managers[key] = manager
+        return manager
+
+    async def _evict_idle_mcp_step_manager(self, current_server: str) -> None:
+        """Evict one pool entry to make room for ``current_server``.
+
+        Runs when the pool is at ``_MCP_STEP_POOL_MAX`` and a new key needs
+        connecting. Eviction order:
+
+        1. Oldest entry of ``current_server``. The caller holds that server's
+           slot lock across this call, and every use of a server's entries
+           happens under its slot lock — so no entry of ``current_server``
+           can be in flight and all are evictable. Without this arm, one
+           server with many cwds (a for_each over templated working_dirs)
+           could never evict anything: its own held lock marks every entry
+           "locked" and the pool would grow past the cap.
+        2. Oldest entry of any other server whose per-server slot lock is
+           unheld (a held lock means a call is in flight against that entry;
+           closing it mid-call is forbidden).
+        3. If every entry is locked, allow the overflow rather than block.
+
+        The close is best-effort: a failing close must not fail the run or
+        the new connect.
+        """
+        evicted: MCPManager | None = None
+        evicted_key: tuple[str, str] | None = None
+        async with self._mcp_step_pool_guard:
+            target: tuple[str, str] | None = next(
+                (key for key in self._mcp_step_managers if key[0] == current_server),
+                None,
+            )
+            if target is None:
+                for pool_key in self._mcp_step_managers:
+                    lock = self._mcp_step_locks.get(pool_key[0])
+                    if lock is None or not lock.locked():
+                        target = pool_key
+                        break
+            if target is None:
+                logger.debug(
+                    "MCP step pool at cap %d with every entry locked; allowing overflow",
+                    _MCP_STEP_POOL_MAX,
+                )
+                return
+            evicted_key = target
+            evicted = self._mcp_step_managers.pop(target)
+        try:
+            await evicted.close()
+        except Exception as e:  # noqa: BLE001 - eviction must not mask the run outcome
+            logger.warning("Error closing evicted MCP manager for %s: %s", evicted_key, e)
+
+    async def _close_mcp_step_managers(self) -> None:
+        """Close every pooled MCP manager (best-effort) and clear the pool."""
+        # Unconditional: the lock dict must be cleared even when the pool is
+        # empty (reachable after a failed connect, which creates a slot lock
+        # without pooling a manager), and clearing happens before closing so
+        # the pool is consistent even if a close raises.
+        managers = list(self._mcp_step_managers.items())
+        self._mcp_step_managers.clear()
+        self._mcp_step_locks.clear()
+        for key, manager in managers:
+            try:
+                await manager.close()
+            except Exception as e:  # noqa: BLE001 - cleanup must not mask the run outcome
+                logger.warning("Error closing MCP manager for %s: %s", key, e)
+
     def _resolve_agent_directory(
         self,
         agent: AgentDef,
@@ -602,6 +831,7 @@ class WorkflowEngine:
         raw: str,
     ) -> str:
         """Render and absolutize one authored directory value.
+
 
         Shared by ``working_dir`` and ``settings_dir`` so the two cannot drift
         apart: the raw value is Jinja-rendered against the per-agent context
@@ -1484,6 +1714,246 @@ class WorkflowEngine:
             },
         )
         return set_output
+
+    async def _run_mcp_step(
+        self,
+        agent: AgentDef,
+        agent_context: dict[str, Any],
+        *,
+        event_fields: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Execute an mcp step end-to-end with events and output validation.
+
+        Shared between the main dispatch loop (``event_fields=None``) and
+        parallel / for-each groups (``event_fields`` carries ``group_name`` /
+        ``item_key`` so per-item events can be told apart).
+
+        Lifecycle is strict: the timer starts, ``mcp_started`` is emitted,
+        then ONE ``try`` block covers the runtime checks, the slot-locked
+        connect + tool existence check + invoke, and the ``output:`` schema
+        validation. Any exception emits exactly one redacted ``mcp_failed``
+        (generic message — no argument or result values ever reach an event
+        payload; the full traceback goes to the debug log only). Failure
+        propagation is split: the authored name-only runtime-check errors
+        (unknown server, non-stdio transport, disallowed or missing tool —
+        messages naming the step's literal configuration) and the cwd check
+        (whose message is authored value-free at the raise site, since the
+        rendered path and template can carry context values and go to the
+        debug log only) re-raise verbatim, while every other exception is
+        re-raised as a generic redacted ``ExecutionError`` so downstream
+        failure surfaces (``workflow_failed``, group failure events,
+        checkpoint messages) never carry argument or result values — an
+        output-schema mismatch, for example, would otherwise echo the
+        received value.
+
+        The runtime checks mirror the static validator because
+        ``conductor run`` never calls it: the server must be declared in
+        ``runtime.mcp_servers``, be stdio, and allow the tool — plus the
+        tool must actually exist on the connected server, which only a live
+        connection can prove. The whole call runs under the per-server slot
+        lock, serializing concurrent executions against one server process.
+
+        Callers are responsible for storing the returned envelope in context,
+        recording iteration, and evaluating routes.
+        """
+        # Guaranteed by AgentDef.validate_agent_type (config/schema.py) for
+        # type == "mcp": both fields are required and non-empty.
+        assert agent.server is not None
+        assert agent.tool is not None
+        server = agent.server
+        tool = agent.tool
+        extra = dict(event_fields or {})
+
+        iteration = self.limits.get_agent_execution_count(agent.name) + 1
+        start = _time.time()
+        self._emit(
+            "mcp_started",
+            {
+                "agent_name": agent.name,
+                "iteration": iteration,
+                "server": server,
+                "tool": tool,
+                "argument_keys": sorted((agent.arguments or {}).keys()),
+                **extra,
+            },
+        )
+
+        try:
+            # Runtime half of the static validator checks (conductor run
+            # never calls the validator). Unknown server short-circuits so
+            # the allowlist/transport checks don't cascade.
+            mcp_servers = self.config.workflow.runtime.mcp_servers
+            if server not in mcp_servers:
+                available = ", ".join(sorted(mcp_servers)) or "(none)"
+                raise _McpStepRuntimeCheckError(
+                    f"MCP step '{agent.name}' references unknown server "
+                    f"'{server}'. Available servers: {available}",
+                    agent_name=agent.name,
+                )
+            server_def = mcp_servers[server]
+            if server_def.type != "stdio":
+                raise _McpStepRuntimeCheckError(
+                    f"MCP step '{agent.name}': server '{server}' has type "
+                    f"'{server_def.type}'; type: mcp supports stdio servers only "
+                    f"(http/sse support is not implemented yet)",
+                    agent_name=agent.name,
+                )
+            if server_def.tools != ["*"] and tool not in server_def.tools:
+                raise _McpStepRuntimeCheckError(
+                    f"MCP step '{agent.name}': tool '{tool}' is not enabled on "
+                    f"server '{server}' (enabled tools: {server_def.tools})",
+                    agent_name=agent.name,
+                )
+
+            # Resolve the server process cwd under THIS execution's context,
+            # by the same rules as _resolve_agent_working_dir (render Jinja
+            # -> expanduser -> normpath against the workflow dir -> existence
+            # check). Per-step working_dir is forbidden by the schema, so
+            # only the runtime-level value renders.
+            raw_cwd = self.config.workflow.runtime.working_dir
+            if raw_cwd is None:
+                resolved_cwd = os.path.normpath(
+                    str(self._workflow_dir) if self._workflow_dir is not None else os.getcwd()
+                )
+            else:
+                rendered_cwd = self.renderer.render(raw_cwd, agent_context)
+                cwd_path = Path(rendered_cwd).expanduser()
+                if not cwd_path.is_absolute():
+                    base = self._workflow_dir if self._workflow_dir is not None else Path.cwd()
+                    cwd_path = base / cwd_path
+                resolved_cwd = os.path.normpath(cwd_path)
+                if not Path(resolved_cwd).is_dir():
+                    # Redacted on purpose: resolved_cwd and raw_cwd are
+                    # Jinja-rendered from the execution context and can carry
+                    # values (e.g. "{{ item.secret_path }}"). The full path
+                    # and template go to the debug log only; the propagated
+                    # message names the failure, nothing else.
+                    logger.debug(
+                        "MCP step '%s': runtime working_dir '%s' (rendered from '%s') "
+                        "does not exist or is not a directory",
+                        agent.name,
+                        resolved_cwd,
+                        raw_cwd,
+                    )
+                    raise _McpStepRedactedCheckError(
+                        f"MCP step '{agent.name}': runtime working_dir does not exist "
+                        f"or is not a directory",
+                        agent_name=agent.name,
+                    )
+
+            async with await self._mcp_step_slot(server):
+                manager = await self._get_mcp_step_manager(server, resolved_cwd)
+                # The static validator cannot check this: the tool must
+                # actually exist on the connected server.
+                server_tools = {
+                    t.get("original_name") or t.get("name", "")
+                    for t in manager.get_server_tools(server)
+                }
+                if tool not in server_tools:
+                    raise _McpStepRuntimeCheckError(
+                        f"MCP step '{agent.name}': tool '{tool}' does not exist "
+                        f"on server '{server}'",
+                        agent_name=agent.name,
+                    )
+                envelope = await self.mcp_step_executor.execute(agent, agent_context, manager)
+
+            # `output:` schema validation runs here so the contract holds in
+            # the main loop, parallel groups, and for-each alike (mirrors the
+            # set-step path).
+            if agent.output is not None:
+                validate_output(envelope, agent.output)
+        except (_McpStepRuntimeCheckError, _McpStepRedactedCheckError) as exc:
+            # Authored errors propagate verbatim (see below), but the single
+            # mcp_failed contract still applies to them.
+            elapsed = _time.time() - start
+            logger.debug("MCP step '%s' failed", agent.name, exc_info=True)
+            self._emit(
+                "mcp_failed",
+                {
+                    "agent_name": agent.name,
+                    "elapsed": elapsed,
+                    "server": server,
+                    "tool": tool,
+                    "error_type": type(exc).__name__,
+                    "message": f"MCP step '{agent.name}' failed; see debug logs for details",
+                    **extra,
+                },
+            )
+            # Only the authored errors may propagate verbatim — the name-only
+            # runtime checks (servers, tools from literal config) and the cwd
+            # check (its message is authored value-free at the raise site;
+            # the rendered path and template are debug-log only). Everything
+            # else can embed argument or result values in its text: manager/
+            # SDK failures, output-schema ValidationError (which echoes the
+            # received value), argument rendering errors.
+            raise
+        except (asyncio.CancelledError, GeneratorExit):
+            # Cancellation is not a step failure: re-raise untouched with no
+            # mcp_failed, preserving the engine's cancellation semantics.
+            raise
+        except BaseException as exc:
+            elapsed = _time.time() - start
+            # Redacted by contract: raw exception text can carry argument or
+            # result values, so only the type leaves this method. The full
+            # traceback is available at debug level. This arm is deliberately
+            # BaseException, not Exception: a value-bearing BaseException
+            # from the SDK / mcp_auth / connect / renderer code (e.g.
+            # SystemExit("secret")) would otherwise bypass this handler and
+            # reach the workflow's outer except BaseException, publishing the
+            # value via str(e) in workflow_failed. Trade-off: a genuine
+            # SystemExit / KeyboardInterrupt raised inside an mcp step is
+            # reported as a redacted step failure instead of propagating as a
+            # base exception — the no-values policy outranks base-exception
+            # classification for this step type, and the engine converts real
+            # keyboard interrupts before this point.
+            logger.debug("MCP step '%s' failed", agent.name, exc_info=True)
+            self._emit(
+                "mcp_failed",
+                {
+                    "agent_name": agent.name,
+                    "elapsed": elapsed,
+                    "server": server,
+                    "tool": tool,
+                    "error_type": type(exc).__name__,
+                    "message": f"MCP step '{agent.name}' failed; see debug logs for details",
+                    **extra,
+                },
+            )
+            # Re-raise a generic redacted error so workflow_failed and group
+            # failure events stay value-free. The original traceback is in
+            # the debug log above.
+            raise ExecutionError(
+                f"MCP step '{agent.name}' failed; see debug logs for details",
+                agent_name=agent.name,
+            ) from None
+        elapsed = _time.time() - start
+
+        content = envelope.get("content")
+        blocks = content if isinstance(content, list) else []
+        truncated = any(isinstance(block, dict) and block.get("truncated") for block in blocks)
+        spill_path = next(
+            (
+                block.get("spill_path")
+                for block in blocks
+                if isinstance(block, dict) and block.get("spill_path")
+            ),
+            None,
+        )
+        self._emit(
+            "mcp_completed",
+            {
+                "agent_name": agent.name,
+                "elapsed": elapsed,
+                "server": server,
+                "tool": tool,
+                "is_error": envelope.get("is_error", False),
+                "result_bytes": mcp_result_bytes(content, envelope.get("structured")),
+                "truncated": truncated,
+                "spill_path": spill_path,
+                **extra,
+            },
+        )
+        return envelope
 
     def _validate_script_output_schema(
         self,
@@ -2532,6 +3002,9 @@ class WorkflowEngine:
         try:
             result = await self._execute_loop(current_agent_name)
         finally:
+            # Best-effort shutdown of MCP step connections; each close runs
+            # in its own guard so a failing manager cannot mask the run outcome.
+            await self._close_mcp_step_managers()
             # The pricing verdict belongs to the run ending, not to anyone
             # asking for a summary. Drawing it here covers the run that dies
             # part way -- the case where "these numbers came from the static
@@ -2574,6 +3047,7 @@ class WorkflowEngine:
         try:
             result = await self._execute_loop(current_agent_name)
         finally:
+            await self._close_mcp_step_managers()
             # Same reasoning as :meth:`run` -- a resumed run that dies part way
             # is still a run that priced nothing.
             self._warn_if_pricing_hook_silent()
@@ -5122,6 +5596,47 @@ class WorkflowEngine:
                                 )
                             continue
 
+                        # Handle mcp steps. Direct tool calls against a server
+                        # from runtime.mcp_servers — no LLM involved. The
+                        # result envelope (with merged structured keys) lands
+                        # in context like set/script outputs, so routing on
+                        # e.g. ``output.is_error`` works unchanged.
+                        if agent.type == "mcp":
+                            mcp_envelope = await self._run_mcp_step(agent, agent_context)
+                            self.context.store(agent.name, mcp_envelope)
+                            self.limits.record_execution(agent.name)
+                            self.limits.check_timeout()
+
+                            route_result = self._evaluate_routes(agent, mcp_envelope)
+
+                            self._emit(
+                                "route_taken",
+                                {
+                                    "from_agent": agent.name,
+                                    "to_agent": route_result.target,
+                                },
+                            )
+
+                            if route_result.target == "$end":
+                                result = self._build_final_output(route_result.output_transform)
+                                self._emit(
+                                    "workflow_completed",
+                                    {
+                                        "elapsed": _time.time() - _workflow_start,
+                                        "output": result,
+                                    },
+                                )
+                                return result
+
+                            current_agent_name = route_result.target
+
+                            interrupt_result = await self._check_interrupt(current_agent_name)
+                            if interrupt_result is not None:
+                                current_agent_name = await self._handle_interrupt_result(
+                                    interrupt_result, current_agent_name
+                                )
+                            continue
+
                         # Handle sub-workflow steps
                         if agent.type == "workflow":
                             _sub_start = _time.time()
@@ -6264,6 +6779,34 @@ class WorkflowEngine:
                     )
                     return (agent.name, set_output.value)
 
+                # `mcp` steps are provider-free tool calls; per-server
+                # serialization lives inside _run_mcp_step (slot lock). Like
+                # the set branch above: no `parallel_agent_started` (that
+                # event is LLM-only), and `parallel_agent_completed` carries
+                # no `output` field — the no-values policy for step events.
+                if agent.type == "mcp":
+                    mcp_envelope = await self._run_mcp_step(
+                        agent,
+                        agent_context,
+                        event_fields={"group_name": parallel_group.name},
+                    )
+                    _agent_elapsed = _time.time() - _agent_start
+                    self._emit(
+                        "parallel_agent_completed",
+                        {
+                            "group_name": parallel_group.name,
+                            "agent_name": agent.name,
+                            "elapsed": _agent_elapsed,
+                            "model": "",
+                            "tokens": 0,
+                            "cost_usd": 0.0,
+                            "context_window_used": 0,
+                            "context_window_max": None,
+                            "agent_type": "mcp",
+                        },
+                    )
+                    return (agent.name, mcp_envelope)
+
                 # Resolve working_dir / settings_dir for provider-backed LLM agents against
                 # this agent's own (pre-group snapshot) context. `set` steps
                 # returned above; other types in a parallel group are LLM agents.
@@ -6360,17 +6903,45 @@ class WorkflowEngine:
         parallel_output = ParallelGroupOutput()
 
         if parallel_group.failure_mode == "fail_fast":
-            # Fail immediately on first error
+            # Fail immediately on first error. Tasks are created explicitly so
+            # that on failure the siblings can be cancelled and drained before
+            # propagating: gather() alone leaves them running, and an in-flight
+            # step (e.g. an mcp call) must not outlive the group — it would
+            # race manager cleanup in run()'s finally and emit late events
+            # after the failure.
+            tasks = [asyncio.ensure_future(execute_single_agent(agent)) for agent in agents]
             try:
-                results = await asyncio.gather(
-                    *[execute_single_agent(agent) for agent in agents],
-                    return_exceptions=False,
-                )
+                # Shield the gather: the gathering future re-cascades every
+                # cancel() of this task to the children, and it stays pending
+                # while a cancelled child is still in cleanup — so a second
+                # cancel arriving mid-cleanup would re-cancel the child and
+                # kill its cleanup (_must_cancel). The except arm cancels each
+                # child exactly once instead; shield detaches the cascade.
+                results = await asyncio.shield(asyncio.gather(*tasks, return_exceptions=False))
                 # All succeeded
                 for agent_name, output_content in results:
                     parallel_output.outputs[agent_name] = output_content
 
-            except Exception as e:
+            except BaseException as e:
+                # BaseException, not Exception: a child completing with
+                # CancelledError (a BaseException) propagates out of gather
+                # WITHOUT entering an except-Exception arm, and external
+                # cancellation of this group lands here as CancelledError too
+                # — either way the siblings must be cancelled and drained
+                # before anything propagates, or an in-flight step (e.g. an
+                # mcp call) outlives the group and races manager cleanup in
+                # run()'s finally. The drain is re-cancellation-proof: a
+                # second cancel() arriving mid-drain must not abandon it.
+                await _cancel_and_drain_group_tasks(tasks)
+
+                # Cancellation semantics are preserved by re-raising
+                # non-Exception base exceptions (CancelledError from a child
+                # or from external cancellation, GeneratorExit) unchanged —
+                # converting them to a group failure would defeat the
+                # engine's cancellation handling upstream.
+                if not isinstance(e, Exception):
+                    raise
+
                 # Extract agent name and exception type from wrapped exception
                 agent_name = getattr(e, "_parallel_agent_name", "unknown")
                 exception_type = type(e).__name__
@@ -6742,6 +7313,31 @@ class WorkflowEngine:
                     )
                     return (key, set_output.value)
 
+                # `mcp` steps per item: the item_key is only known here inside
+                # execute_single_item, so it rides event_fields into all three
+                # mcp_* payloads (merged inside _run_mcp_step). No `output`
+                # field on for_each_item_completed — deliberate divergence
+                # from the set branch above: mcp events follow the no-values
+                # policy, the envelope is data for routing, never for events.
+                if for_each_group.agent.type == "mcp":
+                    mcp_envelope = await self._run_mcp_step(
+                        for_each_group.agent,
+                        agent_context,
+                        event_fields={"group_name": for_each_group.name, "item_key": key},
+                    )
+                    _item_elapsed = _time.time() - _item_start
+                    self._emit(
+                        "for_each_item_completed",
+                        {
+                            "group_name": for_each_group.name,
+                            "item_key": key,
+                            "elapsed": _item_elapsed,
+                            "tokens": 0,
+                            "cost_usd": 0.0,
+                        },
+                    )
+                    return (key, mcp_envelope)
+
                 # Qualify the per-iteration agent name so that any verbose
                 # provider-side logging (e.g. CopilotProvider tool/reasoning
                 # lines) can attribute interleaved output to a specific
@@ -6873,15 +7469,22 @@ class WorkflowEngine:
 
             # Execute based on failure mode
             if for_each_group.failure_mode == "fail_fast":
-                # Fail immediately on first error
-                try:
-                    results = await asyncio.gather(
-                        *[
-                            execute_single_item(item, batch_start_idx + i, batch_keys[i])
-                            for i, item in enumerate(batch_items)
-                        ],
-                        return_exceptions=False,
+                # Fail immediately on first error. Explicit tasks + drain for
+                # the same reason as the parallel fail_fast branch: a sibling
+                # item still in flight (e.g. an mcp call) must be cancelled
+                # and awaited before the exception propagates.
+                tasks = [
+                    asyncio.ensure_future(
+                        execute_single_item(item, batch_start_idx + i, batch_keys[i])
                     )
+                    for i, item in enumerate(batch_items)
+                ]
+                try:
+                    # Shield for the same reason as the parallel fail_fast
+                    # branch: a second cancel() of this task mid-cleanup must
+                    # not re-cancel the items through the pending gathering
+                    # future; the except arm cancels each item exactly once.
+                    results = await asyncio.shield(asyncio.gather(*tasks, return_exceptions=False))
                     # All succeeded - store outputs
                     for item_key, output_content in results:
                         if for_each_group.key_by:
@@ -6889,7 +7492,20 @@ class WorkflowEngine:
                         else:
                             for_each_output.outputs.append(output_content)  # type: ignore[union-attr]
 
-                except Exception as e:
+                except BaseException as e:
+                    # Same reasoning as the parallel fail_fast branch: a child
+                    # completing with CancelledError, or external cancellation
+                    # of this group, must still cancel+drain the in-flight
+                    # sibling items before anything propagates. The drain is
+                    # re-cancellation-proof: a second cancel() arriving
+                    # mid-drain must not abandon it.
+                    await _cancel_and_drain_group_tasks(tasks)
+
+                    # Preserve cancellation semantics (see the parallel
+                    # fail_fast branch).
+                    if not isinstance(e, Exception):
+                        raise
+
                     # Extract item key from wrapped exception
                     item_key = getattr(e, "_for_each_item_key", "unknown")
                     exception_type = type(e).__name__

@@ -1007,6 +1007,48 @@ class WebDashboard:
             }
             return "set_started", started_data, "set_completed", completed_data
 
+        if agent_type == "mcp":
+            # Mirror the live runtime's mcp payload shape so synthetic replays
+            # render identically to live runs. The result size must be measured
+            # by the same helper the engine emitter uses — anything else would
+            # let the two disagree (multibyte text, structured payloads).
+            from conductor.executor.mcp_step import mcp_result_bytes
+
+            server = getattr(agent_def, "server", None)
+            tool = getattr(agent_def, "tool", None)
+            arguments = getattr(agent_def, "arguments", None)
+            content = output_dict.get("content")
+            blocks = content if isinstance(content, list) else []
+            started_data = {
+                "agent_name": name,
+                "iteration": 1,
+                "server": server,
+                "tool": tool,
+                "argument_keys": sorted(arguments.keys()) if isinstance(arguments, dict) else [],
+                "synthetic": True,
+            }
+            completed_data = {
+                "agent_name": name,
+                "elapsed": 0.0,
+                "server": server,
+                "tool": tool,
+                "is_error": output_dict.get("is_error", False),
+                "result_bytes": mcp_result_bytes(content, output_dict.get("structured")),
+                "truncated": any(
+                    isinstance(block, dict) and block.get("truncated") for block in blocks
+                ),
+                "spill_path": next(
+                    (
+                        block.get("spill_path")
+                        for block in blocks
+                        if isinstance(block, dict) and block.get("spill_path")
+                    ),
+                    None,
+                ),
+                "synthetic": True,
+            }
+            return "mcp_started", started_data, "mcp_completed", completed_data
+
         started_data = {
             "agent_name": name,
             "iteration": 1,

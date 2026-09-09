@@ -21,6 +21,9 @@ import type {
   WaitFailedData,
   SetCompletedData,
   SetFailedData,
+  McpStartedData,
+  McpCompletedData,
+  McpFailedData,
   GatePresentedData,
   GateResolvedData,
   GateOptionDetail,
@@ -95,6 +98,12 @@ export interface ForEachItemData {
   prompt?: string;
   output?: unknown;
   activity: ActivityEntry[];
+  mcp_server?: string;
+  mcp_tool?: string;
+  mcp_is_error?: boolean;
+  mcp_result_bytes?: number;
+  mcp_truncated?: boolean;
+  mcp_spill_path?: string;
 }
 
 export interface NodeData {
@@ -120,6 +129,15 @@ export interface NodeData {
   iteration?: number;
   error_type?: string;
   error_message?: string;
+
+  // MCP-specific
+  mcp_server?: string;
+  mcp_tool?: string;
+  mcp_is_error?: boolean;
+  mcp_result_bytes?: number;
+  mcp_truncated?: boolean;
+  mcp_spill_path?: string;
+
   // Script-specific
   stdout?: string;
   stderr?: string;
@@ -1914,6 +1932,99 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     replaceNode(t.nodes, data.agent_name);
   },
 
+  mcp_started: (state, _data, timestamp) => {
+    const data = _data as unknown as McpStartedData;
+    const t = activeTarget(state, _data);
+
+    if (data.group_name != null && data.item_key != null) {
+      const nd = ensureNode(t.nodes, data.group_name, 'for_each_group');
+      if (nd.for_each_items) {
+        nd.for_each_items = nd.for_each_items.map((i) =>
+          i.key === data.item_key ? { ...i, status: 'running' } : i
+        );
+      }
+      replaceNode(t.nodes, data.group_name);
+    } else {
+      const nd = ensureNode(t.nodes, data.agent_name, 'mcp');
+      nd.status = 'running';
+      nd.startedAt = timestamp ?? Date.now() / 1000;
+      replaceNode(t.nodes, data.agent_name);
+    }
+  },
+
+  mcp_completed: (state, _data) => {
+    const data = _data as unknown as McpCompletedData;
+    const t = activeTarget(state, _data);
+
+    if (data.group_name != null && data.item_key != null) {
+      const nd = ensureNode(t.nodes, data.group_name, 'for_each_group');
+      if (nd.for_each_items) {
+        nd.for_each_items = nd.for_each_items.map((i) =>
+          i.key === data.item_key
+            ? {
+                ...i,
+                status: 'completed',
+                elapsed: data.elapsed,
+                mcp_server: data.server,
+                mcp_tool: data.tool,
+                mcp_is_error: data.is_error,
+                mcp_result_bytes: data.result_bytes,
+                mcp_truncated: data.truncated,
+                mcp_spill_path: data.spill_path,
+              }
+            : i
+        );
+      }
+      replaceNode(t.nodes, data.group_name);
+    } else {
+      const nd = ensureNode(t.nodes, data.agent_name, 'mcp');
+      nd.status = 'completed';
+      t.incrCompleted();
+      nd.elapsed = data.elapsed;
+      nd.mcp_server = data.server;
+      nd.mcp_tool = data.tool;
+      nd.mcp_is_error = data.is_error;
+      nd.mcp_result_bytes = data.result_bytes;
+      nd.mcp_truncated = data.truncated;
+      nd.mcp_spill_path = data.spill_path;
+      replaceNode(t.nodes, data.agent_name);
+    }
+  },
+
+  mcp_failed: (state, _data) => {
+    const data = _data as unknown as McpFailedData;
+    const t = activeTarget(state, _data);
+
+    if (data.group_name != null && data.item_key != null) {
+      const nd = ensureNode(t.nodes, data.group_name, 'for_each_group');
+      if (nd.for_each_items) {
+        nd.for_each_items = nd.for_each_items.map((i) =>
+          i.key === data.item_key
+            ? {
+                ...i,
+                status: 'failed',
+                elapsed: data.elapsed,
+                mcp_server: data.server,
+                mcp_tool: data.tool,
+                error_type: data.error_type,
+                error_message: data.message,
+              }
+            : i
+        );
+      }
+      replaceNode(t.nodes, data.group_name);
+    } else {
+      const nd = ensureNode(t.nodes, data.agent_name, 'mcp');
+      nd.status = 'failed';
+      nd.elapsed = data.elapsed;
+      nd.mcp_server = data.server;
+      nd.mcp_tool = data.tool;
+      nd.error_type = data.error_type;
+      nd.error_message = data.message;
+      replaceNode(t.nodes, data.agent_name);
+    }
+  },
+
   gate_presented: (state, _data) => {
     const data = _data as unknown as GatePresentedData;
     const t = activeTarget(state, _data);
@@ -2698,6 +2809,15 @@ function buildLogEntry(event: WorkflowEvent): LogEntry | null {
     case 'script_failed':
       return { timestamp: ts, level: 'error', source: String(d.agent_name), message: `Script failed: ${d.message || d.error_type || 'unknown error'}` };
 
+    case 'mcp_started':
+      return { timestamp: ts, level: 'info', source: String(d.agent_name), message: `MCP tool started: ${(d.server as string)}/${(d.tool as string)}` };
+
+    case 'mcp_completed':
+      return { timestamp: ts, level: d.is_error ? 'warning' : 'success', source: String(d.agent_name), message: `MCP tool completed: ${(d.server as string)}/${(d.tool as string)}${d.elapsed != null ? ` in ${formatSec(d.elapsed as number)}` : ''}` };
+
+    case 'mcp_failed':
+      return { timestamp: ts, level: 'error', source: String(d.agent_name), message: `MCP tool failed: ${(d.server as string)}/${(d.tool as string)} — ${d.message || d.error_type || 'unknown error'}` };
+
     case 'wait_started': {
       const dur = d.duration_seconds as number | null | undefined;
       const reason = d.reason as string | null | undefined;
@@ -3009,6 +3129,19 @@ function buildActivityLogEntry(event: WorkflowEvent): ActivityLogEntry | null {
 
     case 'script_failed':
       return { timestamp: ts, source: String(d.agent_name), type: 'turn', message: `Script failed: ${d.message || d.error_type || 'unknown'}` };
+
+    case 'mcp_started':
+      return { timestamp: ts, source: String(d.agent_name), type: 'turn', message: `MCP tool started: ${(d.server as string)}/${(d.tool as string)}` };
+
+    case 'mcp_completed':
+      return {
+        timestamp: ts, source: String(d.agent_name), type: 'tool-complete',
+        message: `MCP tool completed: ${(d.server as string)}/${(d.tool as string)}${d.is_error ? ' (error)' : ''}`,
+        detail: d.result_bytes ? `${d.result_bytes} bytes${d.truncated ? ' (truncated)' : ''}` : null,
+      };
+
+    case 'mcp_failed':
+      return { timestamp: ts, source: String(d.agent_name), type: 'turn', message: `MCP tool failed: ${(d.server as string)}/${(d.tool as string)} — ${d.message || d.error_type || 'unknown'}` };
 
     case 'wait_started': {
       const dur = d.duration_seconds as number | null | undefined;

@@ -368,6 +368,111 @@ class MCPManager:
             logger.error(f"MCP tool call failed: {prefixed_name}: {e}")
             raise RuntimeError(f"MCP tool call failed: {prefixed_name}: {e}") from e
 
+    async def call_tool_structured(
+        self,
+        server_name: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Call a tool on a named server and return a JSON-safe structured envelope.
+
+        Unlike :meth:`call_tool`, this keeps the result as structured data
+        instead of flattening it to a string, for ``type: mcp`` workflow steps.
+
+        The returned envelope has the shape::
+
+            {"content": [...], "structured": dict | None, "is_error": bool}
+
+        where each entry of ``content`` is a JSON-safe dict produced by
+        ``block.model_dump(mode="json")`` (with a ``{"type", "text"}`` fallback
+        for blocks that are not pydantic models). ``structured`` is read from
+        the ``structuredContent``/``structured_content`` field and is strictly
+        ``dict | None`` — any other shape is a malformed MCP response.
+        ``is_error`` mirrors the result's error flag.
+
+        The per-result text budget (``runtime.tool_output``) applies to TEXT
+        blocks only: when the combined text length exceeds ``max_chars``,
+        blocks are walked in order and each keeps ``min(len(text), remaining)``
+        characters, where ``remaining`` starts at ``max_chars``. Every
+        truncated block gets ``"truncated": true`` and, when spilling is
+        enabled, a ``"spill_path"`` written by :meth:`_spill_full_output`
+        holding that block's FULL original text. ``structured`` is structural
+        data and is NEVER truncated.
+
+        Logging contract: this method emits no log records at all, so argument
+        values, result values, and exception text can never leak into logs.
+
+        Args:
+            server_name: Name of the connected MCP server.
+            tool_name: Tool name as exposed by the server (no server prefix).
+            arguments: Tool input arguments matching the tool's input schema.
+
+        Returns:
+            The envelope described above.
+
+        Raises:
+            ValueError: If the server is unknown.
+            RuntimeError: If the server has no live session, the call fails,
+                or the response carries malformed structured content.
+        """
+        if server_name not in self.sessions:
+            raise ValueError(f"Unknown server: {server_name}")
+        session = self.sessions[server_name]
+        if not session:
+            raise RuntimeError(f"No session for server: {server_name}")
+
+        try:
+            result = await session.call_tool(tool_name, arguments=arguments)
+        except Exception as e:
+            raise RuntimeError(f"MCP tool call failed: {tool_name}: {e}") from e
+
+        content: list[dict[str, Any]] = []
+        for block in result.content or []:
+            try:
+                content.append(block.model_dump(mode="json"))
+            except Exception:
+                content.append({"type": getattr(block, "type", "unknown"), "text": str(block)})
+
+        structured = _mcp_field(result, "structured_content", "structuredContent")
+        if structured is not None and not isinstance(structured, dict):
+            raise RuntimeError(
+                f"MCP tool '{tool_name}' on server '{server_name}' returned malformed "
+                "structured content (expected a dict or null)"
+            )
+
+        if self._tool_output.enabled:
+            max_chars = self._tool_output.max_chars
+            text_total = sum(
+                len(block["text"])
+                for block in content
+                if block.get("type") == "text" and isinstance(block.get("text"), str)
+            )
+            if text_total > max_chars:
+                remaining = max_chars
+                for block in content:
+                    if block.get("type") != "text" or not isinstance(block.get("text"), str):
+                        continue
+                    text = block["text"]
+                    kept = min(len(text), max(remaining, 0))
+                    if kept < len(text):
+                        block["text"] = text[:kept]
+                        block["truncated"] = True
+                        if self._tool_output.spill_to_file:
+                            spill_path = self._spill_full_output(
+                                full_text=text,
+                                server_name=server_name,
+                                original_name=tool_name,
+                            )
+                            if spill_path:
+                                block["spill_path"] = spill_path
+                    remaining -= kept
+
+        return {
+            "content": content,
+            "structured": structured,
+            "is_error": bool(_mcp_field(result, "is_error", "isError")),
+        }
+
     def _maybe_truncate_response(
         self,
         response_text: str,

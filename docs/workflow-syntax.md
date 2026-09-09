@@ -1147,6 +1147,127 @@ Per-key typing on multi `values:` is not supported.
 
 **Events** — set steps emit `set_started` / `set_completed` / `set_failed` (mirroring the script-step lifecycle) in all three positions: linear main loop, parallel group member, and for-each iteration. The `set_completed` payload carries `output_type`, `output_keys` (sorted, empty for scalars), and `value_repr` (a JSON-safe preview, truncated at 512 chars).
 
+### MCP Steps
+
+MCP steps call a tool on a configured MCP server directly without invoking an LLM. There is no model call, no prompt tokens are spent, and execution is deterministic. Use them to fetch files, query databases, invoke APIs, or perform external tool operations where the exact tool and arguments are known in advance.
+
+```yaml
+agents:
+  - name: read_spec
+    type: mcp
+    server: filesystem                      # Server name in runtime.mcp_servers (required, literal)
+    tool: read_file                         # Tool name on the MCP server (required, literal)
+    arguments:                              # Tool arguments (optional, Jinja2-rendered)
+      path: "docs/spec.md"
+    timeout: 30                             # Per-call timeout in seconds (optional)
+    routes:
+      - to: handle_error
+        when: "{{ output.is_error }}"
+      - to: analyze_spec
+```
+
+**Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `server` | `string` | **Required.** MCP server name declared in `workflow.runtime.mcp_servers`. Literal string only; templates are rejected. |
+| `tool` | `string` | **Required.** Tool name as exposed by the server. Literal string only; templates are rejected. |
+| `arguments` | `mapping` | Optional tool arguments dict. Recursively Jinja2-rendered against workflow context. |
+| `timeout` | `integer` | Optional per-call timeout in seconds. Raises `ExecutionError` if exceeded. |
+| `output` | `mapping` | Optional output schema for validating the merged result envelope. |
+| `routes` | `list` | Optional route list evaluated against the merged result envelope. |
+| `input` | `list` | Optional input reference declarations used in explicit context mode. |
+
+**Argument rendering and type coercion:**
+
+Dicts and lists inside `arguments` are walked recursively. String leaves are Jinja2-rendered against the workflow context and coerced with the automatic scalar conversion rule:
+- Whole-string YAML scalars like `"105"` coerce to `int`, `"true"` to `bool`, and `"null"` to `None`.
+- Embedded templates like `"prefix-{{ item.id }}"` or multi-word text remain strings.
+- Empty or whitespace-only renders become `""`.
+- Native YAML scalars (integers, floats, booleans, `None`) pass through without change.
+
+**Result envelope and merge rule:**
+
+An MCP tool execution produces a result envelope with three base keys:
+
+```json
+{
+  "content": [
+    {"type": "text", "text": "..."}
+  ],
+  "structured": {"record_id": 42, "status": "ok"},
+  "is_error": false
+}
+```
+
+When the tool returns structured content (a dictionary under `structured`), its top-level keys are merged directly into the agent's output dictionary alongside the envelope. Downstream templates and route conditions can access these fields directly:
+
+```jinja2
+{{ read_spec.output.content }}         # Content blocks list
+{{ read_spec.output.structured }}      # Raw structured dict (or null)
+{{ read_spec.output.is_error }}        # Boolean error flag
+{{ read_spec.output.record_id }}       # Merged structured field
+```
+
+The base keys `content`, `structured`, and `is_error` are reserved by the envelope. If the structured dictionary contains colliding keys with those exact names, the envelope keys take precedence, and the colliding structured keys are omitted with a debug-level log message.
+
+**`is_error` semantics and routing:**
+
+When an MCP tool reports a logical tool failure (`isError: true` in the MCP protocol), the step sets `output.is_error = True` and completes normally. The workflow engine does not treat this as a workflow crash, allowing you to handle tool failures via routing:
+
+```yaml
+routes:
+  - to: handle_tool_error
+    when: "{{ output.is_error }}"
+  - to: process_success
+```
+
+In contrast, transport failures, unknown server names, unlisted tools, server launch failures, call timeouts, and output schema validation mismatches raise exceptions and fail the step.
+
+**Server transport:**
+
+MCP steps currently support `stdio` servers only. Configuring an `http` or `sse` server for an MCP step is rejected during validation and runtime with an explicit error: `type: mcp supports stdio servers only (http/sse support is not implemented yet)`.
+
+**Concurrency and slot serialization:**
+
+Calls to the same MCP server process are serialized via an internal per-server slot lock to protect the stdio stream. Calls to different MCP servers run in parallel when placed in parallel groups. The engine pools one server process per `(server, working_dir)` pair, bounded by `_MCP_STEP_POOL_MAX` (16): when the pool is at the cap, the oldest entry not currently serving a call is closed to make room, so a for_each rendering many unique working directories cannot spawn unbounded server processes within a single run.
+
+**Timeouts:**
+
+The step-level `timeout` field sets a per-call timeout in seconds for the MCP tool invocation. It is independent of the overall `workflow.limits.timeout_seconds`, which bounds the entire workflow execution.
+
+**Composition:**
+
+- **Parallel groups:** MCP steps can run inside `parallel` groups. Invocations targeting distinct servers execute concurrently; invocations targeting the same server serialize on the server slot lock.
+- **For-each groups:** MCP steps can serve as the inline agent of a `for_each` group.
+- **Working directory:** The server process inherits the workflow's `runtime.working_dir`, rendered dynamically per execution. Step-level `working_dir` is not allowed on MCP steps.
+
+**Validation rules:**
+
+- **Static validation (`conductor validate`):** Validates workflows offline without connecting to servers. Checks that the referenced server is declared in `runtime.mcp_servers`, has `type: stdio`, allows the tool in its `tools:` filter, uses valid template syntax in `arguments`, and avoids referencing sibling parallel steps.
+- **Runtime validation (`conductor run`):** Repeats all static checks and additionally verifies that the tool actually exists on the live connected server.
+
+**Limits and truncation policy:**
+
+`runtime.tool_output` bounds the total text length across all text blocks in `content`. When text output exceeds `max_chars`, blocks are truncated in order. Truncated blocks receive `"truncated": true` and a `"spill_path"` pointing to the full spilled output file when spilling is enabled. The `structured` dictionary represents structured application data and is never truncated.
+
+**Events, errors, and secrets policy:**
+
+MCP steps emit three lifecycle events:
+- `mcp_started`: contains `agent_name`, `iteration`, `server`, `tool`, and `argument_keys` (sorted list of key names only).
+- `mcp_completed`: contains `agent_name`, `elapsed`, `server`, `tool`, `is_error`, `result_bytes`, `truncated`, and optional `spill_path`.
+- `mcp_failed`: contains `agent_name`, `elapsed`, `server`, `tool`, `error_type`, and a generic redacted `message`.
+
+Argument values and result payloads are never included in event data, ensuring credentials or sensitive parameters do not leak to event logs or dashboard streams. When a call fails, `mcp_failed` records only the exception class name and a sanitized message; full tracebacks and raw error details are written to debug logs only (`exc_info=True`). The redaction extends downstream: the step re-raises a generic error, so `workflow_failed` and group failure events (`parallel_agent_failed`, `for_each_item_failed`) also carry only the sanitized message — never raw manager or SDK exception text, which can embed argument or result values.
+
+**Cancellation and resume semantics:**
+
+MCP steps do not support automatic retries (`retry:` is forbidden). When cancelled via keyboard interrupt or workflow timeout, the engine stops waiting for the call. Any external side effects already performed by the MCP server process are not rolled back, providing at-least-once execution semantics on workflow resume.
+
+**Restrictions:**
+
+MCP steps cannot have `prompt`, `system_prompt`, `provider`, `model`, `tools`, `reasoning`, `context_tier`, `skills`, `plugins`, `validator`, `dialog`, `sandbox`, `session_key`, `max_agent_iterations`, `max_session_seconds`, `output_mode`, `retry`, `timeout_seconds` (use `timeout`), `command`, `args`, `env`, `working_dir`, `options`, `workflow`, `input_mapping`, `max_depth`, `value`, `values`, or `output_type`.
+
 ### Sub-Workflow Steps
 
 Sub-workflow steps reference external workflow YAML files, enabling composable and reusable workflow building blocks. The sub-workflow runs as a black box — its internal agents are not visible to the parent.

@@ -39,6 +39,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Direct MCP workflow steps (`type: mcp`)** (#392): calls a tool on a
+  configured `runtime.mcp_servers` stdio server directly without an LLM.
+  Arguments are rendered recursively with Jinja2 and auto-coerced to
+  JSON-native types; the result envelope (`content`, `structured`, `is_error`)
+  merges structured keys directly onto the output dict so routes and downstream
+  steps can branch on `output.is_error` or individual fields. Calls serialize
+  per server process to maintain stdio stream integrity while distinct servers
+  execute concurrently in parallel groups. Output text payload is bounded by
+  `runtime.tool_output` with spill-to-file support while structured data is
+  preserved intact. Step and result values are excluded from all lifecycle
+  events (`mcp_started`, `mcp_completed`, `mcp_failed`), with failure messages
+  redacted and full traces logged at debug level only. See
+  [`docs/workflow-syntax.md`](docs/workflow-syntax.md#mcp-steps) and
+  [`examples/mcp-step.yaml`](examples/mcp-step.yaml).
+
 - **Opt-in `runtime.provider.setting_sources` on `claude-agent-sdk`** (#501) —
   selects which Claude Code settings tiers (`user` / `project` / `local`) a
   session may load. It is empty by default, so behaviour is unchanged unless a

@@ -1053,6 +1053,34 @@ class ConsoleEventSubscriber:
                 style="red",
             )
 
+        elif t == "mcp_completed":
+            # Mirror of the wait_completed branch: one line naming the step's
+            # server/tool and elapsed. `mcp_started` is deliberately not
+            # printed — started events never reach the console.
+            verbose_log(
+                styled(
+                    "  MCP call done: {} {} after {:.2f}s",
+                    d.get("server", "?"),
+                    d.get("tool", "?"),
+                    d.get("elapsed", 0.0),
+                )
+            )
+
+        elif t == "mcp_failed":
+            # Unlike script_failed (which has no branch), an mcp failure must
+            # be visible here: a connect failure is otherwise silent until the
+            # run terminates with workflow_failed.
+            verbose_log(
+                styled(
+                    "  MCP call failed: {} {} — {}: {}",
+                    d.get("server", "?"),
+                    d.get("tool", "?"),
+                    d.get("error_type", "Error"),
+                    d.get("message", "unknown"),
+                ),
+                style="red",
+            )
+
         elif t == "agent_validator_start":
             verbose_log(f"  Validating '{_validator_label(d)}' output…", style="cyan")
 
