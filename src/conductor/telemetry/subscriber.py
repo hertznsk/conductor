@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+import threading
 import time
-from contextlib import suppress
 from typing import TYPE_CHECKING
 
 from opentelemetry import trace
@@ -17,6 +18,14 @@ from conductor.telemetry.subscriber_types import SpanKey
 
 if TYPE_CHECKING:
     from opentelemetry.sdk.trace import TracerProvider
+
+logger = logging.getLogger(__name__)
+
+# Single overall deadline for draining the exporter at close. The pinned SDK's
+# BatchSpanProcessor ignores force_flush's own timeout and drains synchronously
+# (one exporter-timeout per queued batch), so the bound has to be enforced
+# from outside the exporter — see TelemetrySubscriber.close.
+_CLOSE_EXPORT_DEADLINE_SECONDS = 5.0
 
 
 class TelemetrySubscriber:
@@ -46,22 +55,106 @@ class TelemetrySubscriber:
             return
         _dispatch(self._state, event)
 
-    def close(self) -> None:
-        """Finish open spans, flush exporters, and reset process-local guards."""
+    def close(
+        self,
+        *,
+        failed: bool = False,
+        error_type: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        """Finish open spans, drain exporters under a deadline, reset guards.
+
+        Args:
+            failed: Terminal outcome of the run for spans still open at close
+                — an interrupt, a cancellation, or an exception that escaped
+                the engine before it could emit a terminal event. Those spans
+                are ended as failed instead of looking like clean completions.
+                Spans a genuine ``workflow_completed`` / ``workflow_failed``
+                already closed are untouched either way.
+            error_type: Classifier stamped on unfinished spans when ``failed``
+                (e.g. ``KeyboardInterrupt``).
+            error_message: Detail stamped on unfinished spans when ``failed``.
+
+        Never raises: cleanup runs fail-open so it cannot mask an in-flight
+        workflow or dashboard exception, and the process-local guards are
+        reset on every path.
+        """
         if self._closed:
             return
         self._closed = True
-        if self._state is not None:
-            closed_event = WorkflowEvent(type="telemetry_closed", timestamp=time.time())
-            self._state.finish_all(closed_event, failed=False)
-            self._state.detach_close_tokens()
-            self._state.clear_indexes()
-        if self._tracer_provider is not None:
-            with suppress(Exception):
-                self._tracer_provider.force_flush(timeout_millis=5_000)
-            with suppress(Exception):
-                self._tracer_provider.shutdown()
-        guards.reset_telemetry_context()
+        # Captured before any reset so diagnostics can name the run.
+        run_id = guards.current_run_id()
+        try:
+            if self._state is not None:
+                closed_data: dict[str, str] = {}
+                if failed:
+                    closed_data["error_type"] = error_type or "WorkflowIncomplete"
+                    if error_message:
+                        closed_data["message"] = error_message
+                closed_event = WorkflowEvent(
+                    type="telemetry_closed", timestamp=time.time(), data=closed_data
+                )
+                self._state.finish_all(closed_event, failed=failed)
+                self._state.detach_close_tokens()
+                self._state.clear_indexes()
+        except Exception:  # noqa: BLE001 -- cleanup must not mask a workflow exception.
+            logger.warning("OpenTelemetry span cleanup failed for run %s", run_id, exc_info=True)
+        try:
+            if self._tracer_provider is not None:
+                self._drain_provider(self._tracer_provider, run_id)
+        finally:
+            guards.reset_telemetry_context()
+
+    def _drain_provider(self, provider: TracerProvider, run_id: str | None) -> None:
+        """Flush and shut down the exporter off the calling thread.
+
+        The batch processor's ``force_flush`` ignores its timeout and drains
+        synchronously — with a slow or unreachable collector each queued batch
+        costs up to the exporter timeout, so doing this on the asyncio thread
+        would stall workflow teardown and cancellation. The drain runs on a
+        daemon thread bounded by a single overall deadline; an incomplete
+        export is reported rather than waited on. The daemon flag plus the
+        provider's ``shutdown_on_exit=False`` construction guarantee that
+        interpreter shutdown can never block on leftover export work.
+        """
+
+        def _drain() -> None:
+            try:
+                flushed = provider.force_flush(
+                    timeout_millis=int(_CLOSE_EXPORT_DEADLINE_SECONDS * 1000)
+                )
+                if not flushed:
+                    logger.warning(
+                        "OpenTelemetry force_flush reported incomplete export for run %s; "
+                        "some spans may be lost",
+                        run_id,
+                    )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "OpenTelemetry flush failed for run %s; some spans may be lost",
+                    run_id,
+                    exc_info=True,
+                )
+            # Shutdown is attempted independently of the flush outcome.
+            try:
+                provider.shutdown()
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "OpenTelemetry exporter shutdown failed for run %s",
+                    run_id,
+                    exc_info=True,
+                )
+
+        worker = threading.Thread(target=_drain, name="conductor-telemetry-close", daemon=True)
+        worker.start()
+        worker.join(_CLOSE_EXPORT_DEADLINE_SECONDS)
+        if worker.is_alive():
+            logger.warning(
+                "OpenTelemetry export for run %s did not finish within %.1fs; "
+                "continuing teardown, some spans may be lost",
+                run_id,
+                _CLOSE_EXPORT_DEADLINE_SECONDS,
+            )
 
 
 def _dispatch(state: SpanState, event: WorkflowEvent) -> None:

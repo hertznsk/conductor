@@ -2569,12 +2569,22 @@ async def run_workflow_async(
         # dashboard/event-log/file-logging cleanup below from running.
         _remove_run_record_for_current_process_safe()
 
-        # Stop dashboard if it was started
-        if dashboard is not None:
-            await dashboard.stop()
-
-        if telemetry_subscriber is not None:
-            telemetry_subscriber.close()
+        # Stop dashboard if it was started. Telemetry cleanup lives in the
+        # finally: a dashboard stop failure must not skip exporter shutdown
+        # and telemetry-state reset.
+        try:
+            if dashboard is not None:
+                await dashboard.stop()
+        finally:
+            if telemetry_subscriber is not None:
+                # Spans still open here never saw a terminal workflow event
+                # (interrupt/cancellation escaping the engine) — mark them
+                # failed rather than let them read as clean completions.
+                telemetry_subscriber.close(
+                    failed=terminal_status != "success",
+                    error_type=terminal_error_type,
+                    error_message=terminal_error_message,
+                )
 
         # Close JSONL event log and report path
         if event_log_subscriber is not None:
@@ -3392,12 +3402,19 @@ async def resume_workflow_async(
         # cleanup below from running.
         _remove_run_record_for_current_process_safe()
 
-        # Stop dashboard if it was started
-        if dashboard is not None:
-            await dashboard.stop()
-
-        if telemetry_subscriber is not None:
-            telemetry_subscriber.close()
+        # Stop dashboard if it was started. Telemetry cleanup lives in the
+        # finally: a dashboard stop failure must not skip exporter shutdown
+        # and telemetry-state reset (mirrors run_workflow_async).
+        try:
+            if dashboard is not None:
+                await dashboard.stop()
+        finally:
+            if telemetry_subscriber is not None:
+                telemetry_subscriber.close(
+                    failed=terminal_status != "success",
+                    error_type=terminal_error_type,
+                    error_message=terminal_error_message,
+                )
 
         # Close JSONL event log and report path
         if event_log_subscriber is not None:
