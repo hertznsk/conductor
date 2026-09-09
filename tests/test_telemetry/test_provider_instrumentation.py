@@ -71,6 +71,7 @@ def test_active_telemetry_configures_pydantic_ai_without_message_content(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Requirement: native tracing uses Conductor's provider and hides content by default."""
+    pytest.importorskip("opentelemetry.sdk")
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
     provider = init_tracer_provider(run_id="run-telemetry")
     assert provider is not None
@@ -90,6 +91,7 @@ def test_content_capture_modes_enable_pydantic_ai_message_content(
     monkeypatch: pytest.MonkeyPatch, capture_mode: str
 ) -> None:
     """Requirement: explicit span-content modes are the only opt-in for message capture."""
+    pytest.importorskip("opentelemetry.sdk")
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
     monkeypatch.setenv("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", capture_mode)
     provider = init_tracer_provider(run_id="run-telemetry")
@@ -108,6 +110,7 @@ def test_event_only_capture_mode_hides_pydantic_ai_message_content(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Requirement: EVENT_ONLY degrades safely because Pydantic AI has no event-only mode."""
+    pytest.importorskip("opentelemetry.sdk")
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
     monkeypatch.setenv("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "EVENT_ONLY")
     provider = init_tracer_provider(run_id="run-telemetry")
@@ -131,6 +134,24 @@ def test_inactive_telemetry_leaves_pydantic_ai_uninstrumented(
 
     agent = build_agent(_agent_definition("writer"), system_prompt="", rendered_prompt="")
 
+    assert agent.instrument is None
+
+
+def test_sdk_absent_with_endpoint_set_still_runs_uninstrumented(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Requirement: a base install with OTLP configured degrades to normal execution.
+
+    The optional SDK missing must never break a run: initialization declines
+    and the built agent carries no instrumentation.
+    """
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
+    monkeypatch.setattr(guards, "OTEL_SDK_AVAILABLE", False)
+
+    provider = init_tracer_provider(run_id="run-no-sdk")
+    assert provider is None
+
+    agent = build_agent(_agent_definition("writer"), system_prompt="", rendered_prompt="")
     assert agent.instrument is None
 
 

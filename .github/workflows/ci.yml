@@ -78,7 +78,9 @@ jobs:
         run: uv python install ${{ env.PYTHON_VERSION }}
 
       - name: Install dependencies
-        run: uv sync --group dev
+        # The telemetry extra installs opentelemetry-sdk so ty can resolve the
+        # TYPE_CHECKING imports under src/conductor/telemetry/.
+        run: uv sync --group dev --extra telemetry
 
       - name: Run ty type checker
         run: uv run ty check src
@@ -123,8 +125,9 @@ jobs:
       - name: Install dependencies
         # Include the claude-agent-sdk extra so the provider's regression tests
         # (gated by `pytest.importorskip("claude_agent_sdk")`) actually run in
-        # CI instead of silently skipping.
-        run: uv sync --group dev --extra claude-agent-sdk
+        # CI instead of silently skipping. The telemetry extra does the same
+        # for the OpenTelemetry suite (`importorskip("opentelemetry.sdk")`).
+        run: uv sync --group dev --extra claude-agent-sdk --extra telemetry
 
       - name: Remove bundled Copilot CLI binary
         # `shell: bash` so this runs identically on the Windows runner (Git Bash

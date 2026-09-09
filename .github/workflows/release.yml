@@ -71,7 +71,9 @@ jobs:
         run: uv python install ${{ env.PYTHON_VERSION }}
 
       - name: Install dependencies
-        run: uv sync --group dev
+        # The telemetry extra installs opentelemetry-sdk so ty can resolve the
+        # TYPE_CHECKING imports under src/conductor/telemetry/.
+        run: uv sync --group dev --extra telemetry
 
       - name: Run ty type checker
         run: uv run ty check src
@@ -99,7 +101,9 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv sync --group dev
+        # The telemetry extra lets the OpenTelemetry suite actually run
+        # (`importorskip("opentelemetry.sdk")`) instead of silently skipping.
+        run: uv sync --group dev --extra telemetry
 
       - name: Run tests
         # Exclude performance tests: they assert wall-clock thresholds (e.g.

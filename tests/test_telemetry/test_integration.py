@@ -6,6 +6,7 @@ import asyncio
 import io
 import json
 import logging
+import os
 import sys
 import time
 from collections.abc import Callable, Generator
@@ -1007,18 +1008,27 @@ output:
     provider = CrossTaskProvider()
     mock_registry = MockProviderRegistry(provider)
 
-    original_detach = sys.modules["opentelemetry.context"].detach
-    detached_in_main: list[str] = []
+    # Record every attach/detach with its owning task so the assertions below
+    # observe what production code actually did — an uninstalled spy would
+    # make the cross-task-detach assertion vacuous. contextvars.Token is
+    # unhashable, so recordings key on id(token).
+    otel_context_module = sys.modules["opentelemetry.context"]
+    original_attach = otel_context_module.attach
+    original_detach = otel_context_module.detach
+    main_task = asyncio.current_task()
+    attach_owner: dict[int, asyncio.Task[None] | None] = {}
+    detach_events: list[tuple[int, asyncio.Task[None] | None]] = []
 
-    def spy_detach(token):
-        current = asyncio.current_task()
-        assert current is not None
-        loop = asyncio.get_running_loop()
-        # The test coroutine runs in the only task on this loop during the
-        # synchronous portion; other detach calls belong to worker tasks.
-        if current is loop._task:  # type: ignore[attr-defined]
-            detached_in_main.append("detached")
+    def recording_attach(context: Any) -> object:
+        token = original_attach(context)
+        attach_owner[id(token)] = asyncio.current_task()
+        return token
+
+    def recording_detach(token: object) -> None:
+        detach_events.append((id(token), asyncio.current_task()))
         return original_detach(token)
+
+    caller_context = otel_context_module.get_current()
 
     with (
         patch("conductor.cli.run.ProviderRegistry", return_value=mock_registry),
@@ -1032,14 +1042,34 @@ output:
         patch("conductor.cli.run._remove_run_record_for_current_process_safe"),
         patch("conductor.fleet.retention.maybe_prune_event_logs"),
         patch("sys.stdin") as mock_stdin,
+        patch.object(otel_context_module, "attach", recording_attach),
+        patch.object(otel_context_module, "detach", recording_detach),
         pytest.raises(ExecutionError),
     ):
         mock_stdin.isatty.return_value = False
         await run_workflow_async(wf_path, {})
 
-    # Cross-task detach ownership means no detach token for worker spans was
-    # reset from the main task during fail-fast cleanup.
-    assert detached_in_main == []
+    # Worker spans were really attached by worker tasks — the scenario under
+    # test (fail-fast cleanup ending another task's spans) was exercised.
+    worker_tokens = {
+        token_id
+        for token_id, owner in attach_owner.items()
+        if owner is not None and owner is not main_task
+    }
+    assert worker_tokens, "no worker-task context attaches observed; test is vacuous"
+
+    # Cross-task detach ownership: no worker token was detached by any task
+    # other than the one that attached it during fail-fast cleanup.
+    cross_task_detaches = [
+        (token_id, detacher)
+        for token_id, detacher in detach_events
+        if token_id in worker_tokens and detacher is not attach_owner[token_id]
+    ]
+    assert cross_task_detaches == []
+
+    # Cleanup restored the caller's original context: no span context leaked
+    # past the run.
+    assert otel_context_module.get_current() == caller_context
 
     spans = mock_otlp_exporter.get_finished_spans()
     roots = [s for s in spans if s.name == "invoke_workflow cross-task-wf"]
@@ -1049,95 +1079,235 @@ output:
 
 @pytest.mark.asyncio
 async def test_provider_override_dedup_single_tree(tmp_path, monkeypatch, mock_otlp_exporter):
-    """Scenario 12: --provider openai override suppresses duplicate conductor tool spans."""
-    from conductor.cli.run import run_workflow_async
+    """Scenario 12: native Pydantic AI spans replace Conductor's fallback tool spans.
+
+    Exercises the real OpenAI builder and runner with only the model swapped
+    for TestModel: the run must export exactly one tool span — the native
+    ``execute_tool`` span — inside the workflow's single trace with the run id
+    as conversation identity. A Conductor fallback span duplicating the same
+    tool call would fail the count assertion.
+    """
+    from pydantic_ai.models.test import TestModel
+
+    from conductor.config.schema import (
+        OutputField,
+        RouteDef,
+        RuntimeConfig,
+        WorkflowConfig,
+        WorkflowDef,
+    )
+    from conductor.engine.workflow import RunContext, WorkflowEngine
+    from conductor.events import WorkflowEventEmitter
+    from conductor.providers.openai import OpenAIProvider
 
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
-    wf_path = tmp_path / "dedup-wf.yaml"
-    wf_path.write_text(
-        """
-workflow:
-  name: dedup-wf
-  entry_point: worker
-agents:
-  - name: worker
-    model: gpt-4
-    prompt: "Use the echo tool"
-    output:
-      result:
-        type: string
-    routes:
-      - to: $end
-output:
-  result: "{{ worker.output.result }}"
-""",
-        encoding="utf-8",
+
+    tool_name = "filesystem__read_file"
+    provider = OpenAIProvider(api_key="test-key", model="gpt-4")
+    mock_mcp = MagicMock()
+    mock_mcp.get_all_tools.return_value = [
+        {
+            "name": tool_name,
+            "description": "Read a file from the filesystem",
+            "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
+            "server": "filesystem",
+            "original_name": "read_file",
+        }
+    ]
+    mock_mcp.has_servers.return_value = True
+    mock_mcp.call_tool = AsyncMock(return_value="file contents")
+    provider._mcp_servers_config = {"filesystem": {"command": "true"}}
+    provider._mcp_managers = {os.getcwd(): mock_mcp}
+    provider._mcp_manager_locks = {}
+
+    # Swap only the model: the real builder still applies Conductor's
+    # instrumentation settings, and the real runner still emits the events.
+    monkeypatch.setattr(
+        "conductor.providers._pydantic_ai.agent_builder._resolve_openai_model",
+        lambda *args, **kwargs: TestModel(
+            call_tools=[tool_name], custom_output_args={"result": "ok"}
+        ),
     )
 
-    pytest.importorskip("pydantic_ai")
-    from pydantic_ai import Agent
-    from pydantic_ai.models.test import TestModel
-    from pydantic_ai.tools import Tool
-
-    class DedupProvider(AgentProvider, abstract=True):
-        async def execute(
-            self,
-            agent: AgentDef,
-            context: dict[str, Any],
-            rendered_prompt: str,
-            *,
-            tools: list[str] | None = None,
-            interrupt_signal: asyncio.Event | None = None,
-            event_callback: Callable[[str, dict[str, Any]], None] | None = None,
-            skill_directories: list[str] | None = None,
-            custom_agents: list[dict[str, Any]] | None = None,
-            extra_mcp_servers: dict[str, Any] | None = None,
-            continuation_state: object | None = None,
-        ) -> AgentOutput:
-            pydantic_agent = Agent(
-                TestModel(call_tools=["echo"]),
-                tools=[Tool(lambda value: value, name="echo")],
-                name=agent.name,
-                retries=0,
-            )
-            pydantic_agent.instrument = None
-            run_result = await pydantic_agent.run(rendered_prompt)
-            if event_callback:
-                event_callback("agent_tool_start", {"tool_name": "echo", "tool_call_id": "call-1"})
-                event_callback(
-                    "agent_tool_complete", {"tool_name": "echo", "tool_call_id": "call-1"}
-                )
-            return AgentOutput(
-                content={"result": str(run_result.output)}, raw_response=None, model="test"
-            )
-
-        async def validate_connection(self):
-            return True
-
-        async def close(self):
-            pass
-
-    provider = DedupProvider()
-    mock_registry = MockProviderRegistry(provider)
-
-    with (
-        patch("conductor.cli.run.ProviderRegistry", return_value=mock_registry),
-        patch("conductor.cli.run._build_mcp_servers", new_callable=AsyncMock, return_value=None),
-        patch(
-            "conductor.cli.run._prefetch_plugin_sources",
-            new_callable=AsyncMock,
-            return_value={},
+    config = WorkflowConfig(
+        workflow=WorkflowDef(
+            name="dedup-wf",
+            entry_point="worker",
+            runtime=RuntimeConfig(provider="openai"),
         ),
-        patch("conductor.cli.run._write_run_record_for_current_process"),
-        patch("conductor.cli.run._remove_run_record_for_current_process_safe"),
-        patch("conductor.fleet.retention.maybe_prune_event_logs"),
-        patch("sys.stdin") as mock_stdin,
-    ):
-        mock_stdin.isatty.return_value = False
-        result = await run_workflow_async(wf_path, {}, provider_override="openai")
+        agents=[
+            AgentDef(
+                name="worker",
+                model="gpt-4",
+                prompt="Use the read_file tool",
+                output={"result": OutputField(type="string")},
+                routes=[RouteDef(to="$end")],
+            ),
+        ],
+        output={"result": "{{ worker.output.result }}"},
+    )
+
+    tracer_provider = init_tracer_provider(run_id="run-dedup")
+    assert tracer_provider is not None
+    subscriber = TelemetrySubscriber(tracer_provider)
+    emitter = WorkflowEventEmitter()
+    emitter.subscribe(subscriber.on_event)
+
+    engine = WorkflowEngine(
+        config,
+        provider,
+        event_emitter=emitter,
+        run_context=RunContext(run_id="run-dedup"),
+    )
+    result = await engine.run({})
+    subscriber.close()
 
     assert result is not None
     spans = mock_otlp_exporter.get_finished_spans()
     roots = [s for s in spans if s.name == "invoke_workflow dedup-wf"]
     assert len(roots) == 1
     _assert_single_tree(spans, roots[0])
+
+    # Exactly one tool span: the native execute_tool span from the
+    # instrumented runner. A Conductor fallback span for the same call would
+    # be a duplicate and fail this count.
+    tool_spans = [s for s in spans if s.name == f"execute_tool {tool_name}"]
+    assert len(tool_spans) == 1
+
+    # The native model span reached the same run-local exporter.
+    chat_spans = [s for s in spans if s.name.startswith("chat ")]
+    assert chat_spans
+
+    # Conversation identity: every span in the tree carries the workflow run id.
+    conversation_ids = {
+        span.attributes.get("gen_ai.conversation.id") for span in spans if span.attributes
+    }
+    assert conversation_ids == {"run-dedup"}
+
+    # Ancestry: Conductor's agent span carries the conductor-specific step
+    # attribute; the native Pydantic AI invocation wrapper does not. The
+    # wrapper nests under the Conductor span, and the model/tool spans nest
+    # under the wrapper.
+    conductor_agent = next(
+        s
+        for s in spans
+        if s.name == "invoke_agent worker" and s.attributes.get("conductor.step.type")
+    )
+    native_wrappers = [
+        s
+        for s in spans
+        if s.name == "invoke_agent worker" and not s.attributes.get("conductor.step.type")
+    ]
+    assert len(native_wrappers) == 1
+    wrapper = native_wrappers[0]
+    agent_span_id = conductor_agent.get_span_context().span_id
+    wrapper_span_id = wrapper.get_span_context().span_id
+    assert wrapper.parent is not None
+    assert wrapper.parent.span_id == agent_span_id
+    for native_child in [*chat_spans, *tool_spans]:
+        assert native_child.parent is not None
+        assert native_child.parent.span_id == wrapper_span_id
+
+
+@pytest.mark.asyncio
+async def test_nested_subworkflow_agents_parent_under_child_workflow(
+    tmp_path, monkeypatch, mock_otlp_exporter
+):
+    """Scenario 13: a child workflow's spans nest under the child workflow span.
+
+    Real nested engine execution (not an isolated lookup): the remembered
+    delegate invocation span must only parent the child workflow span itself;
+    once that span exists, the child's agents and groups attach to it, so the
+    exported tree reads delegate -> inner-workflow -> inner-agent.
+    """
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
+
+    from conductor.config.schema import (
+        AgentDef,
+        LimitsConfig,
+        RouteDef,
+        RuntimeConfig,
+        WorkflowConfig,
+        WorkflowDef,
+    )
+    from conductor.engine.workflow import RunContext, WorkflowEngine
+    from conductor.events import WorkflowEventEmitter
+
+    (tmp_path / "child.yaml").write_text(
+        """\
+workflow:
+  name: child-wf
+  entry_point: inner
+agents:
+  - name: inner
+    model: gpt-4
+    prompt: "Do inner work"
+    output:
+      result:
+        type: string
+    routes:
+      - to: $end
+output:
+  result: "{{ inner.output.result }}"
+""",
+        encoding="utf-8",
+    )
+    config = WorkflowConfig(
+        workflow=WorkflowDef(
+            name="parent-wf",
+            entry_point="delegate",
+            runtime=RuntimeConfig(provider="copilot"),
+            limits=LimitsConfig(max_iterations=5),
+        ),
+        agents=[
+            AgentDef(
+                name="delegate",
+                type="workflow",
+                workflow="child.yaml",
+                routes=[RouteDef(to="$end")],
+            ),
+        ],
+        output={"result": "{{ delegate.output.result }}"},
+    )
+
+    def handler(agent, _prompt, _context):
+        return {"result": "done"}
+
+    provider = CopilotProvider(mock_handler=handler)
+    tracer_provider = init_tracer_provider(run_id="run-nested")
+    assert tracer_provider is not None
+    subscriber = TelemetrySubscriber(tracer_provider)
+    emitter = WorkflowEventEmitter()
+    emitter.subscribe(subscriber.on_event)
+
+    engine = WorkflowEngine(
+        config,
+        provider,
+        event_emitter=emitter,
+        workflow_path=tmp_path / "parent.yaml",
+        run_context=RunContext(run_id="run-nested"),
+    )
+    result = await engine.run({})
+    subscriber.close()
+
+    assert result is not None
+    spans = mock_otlp_exporter.get_finished_spans()
+    by_name = {}
+    for span in spans:
+        by_name.setdefault(span.name, []).append(span)
+
+    roots = by_name["invoke_workflow parent-wf"]
+    assert len(roots) == 1
+    _assert_single_tree(spans, roots[0])
+
+    delegate = by_name["invoke_agent delegate"][0]
+    child_workflow = by_name["invoke_workflow child-wf"][0]
+    inner_agent = by_name["invoke_agent inner"][0]
+
+    # The child workflow span attaches to the delegate invocation span...
+    assert child_workflow.parent is not None
+    assert child_workflow.parent.span_id == delegate.get_span_context().span_id
+    # ...and the child's agent nests under the child workflow span, not under
+    # the delegate span that launched the child.
+    assert inner_agent.parent is not None
+    assert inner_agent.parent.span_id == child_workflow.get_span_context().span_id
