@@ -72,6 +72,8 @@ disables tracing for the process.
 
 Conductor's own spans record execution metadata, not prompts or model
 responses. Native spans for `copilot`, `claude`, and `openai` also exclude message content by default.
+Prompt and response capture is disabled by default, but exception messages can contain input or
+response values — treat traces as potentially sensitive even with content capture disabled.
 Set `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` to `true`,
 `SPAN_ONLY`, or `SPAN_AND_EVENT` only after confirming that the collector and
 its retention policy are approved for prompt and response data. For details on how content capture behaves under different providers, see the [Copilot Provider telemetry documentation](telemetry.md#copilot-provider).

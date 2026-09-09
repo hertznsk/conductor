@@ -91,7 +91,7 @@ For `copilot`, `claude`, and `openai` providers, Conductor automatically registe
 
 - **Orchestration Spans as Parents:** The high-level Conductor orchestration spans, such as `invoke_agent` and `execute_tool`, act as parent spans.
 - **Provider Spans as Children:** Native provider spans, including LLM API calls and token counts, are nested directly under the corresponding Conductor spans. They share the same `trace_id` and trace context.
-- **Correlation Identifier:** Conductor propagates the workflow `run_id` as the `gen_ai.conversation.id` attribute across all spans in the tree.
+- **Correlation Identifier:** Conductor's own spans and native Pydantic AI spans (`claude`, `openai`) carry the workflow `run_id` as the `gen_ai.conversation.id` attribute. Native Copilot CLI spans do not receive that attribute — the Copilot configuration path never forwards it, and W3C trace-context propagation carries trace identity, not span attributes. Correlate Copilot spans by the shared `trace_id` and parent relationship instead.
 
 This single-tree structure allows you to drill down from high-level agent routing directly into the underlying model requests and tools in a single visualization.
 
@@ -115,7 +115,7 @@ When a workflow hits a human-in-the-loop gate, the active `invoke_agent` span fo
 
 ## Privacy and Content Capture
 
-By default, Conductor does not record prompt text, system messages, or model responses in OTel spans. This protects sensitive data and keeps secrets out of your tracing backend.
+Prompt and response capture is disabled by default, but exception messages can contain input or response values — a failed output validation, for example, can embed the rejected value in the error message recorded on the span. Treat traces as potentially sensitive even with content capture disabled.
 
 Native spans for Pydantic AI (Claude, OpenAI) and Copilot CLI also exclude message content by default. If you need to inspect raw prompts and responses for debugging, set `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` to `true`, `SPAN_ONLY`, or `SPAN_AND_EVENT`.
 

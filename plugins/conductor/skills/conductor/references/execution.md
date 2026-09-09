@@ -696,7 +696,7 @@ export OTEL_SERVICE_NAME=my-workflow-service
 
 ### Unified Traces
 
-For `copilot`, `claude`, and `openai` providers, Conductor registers native OpenTelemetry instrumentation. Conductor unifies high-level orchestration spans and low-level LLM call spans into a single unified trace tree. High-level orchestration spans act as parent spans, and native provider spans nest directly under them, sharing the same `trace_id` and trace context. The workflow `run_id` is propagated as the `gen_ai.conversation.id` attribute across all spans in the tree.
+For `copilot`, `claude`, and `openai` providers, Conductor registers native OpenTelemetry instrumentation. Conductor unifies high-level orchestration spans and low-level LLM call spans into a single unified trace tree. High-level orchestration spans act as parent spans, and native provider spans nest directly under them, sharing the same `trace_id` and trace context. The workflow `run_id` is propagated as the `gen_ai.conversation.id` attribute on Conductor's own spans and on native Pydantic AI spans (`claude`, `openai`); native Copilot CLI spans do not carry that attribute — correlate them by the shared `trace_id` and parent relationship instead. Prompt and response capture is disabled by default, but exception messages can contain input or response values, so treat traces as potentially sensitive even with content capture disabled.
 
 ## Performance Tips
 
