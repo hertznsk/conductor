@@ -26,6 +26,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [`docs/workflow-syntax.md`](docs/workflow-syntax.md#mcp-steps) and
   [`examples/mcp-step.yaml`](examples/mcp-step.yaml).
 
+### Fixed
+
+- **Pydantic AI structured-output agents explicitly require `final_result`** —
+  the generated output tool now tells models that they must call it before
+  finishing and that plain-text responses are not accepted. This improves
+  adherence for local models behind OpenAI- or Anthropic-compatible endpoints
+  without replacing tool-based output, weakening schema validation, or
+  changing authored system prompts.
+
 ## [0.1.37](https://github.com/microsoft/conductor/compare/v0.1.36...v0.1.37) - 2026-09-09
 
 ### Added
