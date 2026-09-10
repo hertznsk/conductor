@@ -17,7 +17,7 @@ import httpx
 import pytest
 from pydantic_ai.exceptions import ModelHTTPError
 
-from conductor.config.schema import AgentDef, ToolOutputConfig
+from conductor.config.schema import AgentDef, OutputField, ToolOutputConfig
 from conductor.exceptions import ProviderError
 from conductor.providers._pydantic_ai.agent_builder import build_agent
 from conductor.providers._pydantic_ai.retry import RetryConfig
@@ -197,6 +197,31 @@ async def test_openai_pipeline_400_reasoning_effort_is_fatal_one_request() -> No
     assert isinstance(cause, ModelHTTPError)
     assert cause.status_code == 400
     assert len(captured["urls"]) == 1
+
+
+# Requirement: the OpenAI request tells the model how structured output ends the run.
+@pytest.mark.asyncio
+async def test_openai_structured_output_sends_final_result_contract() -> None:
+    agent = AgentDef(
+        name="formatter",
+        model="gpt-5-mini",
+        prompt="format this",
+        output={"answer": OutputField(type="string")},
+    )
+    run, captured = _build_pipeline_runner(
+        agent,
+        responses=[(400, _make_openai_400_response())],
+    )
+
+    with pytest.raises(ProviderError):
+        await run()
+
+    request_body = json.loads(captured["bodies"][0])
+    output_tool = request_body["tools"][0]["function"]
+    assert output_tool["name"] == "final_result"
+    assert "must call" in output_tool["description"].lower()
+    assert "plain text" in output_tool["description"].lower()
+    assert request_body["tool_choice"] == "required"
 
 
 @pytest.mark.asyncio

@@ -360,6 +360,23 @@ class TestOutputMapping:
         instance = output_model(answer="42")
         assert instance.answer == "42"
 
+    # Requirement: structured-output agents receive an explicit completion contract.
+    def test_output_tool_requires_final_result_call(self) -> None:
+        agent_def = AgentDef(
+            name="formatter",
+            output={"answer": OutputField(type="string")},
+        )
+
+        pydantic_agent = build_agent(agent_def, system_prompt="", rendered_prompt="")
+
+        toolset = pydantic_agent._output_schema.toolset
+        assert toolset is not None
+        output_tool = toolset._tool_defs[0]
+        assert output_tool.name == "final_result"
+        assert output_tool.description is not None
+        assert "must call" in output_tool.description.lower()
+        assert "plain text" in output_tool.description.lower()
+
     def test_empty_output_schema_falls_back_to_text(self) -> None:
         """An empty or missing output schema must produce text output (str)."""
         agent_def = AgentDef(name="chatter")

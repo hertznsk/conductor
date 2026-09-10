@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 from anthropic import NOT_GIVEN as ANTHROPIC_NOT_GIVEN
 from anthropic import AsyncAnthropic
@@ -53,6 +53,10 @@ logger = logging.getLogger(__name__)
 # model deprecation risk. The "-latest" suffix lets Anthropic aliases keep the
 # identifier current without YAML changes.
 DEFAULT_ANTHROPIC_MODEL: str = "claude-3-5-sonnet-latest"
+_FINAL_RESULT_TOOL_DESCRIPTION: Final[str] = (
+    "Call this tool to return the final structured result and end the conversation. "
+    "You must call this tool before finishing; plain text responses are not accepted."
+)
 
 # Default OpenAI model used when the agent and runtime fail to declare one.
 DEFAULT_OPENAI_MODEL: str = "gpt-5-mini"
@@ -235,7 +239,7 @@ def _build_output_type(
     )
     if dynamic_model is None:
         return None
-    return ToolOutput(dynamic_model)
+    return ToolOutput(dynamic_model, description=_FINAL_RESULT_TOOL_DESCRIPTION)
 
 
 def _resolve_anthropic_thinking(
