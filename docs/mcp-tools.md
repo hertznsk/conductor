@@ -96,6 +96,31 @@ The configuration fields are the same as `http`.
 
 > **Provider note:** The Claude provider only supports `stdio` servers. The `http` and `sse` types are supported by the Copilot and Claude Agent SDK providers.
 
+## Direct MCP Steps
+
+Conductor supports two distinct ways to execute MCP tools:
+
+1. **LLM-driven tool calling:** An AI agent receives tool definitions from configured `mcp_servers` and autonomously chooses which tools to call and what arguments to supply.
+2. **Direct MCP steps (`type: mcp`):** A deterministic workflow step invokes an MCP tool directly with authored arguments, without involving an LLM.
+
+Direct MCP steps run deterministically, spend zero LLM tokens, and capture structured result envelopes (`content`, `structured`, `is_error`) directly into the workflow context. This enables explicit routing on tool outputs and errors.
+
+```yaml
+agents:
+  - name: fetch_file
+    type: mcp
+    server: filesystem
+    tool: read_file
+    arguments:
+      path: "config.json"
+    routes:
+      - to: handle_error
+        when: "{{ output.is_error }}"
+      - to: parse_config
+```
+
+Direct MCP steps are provider-independent (they work with any provider or even without an LLM provider configured) and execute on `stdio` MCP servers. See [Workflow Syntax: MCP Steps](workflow-syntax.md#mcp-steps) for the complete reference on arguments, envelope merging, and routing semantics.
+
 ## Configuration Reference
 
 ### Full Schema

@@ -5,6 +5,7 @@ and output parsing/validation.
 """
 
 from conductor.executor.agent import AgentExecutor, resolve_agent_tools
+from conductor.executor.mcp_step import McpStepExecutor
 from conductor.executor.output import parse_json_output, validate_output
 from conductor.executor.script import ScriptExecutor, ScriptOutput
 from conductor.executor.template import TemplateRenderer
@@ -12,6 +13,7 @@ from conductor.executor.wait import WaitExecutor, WaitOutput
 
 __all__ = [
     "AgentExecutor",
+    "McpStepExecutor",
     "ScriptExecutor",
     "ScriptOutput",
     "TemplateRenderer",

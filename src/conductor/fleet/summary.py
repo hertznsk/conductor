@@ -433,6 +433,7 @@ _AGENT_CLOSE_EVENT_TYPES = frozenset(
         "script_completed",
         "wait_completed",
         "set_completed",
+        "mcp_completed",
         "gate_resolved",
         "subworkflow_completed",
         "parallel_agent_completed",
@@ -459,6 +460,7 @@ _AGENT_FAILED_EVENT_TYPES = frozenset(
         "script_failed",
         "wait_failed",
         "set_failed",
+        "mcp_failed",
         "subworkflow_failed",
     }
 )

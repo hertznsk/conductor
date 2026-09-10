@@ -11,6 +11,7 @@ Tests cover:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -1847,3 +1848,268 @@ class TestSyntheticReplaySetStep:
         big_value = "x" * 2000
         _, _, _, completed = WebDashboard._synth_agent_or_script("big", agent, big_value)
         assert completed["value_repr"] == render_set_value_repr(big_value)
+
+
+class TestSyntheticReplayMcpStep:
+    """Coverage for ``WebDashboard._synth_agent_or_script`` mcp branch.
+
+    The synthetic replay path emits ``mcp_started``/``mcp_completed`` when
+    restoring an mcp step's envelope from a checkpoint on resume. The payload
+    must match the live engine emitter byte-for-byte — including the
+    ``result_bytes`` measurement, which is the shared size contract.
+    """
+
+    def _mcp_agent(self) -> object:
+        """Build a minimal AgentDef-like duck typed object for an mcp step."""
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            type="mcp",
+            server="filesystem",
+            tool="read_file",
+            arguments={"path": "/tmp/x"},
+        )
+
+    def _expected_result_bytes(self, content: object, structured: object) -> int:
+        """Independent re-derivation of the envelope byte size.
+
+        Deliberately restates the measurement formula instead of importing the
+        production helper, so the test fails if the helper's contract drifts.
+        """
+        import json
+
+        return len(
+            json.dumps(
+                {"content": content, "structured": structured},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+
+    def test_envelope_synthesises_mcp_events(self) -> None:
+        # Requirement: the mcp branch emits mcp_started/mcp_completed with the
+        # live payload shape (server/tool from the agent def, argument_keys
+        # sorted, elapsed 0.0 like the set branch).
+        content = [{"type": "text", "text": "hello", "truncated": False}]
+        envelope = {"content": content, "structured": None, "is_error": False}
+        started_type, started, completed_type, completed = WebDashboard._synth_agent_or_script(
+            "fetch", self._mcp_agent(), envelope
+        )
+        assert started_type == "mcp_started"
+        assert completed_type == "mcp_completed"
+        assert started["server"] == "filesystem"
+        assert started["tool"] == "read_file"
+        assert started["argument_keys"] == ["path"]
+        assert started["synthetic"] is True
+        assert completed["is_error"] is False
+        assert completed["elapsed"] == 0.0
+        assert completed["result_bytes"] == self._expected_result_bytes(content, None)
+
+    def test_result_bytes_match_live_measurement_for_multibyte_text(self) -> None:
+        # Requirement: result_bytes is byte-identical between live and
+        # synthetic events — multibyte text must count UTF-8 bytes, not chars.
+        content = [{"type": "text", "text": "héllo wörld — 中文文本", "truncated": False}]
+        envelope = {"content": content, "structured": None, "is_error": False}
+        _, _, _, completed = WebDashboard._synth_agent_or_script(
+            "fetch", self._mcp_agent(), envelope
+        )
+        expected = self._expected_result_bytes(content, None)
+        assert completed["result_bytes"] == expected
+        assert expected > len("héllo wörld — 中文文本")  # bytes, not characters
+
+    def test_result_bytes_match_live_measurement_with_structured_payload(self) -> None:
+        # Requirement: a non-empty structured mapping participates in the size
+        # measurement exactly as the live emitter measures it.
+        content = [{"type": "text", "text": "ok", "truncated": False}]
+        structured = {"answer": "中文字符串", "score": 42}
+        envelope = {"content": content, "structured": structured, "is_error": False}
+        _, _, _, completed = WebDashboard._synth_agent_or_script(
+            "fetch", self._mcp_agent(), envelope
+        )
+        assert completed["result_bytes"] == self._expected_result_bytes(content, structured)
+
+    def test_is_error_restored_but_stored_truncation_markers_suppressed(self) -> None:
+        # Requirement: is_error is restored from the saved envelope, but
+        # stored truncated/spill_path markers are NEVER republished on
+        # synthetic replay — a checkpoint written before ingestion stripping
+        # existed can carry server-supplied markers, and replaying them would
+        # present server-controlled data as Conductor-generated metadata.
+        content = [
+            {"type": "text", "text": "big", "truncated": True, "spill_path": "/tmp/spill.txt"}
+        ]
+        envelope = {"content": content, "structured": None, "is_error": True}
+        _, _, _, completed = WebDashboard._synth_agent_or_script(
+            "fetch", self._mcp_agent(), envelope
+        )
+        assert completed["is_error"] is True
+        assert completed["truncated"] is False
+        assert completed["spill_path"] is None
+
+    def test_forged_spill_path_in_stored_envelope_is_dropped(self) -> None:
+        # Requirement: only Conductor's own truncation markers are replayed —
+        # a stored envelope carrying a non-string ``spill_path`` (e.g. forged
+        # by a server before ingestion stripping existed) must not reach the
+        # event, whose frontend contract types the field as a string.
+        content = [{"type": "text", "text": "x", "spill_path": {"private_result": "value"}}]
+        envelope = {"content": content, "structured": None, "is_error": False}
+        _, _, _, completed = WebDashboard._synth_agent_or_script(
+            "fetch", self._mcp_agent(), envelope
+        )
+        assert completed["truncated"] is False
+        assert completed["spill_path"] is None
+
+
+class TestSyntheticReplayMcpGroups:
+    """Coverage for group synthesis of ``type: mcp`` members (PR review).
+
+    Live group events (``parallel_completed`` / ``for_each_completed``) carry
+    counts only, never member outputs — but the aggregate ``outputs`` field
+    the synthetic replay builds from the restored context used to include
+    saved MCP envelopes (content + structured values), publishing on resume
+    what live execution deliberately excludes. MCP members must be stripped
+    from the aggregate and replayed as metadata-only events instead.
+    """
+
+    def _mcp_agent(self, name: str = "fetch") -> object:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            name=name,
+            type="mcp",
+            server="filesystem",
+            tool="read_file",
+            arguments={"path": "/tmp/x"},
+        )
+
+    def _envelope(self, answer: object) -> dict[str, object]:
+        return {
+            "content": [{"type": "text", "text": f"result-{answer}", "truncated": False}],
+            "structured": {"answer": answer},
+            "is_error": False,
+        }
+
+    def test_parallel_group_strips_mcp_member_envelopes(self) -> None:
+        # Requirement: a mixed parallel group replays its mcp member as
+        # metadata-only mcp_* events (tagged with group_name) plus the
+        # LLM-less parallel_agent_completed, the aggregate outputs keep only
+        # the non-mcp member, and no result value appears in any event.
+        from types import SimpleNamespace
+
+        agent_defs = {
+            "fetch": self._mcp_agent(),
+            "summarize": SimpleNamespace(name="summarize", type="agent"),
+        }
+        pg = SimpleNamespace(name="grp", agents=["fetch", "summarize"])
+        output = {
+            "outputs": {
+                "fetch": self._envelope("SECRET_VALUE"),
+                "summarize": {"text": "notes"},
+            },
+            "errors": {},
+        }
+
+        events = WebDashboard._synth_parallel("grp", pg, output, agent_defs)
+
+        types = [t for t, _ in events]
+        assert types[0] == "parallel_started"
+        assert types[-1] == "parallel_completed"
+        assert "mcp_started" in types and "mcp_completed" in types
+        completed = dict(events)["parallel_completed"]
+        assert "fetch" not in completed["outputs"]["outputs"]
+        assert completed["outputs"]["outputs"]["summarize"] == {"text": "notes"}
+        mcp_completed = next(data for t, data in events if t == "mcp_completed")
+        assert mcp_completed["group_name"] == "grp"
+        assert mcp_completed["server"] == "filesystem"
+        assert mcp_completed["result_bytes"] > 0
+        assert mcp_completed["synthetic"] is True
+        member_completed = next(
+            data
+            for t, data in events
+            if t == "parallel_agent_completed" and data["agent_name"] == "fetch"
+        )
+        assert member_completed["agent_type"] == "mcp"
+        assert "output" not in member_completed
+        assert "SECRET_VALUE" not in json.dumps(events)
+
+    def test_for_each_mcp_group_replays_items_metadata_only(self) -> None:
+        # Requirement: an mcp for-each group replays each item as the live
+        # event sequence (item_started -> mcp pair -> item_completed with no
+        # output), strips the envelopes from the aggregate, and keeps the
+        # authoritative item count.
+        from types import SimpleNamespace
+
+        fg = SimpleNamespace(name="loop", agent=self._mcp_agent("worker"))
+        output = {
+            "outputs": {"k1": self._envelope(1), "k2": self._envelope(2)},
+            "errors": {},
+            "count": 2,
+        }
+
+        events = WebDashboard._synth_for_each("loop", fg, output)
+
+        types = [t for t, _ in events]
+        assert types[0] == "for_each_started"
+        assert types[-1] == "for_each_completed"
+        item_starts = [data for t, data in events if t == "for_each_item_started"]
+        assert {d["item_key"] for d in item_starts} == {"k1", "k2"}
+        mcp_pairs = [data for t, data in events if t == "mcp_completed"]
+        assert {d["item_key"] for d in mcp_pairs} == {"k1", "k2"}
+        assert all(d["group_name"] == "loop" for d in mcp_pairs)
+        item_completions = [data for t, data in events if t == "for_each_item_completed"]
+        assert all("output" not in d for d in item_completions)
+        completed = dict(events)["for_each_completed"]
+        assert completed["outputs"]["outputs"] == {}
+        assert completed["item_count"] == 2
+        assert "result-1" not in json.dumps(events)
+
+    def test_for_each_non_mcp_group_keeps_aggregate_outputs(self) -> None:
+        # Requirement: non-mcp groups replay unchanged — the stripping is
+        # scoped to the step type whose live events enforce the no-values
+        # policy.
+        from types import SimpleNamespace
+
+        fg = SimpleNamespace(name="loop", agent=SimpleNamespace(name="worker", type="agent"))
+        output = {"outputs": [{"a": 1}], "errors": {}, "count": 1}
+
+        events = WebDashboard._synth_for_each("loop", fg, output)
+
+        types = [t for t, _ in events]
+        assert types == ["for_each_started", "for_each_completed"]
+        completed = dict(events)["for_each_completed"]
+        assert completed["outputs"]["outputs"] == [{"a": 1}]
+        assert completed["item_count"] == 1
+
+    def test_group_replay_suppresses_stored_truncation_markers(self) -> None:
+        # Requirement: stored truncated/spill_path markers are never
+        # republished on the group synthetic replay paths either — both
+        # converge on _synth_mcp_pair, and a checkpoint written before
+        # ingestion stripping existed can carry server-supplied markers.
+        from types import SimpleNamespace
+
+        marked_envelope = {
+            "content": [
+                {
+                    "type": "text",
+                    "text": "big",
+                    "truncated": True,
+                    "spill_path": "/tmp/server-chosen.txt",
+                }
+            ],
+            "structured": None,
+            "is_error": False,
+        }
+        agent_defs = {"fetch": self._mcp_agent()}
+        pg = SimpleNamespace(name="grp", agents=["fetch"])
+        parallel_events = WebDashboard._synth_parallel(
+            "grp", pg, {"outputs": {"fetch": marked_envelope}, "errors": {}}, agent_defs
+        )
+        fg = SimpleNamespace(name="loop", agent=self._mcp_agent("worker"))
+        for_each_events = WebDashboard._synth_for_each(
+            "loop", fg, {"outputs": {"k1": marked_envelope}, "errors": {}, "count": 1}
+        )
+
+        for events in (parallel_events, for_each_events):
+            for data in (d for t, d in events if t == "mcp_completed"):
+                assert data["truncated"] is False
+                assert data["spill_path"] is None
+            assert "/tmp/server-chosen.txt" not in json.dumps(events)

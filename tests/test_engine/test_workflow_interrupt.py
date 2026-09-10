@@ -1172,3 +1172,137 @@ class TestHandleWebPauseSubworkflow:
         )
         # Resume returned handled=True; no InterruptError raised.
         assert result.handled is True
+
+
+class TestHandleWebPauseReasons:
+    """Pins for ``WebPauseOutcome.reason`` and the ``agent_resumed`` contract.
+
+    Callers whose interrupted work has unknown external side effects (an
+    in-flight ``type: mcp`` tool call) re-execute only on an explicit resume
+    decision, so the outcome must distinguish Resume/guidance from a
+    disconnect — and a disconnect must NOT emit ``agent_resumed`` (the LLM
+    caller emits it only when it actually auto-resumes).
+    """
+
+    def _make_dashboard(self) -> object:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            has_connections=lambda: True,
+            resume_event=asyncio.Event(),
+            kill_event=asyncio.Event(),
+            disconnect_event=asyncio.Event(),
+        )
+
+    def _make_engine(self, config: WorkflowConfig, dashboard: object) -> WorkflowEngine:
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {})
+        engine = WorkflowEngine(
+            config,
+            provider,
+            interrupt_event=asyncio.Event(),
+            web_dashboard=dashboard,  # type: ignore[arg-type]
+        )
+        emitter = WorkflowEventEmitter()
+        received: list[WorkflowEvent] = []
+        emitter.subscribe(received.append)
+        engine._event_emitter = emitter
+        engine._received_for_test = received  # type: ignore[attr-defined]
+        return engine
+
+    @pytest.mark.asyncio
+    async def test_disconnect_reason_and_no_agent_resumed(
+        self, two_agent_config: WorkflowConfig
+    ) -> None:
+        # Requirement: a mid-pause disconnect resolves the wait with
+        # reason="disconnect" and emits NO agent_resumed — disconnecting is
+        # not a resume decision, and reporting one would be a lie on the
+        # mcp parking path.
+        from conductor.providers.base import AgentOutput
+
+        dashboard = self._make_dashboard()
+        engine = self._make_engine(two_agent_config, dashboard)
+        partial = AgentOutput(content={"plan": "partial"}, raw_response="x", partial=True)
+
+        async def disconnect() -> None:
+            await asyncio.sleep(0.05)
+            dashboard.disconnect_event.set()  # type: ignore[attr-defined]
+
+        outcome, _ = await asyncio.gather(
+            engine._handle_web_pause("planner", partial), disconnect()
+        )
+
+        assert outcome.handled is True
+        assert outcome.reason == "disconnect"
+        assert outcome.guidance == []
+        resumed = [e for e in engine._received_for_test if e.type == "agent_resumed"]
+        assert resumed == []
+
+    @pytest.mark.asyncio
+    async def test_resume_reason_emits_agent_resumed(
+        self, two_agent_config: WorkflowConfig
+    ) -> None:
+        # Requirement: an explicit Resume click keeps reason="resume" and
+        # still emits agent_resumed — the explicit-decision path both
+        # callers re-execute on.
+        from conductor.providers.base import AgentOutput
+
+        dashboard = self._make_dashboard()
+        engine = self._make_engine(two_agent_config, dashboard)
+        partial = AgentOutput(content={"plan": "partial"}, raw_response="x", partial=True)
+
+        async def resume() -> None:
+            await asyncio.sleep(0.05)
+            dashboard.resume_event.set()  # type: ignore[attr-defined]
+
+        outcome, _ = await asyncio.gather(engine._handle_web_pause("planner", partial), resume())
+
+        assert outcome.handled is True
+        assert outcome.reason == "resume"
+        resumed = [e for e in engine._received_for_test if e.type == "agent_resumed"]
+        assert len(resumed) == 1
+        assert resumed[0].data["with_guidance"] is False
+
+    @pytest.mark.asyncio
+    async def test_resume_wins_over_simultaneous_disconnect(
+        self, two_agent_config: WorkflowConfig
+    ) -> None:
+        # Requirement: when a Resume click and the last client's disconnect
+        # complete in the SAME wait batch, the explicit decision wins —
+        # reason="resume" and exactly one agent_resumed. Parking a run the
+        # user explicitly resumed would discard their decision.
+        from conductor.providers.base import AgentOutput
+
+        dashboard = self._make_dashboard()
+        engine = self._make_engine(two_agent_config, dashboard)
+        partial = AgentOutput(content={"plan": "partial"}, raw_response="x", partial=True)
+
+        async def resume_and_disconnect() -> None:
+            await asyncio.sleep(0.05)
+            dashboard.resume_event.set()  # type: ignore[attr-defined]
+            dashboard.disconnect_event.set()  # type: ignore[attr-defined]
+
+        outcome, _ = await asyncio.gather(
+            engine._handle_web_pause("planner", partial), resume_and_disconnect()
+        )
+
+        assert outcome.handled is True
+        assert outcome.reason == "resume"
+        resumed = [e for e in engine._received_for_test if e.type == "agent_resumed"]
+        assert len(resumed) == 1
+        assert resumed[0].data["with_guidance"] is False
+
+    @pytest.mark.asyncio
+    async def test_no_dashboard_is_unavailable(self, two_agent_config: WorkflowConfig) -> None:
+        # Requirement: without a dashboard the outcome is reason=
+        # "unavailable" (handled=False) so the caller falls through to the
+        # CLI interactive handler — an explicit decision by definition.
+        from conductor.providers.base import AgentOutput
+
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {})
+        engine = WorkflowEngine(two_agent_config, provider, interrupt_event=asyncio.Event())
+        partial = AgentOutput(content={"plan": "partial"}, raw_response="x", partial=True)
+
+        outcome = await engine._handle_web_pause("planner", partial)
+
+        assert outcome.handled is False
+        assert outcome.reason == "unavailable"

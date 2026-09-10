@@ -13,7 +13,9 @@ import json
 import logging
 import os
 import sys
+import tempfile
 import time as _time
+import traceback
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,6 +47,12 @@ from conductor.exceptions import (
 from conductor.executor import questions as questions_mod
 from conductor.executor.agent import AgentExecutor
 from conductor.executor.linkify import linkify_markdown
+from conductor.executor.mcp_step import (
+    McpStepExecutor,
+    McpStepTimeoutError,
+    mcp_result_bytes,
+    mcp_truncation_metadata,
+)
 from conductor.executor.output import validate_output
 from conductor.executor.script import ScriptExecutor, ScriptOutput
 from conductor.executor.set_step import (
@@ -65,6 +73,7 @@ from conductor.gates.human import (
     option_for_value,
 )
 from conductor.gates.interrupt import InterruptAction, InterruptHandler, InterruptResult
+from conductor.mcp_auth import resolve_mcp_server_config
 from conductor.providers.base import AgentOutput, EventCallback
 
 logger = logging.getLogger(__name__)
@@ -75,10 +84,11 @@ MAX_SUBWORKFLOW_DEPTH = 10
 
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Coroutine, Mapping
 
     from conductor.config.schema import AgentDef, ForEachDef, ParallelGroup, WorkflowConfig
     from conductor.interrupt.listener import KeyboardListener
+    from conductor.mcp.manager import MCPManager
     from conductor.plugins.marketplace import Marketplace
     from conductor.providers.base import AgentProvider
     from conductor.providers.registry import ProviderRegistry
@@ -123,6 +133,16 @@ class WebPauseOutcome:
     guidance: list[str] = field(default_factory=list)
     """Guidance text(s) submitted while paused, in submission order. Empty
     when the pause was resolved by a plain Resume click or disconnect."""
+
+    reason: Literal["resume", "guidance", "disconnect", "unavailable"] = "unavailable"
+    """Why the pause resolved (or didn't). ``resume`` / ``guidance`` are
+    explicit user decisions; ``disconnect`` means every browser client went
+    away mid-pause; ``unavailable`` means no pause was presented (no
+    dashboard, or a dashboard with zero connected clients). Callers whose
+    interrupted work has unknown external side effects (an in-flight
+    ``type: mcp`` tool call) must re-execute only on ``resume`` /
+    ``guidance`` and park the run on the other two; the LLM path keeps its
+    auto-resume behaviour on all of them."""
 
 
 @dataclass
@@ -287,6 +307,126 @@ class ExecutionPlan:
 _ANSWER_SOURCES = frozenset({"choice", "free_text", "default", "skipped"})
 """Legal ``AnswerRecord.source`` values, for validating restored checkpoints."""
 
+_MCP_STEP_POOL_MAX = 16
+"""Upper bound on engine-owned MCP managers pooled for ``type: mcp`` steps.
+
+One pool entry is a live server process keyed by ``(server_name, cwd)``; a
+for_each whose ``runtime.working_dir`` renders a unique directory per item
+would otherwise spawn an unbounded number of processes within a single run.
+When the pool is at this cap and a new key needs connecting, the oldest
+evictable entry is closed to make room: entries of the server that is
+connecting are always evictable (the per-server slot lock the caller holds
+serializes every use of that server's entries), then the oldest entry of any
+other server whose slot lock is free. If every entry is locked, the overflow
+is allowed rather than blocking a call.
+"""
+
+
+class _McpStepRuntimeCheckError(ExecutionError):
+    """Authored mcp-step runtime-check failure.
+
+    Raised only by the runtime checks inside ``_run_mcp_step`` whose messages
+    name literal configuration only (unknown server, non-stdio transport,
+    tool not allowlisted, tool missing on the connected server) — server and
+    tool names come from the step's own literal config, never from the
+    execution context, so these may propagate verbatim through failure
+    events and the checkpoint message. Every other failure — manager/SDK
+    errors, output-schema mismatches, argument rendering, the cwd check
+    (whose rendered path and template can carry context values, so it raises
+    :class:`_McpStepRedactedCheckError` instead) — is wrapped in a generic
+    redacted ``ExecutionError`` or carries an authored value-free message.
+    """
+
+
+class _McpStepRedactedCheckError(ExecutionError):
+    """Authored mcp-step failure whose message is value-free by construction.
+
+    The runtime ``working_dir`` not-a-directory check renders its path and
+    template from the execution context, so unlike the name-only runtime
+    checks the propagated message must not quote either — the full resolved
+    path and raw template land only in the run's private diagnostic file
+    (:meth:`WorkflowEngine._write_mcp_diagnostic`). ``_run_mcp_step``
+    re-raises this verbatim like the runtime checks; every other exception
+    is wrapped in the generic redacted error.
+    """
+
+
+class _McpStepInterrupted(Exception):
+    """Control-flow signal: the user interrupted an in-flight mcp tool call.
+
+    Raised by ``_run_mcp_step`` when ``interrupt_event`` fires while the step
+    waits on the per-server slot, the lazy connect, or the tool call itself.
+    The in-flight call is cancelled and NOT replayed inside this execution —
+    its external side effects are unknown. This is not a step failure: no
+    ``mcp_failed`` is emitted, and the main-loop caller routes into the same
+    pause flow an interrupted LLM agent gets (dashboard Resume/Kill or the
+    CLI interrupt menu). It deliberately derives from ``Exception`` (not
+    ``asyncio.CancelledError``): task cancellation tears the workflow down,
+    while this asks the caller to pause.
+    """
+
+
+class _McpStepOutcomeUncertain(InterruptError):
+    """Terminal, resumable stop: an interrupted mcp call had no one to resume it.
+
+    Raised by the main-loop mcp dispatch when a Stop cancelled the in-flight
+    tool call and the pause then resolved WITHOUT an explicit resume decision
+    (every dashboard client disconnected mid-pause, or the dashboard has no
+    connected clients at all). Repeating the call transparently would risk
+    duplicating unknown external side effects, so the run stops instead:
+    deriving from ``InterruptError`` flags ``stopped_by_user`` on
+    ``workflow_failed``, and the failure checkpoint makes ``conductor
+    resume`` the explicit at-least-once re-execution boundary. No
+    ``mcp_failed`` is emitted — the tool reported no failure; the call's
+    outcome is simply unknown.
+    """
+
+    def __init__(self, agent_name: str) -> None:
+        super().__init__(
+            f"MCP step '{agent_name}' was interrupted and not resumed: the "
+            "tool call's external outcome is unknown. Resume the workflow to "
+            "re-run the step (at-least-once semantics).",
+            agent_name=agent_name,
+        )
+
+
+async def _cancel_and_drain_group_tasks(tasks: list[asyncio.Task[Any]]) -> None:
+    """Cancel every child task and await their teardown, re-cancellation-proof.
+
+    Used by the parallel / for-each fail-fast drains. Mirrors the
+    re-shielding loop in ``MCPManager.connect_server()`` / ``close()``: the
+    drain runs as its own gather future awaited under ``asyncio.shield``
+    inside a loop, so a repeated ``cancel()`` of the waiting task lands on
+    the shield instead of the drain — a sibling delayed in cancellation
+    cleanup (or temporarily suppressing cancellation) always finishes before
+    this returns and cannot race the pool close in ``run()``'s finally.
+    Cancellation requests that arrive during the drain are noted at debug
+    level; the caller re-raises the exception that entered its except arm,
+    so the original exception is the one that propagates (an extra cancel
+    during the drain never replaces it).
+    """
+    for task in tasks:
+        # gather already cancelled the children when it was THIS task's own
+        # cancellation that entered the except arm — a second cancel() would
+        # land on a sibling that is mid-cleanup (CancelledError already
+        # delivered, cancelling() > 0) and kill its cleanup via _must_cancel.
+        # Only children with no pending cancellation still need cancelling
+        # (a sibling still running because another child raised).
+        if task.cancelling() == 0:
+            task.cancel()
+    cleanup = asyncio.gather(*tasks, return_exceptions=True)
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            logger.debug(
+                "group drain received a cancellation request; continuing until all "
+                "sibling tasks finish their cleanup"
+            )
+    # With return_exceptions=True the gather only completes normally; surface
+    # anything else rather than swallow it.
+    cleanup.result()
+
 
 def _answer_counts(output: dict[str, Any]) -> dict[str, int]:
     """Project a questions output down to the counts events carry.
@@ -425,7 +565,23 @@ class WorkflowEngine:
         self.max_iterations_handler = MaxIterationsHandler(skip_gates=skip_gates)
         self.script_executor = ScriptExecutor()
         self.set_executor = SetExecutor()
+        self.mcp_step_executor = McpStepExecutor()
         self.wait_executor = WaitExecutor()
+        # Engine-owned MCP manager pool for `type: mcp` steps (lazy connect,
+        # keyed by (server_name, resolved_cwd) — a server-only key would
+        # silently reuse the first for_each item's cwd for the rest, since
+        # runtime.working_dir Jinja-renders per execution). The pool guard
+        # only ever covers dict mutation and the admission reservation, never
+        # I/O, so distinct servers connect concurrently; the per-server slot
+        # lock is held across the lazy connect + call by _run_mcp_step.
+        self._mcp_step_managers: dict[tuple[str, str], MCPManager] = {}
+        self._mcp_step_locks: dict[str, asyncio.Lock] = {}
+        self._mcp_step_pool_guard: asyncio.Lock = asyncio.Lock()
+        # Count of in-flight pool connects (reserved slots). Checked together
+        # with the pool size under the guard so two concurrent first-time
+        # connects cannot both pass a size-only capacity check and overshoot
+        # _MCP_STEP_POOL_MAX with nothing evicted.
+        self._mcp_step_pending: int = 0
         self.usage_tracker = UsageTracker(
             pricing_overrides=self._build_pricing_overrides(),
         )
@@ -593,6 +749,197 @@ class WorkflowEngine:
         """Resolved parent directory of the workflow file, or None if unset."""
         return Path(self.workflow_path).resolve().parent if self.workflow_path else None
 
+    async def _mcp_step_slot(self, server_name: str) -> asyncio.Lock:
+        """Return the per-server slot lock for an MCP step, creating it if needed.
+
+        Creation/lookup runs under the short pool guard, which never spans
+        I/O — otherwise distinct servers would serialize their connects.
+        The returned lock is held by ``_run_mcp_step`` across lazy
+        connect, runtime tool checks, and the call, keyed by server name
+        (all cwds for one server are serialized — conservative).
+        """
+        async with self._mcp_step_pool_guard:
+            lock = self._mcp_step_locks.get(server_name)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._mcp_step_locks[server_name] = lock
+            return lock
+
+    async def _get_mcp_step_manager(self, server_name: str, resolved_cwd: str) -> MCPManager:
+        """Return the pooled MCPManager for ``(server_name, resolved_cwd)``, connecting lazily.
+
+        Call only under the per-server slot lock from :meth:`_mcp_step_slot`.
+
+        Admission is atomic under the pool guard: the double-checked lookup
+        AND a reservation for the in-flight connect (``_mcp_step_pending``)
+        happen in the same critical section, so two concurrent first-time
+        connects (distinct servers or cwds) cannot both pass a size-only
+        capacity check and overshoot :data:`_MCP_STEP_POOL_MAX` with nothing
+        evicted. The connection I/O itself runs OUTSIDE the guard; the
+        reservation is released on failure/cancellation and folded into the
+        pool on success. A failed ``connect_server`` propagates and leaves
+        nothing in the pool, so the next call retries the connect.
+
+        Args:
+            server_name: Key into ``runtime.mcp_servers``.
+            resolved_cwd: Working directory the server process is spawned
+                in; arrives as a parameter because ``runtime.working_dir``
+                Jinja-renders per execution and can differ between
+                for_each items.
+        """
+        # Lazy import: conductor.mcp.__init__ eagerly imports the MCP SDK, and
+        # this module is imported by cli/app.py on every conductor invocation.
+        from conductor.mcp.manager import MCPManager
+
+        key = (server_name, resolved_cwd)
+
+        while True:
+            async with self._mcp_step_pool_guard:
+                manager = self._mcp_step_managers.get(key)
+                if manager is not None:
+                    return manager
+                if len(self._mcp_step_managers) + self._mcp_step_pending < _MCP_STEP_POOL_MAX:
+                    self._mcp_step_pending += 1
+                    break
+                target = self._pick_mcp_eviction_target(server_name)
+                if target is None:
+                    # Soft cap: every entry is serving a call right now, so
+                    # nothing is safe to evict. Allow the overflow rather
+                    # than block or fail the step.
+                    logger.debug(
+                        "MCP step pool at cap %d with every entry locked; allowing overflow",
+                        _MCP_STEP_POOL_MAX,
+                    )
+                    self._mcp_step_pending += 1
+                    break
+                evicted = self._mcp_step_managers.pop(target)
+            # The close runs outside the guard (the guard never spans I/O) and
+            # with cancellation-safe semantics — see the helper.
+            await self._close_evicted_mcp_step_manager(target, evicted)
+
+        server_def = self.config.workflow.runtime.mcp_servers[server_name]
+        # MCPServerDef -> connect kwargs. DRIFT HAZARD: this translation is
+        # duplicated from cli/run.py::_build_mcp_servers (mcp steps execute in
+        # the engine, which must not import conductor.cli — a reverse cycle).
+        # Keep the two in sync when the translation changes.
+        server_config: dict[str, Any] = {
+            "type": "stdio",
+            "command": server_def.command,
+            "args": server_def.args,
+            "tools": server_def.tools,
+        }
+        if server_def.env:
+            server_config["env"] = server_def.env
+        if server_def.timeout:
+            server_config["timeout"] = server_def.timeout
+        resolved = await resolve_mcp_server_config(server_name, server_config)
+
+        try:
+            manager = MCPManager(tool_output=self.config.workflow.runtime.tool_output)
+            await manager.connect_server(
+                name=server_name,
+                command=resolved["command"],
+                args=resolved.get("args"),
+                env=resolved.get("env"),
+                timeout=resolved.get("timeout"),
+                cwd=resolved_cwd,
+                # Deterministic mcp-step connections take the redacted logging
+                # path: a stdio failure's exception can embed server-supplied
+                # stderr (values the step's no-values policy excludes), so the
+                # manager logs safe metadata only; the raw exception still
+                # chains into the RuntimeError below, and _run_mcp_step's
+                # diagnostic sink is the only place the full traceback lands.
+                redact_errors=True,
+            )
+        except BaseException:
+            # Release the reservation on failure AND cancellation — a leak
+            # here would shrink the effective pool capacity for the rest of
+            # the run.
+            async with self._mcp_step_pool_guard:
+                self._mcp_step_pending -= 1
+            raise
+        async with self._mcp_step_pool_guard:
+            self._mcp_step_pending -= 1
+            self._mcp_step_managers[key] = manager
+        return manager
+
+    def _pick_mcp_eviction_target(self, current_server: str) -> tuple[str, str] | None:
+        """Choose one pool entry to evict for ``current_server``, or None.
+
+        CALLER HOLDS ``_mcp_step_pool_guard``. Eviction order:
+
+        1. Oldest entry of ``current_server``. The caller holds that server's
+           slot lock across this call, and every use of a server's entries
+           happens under its slot lock — so no entry of ``current_server``
+           can be in flight and all are evictable. Without this arm, one
+           server with many cwds (a for_each over templated working_dirs)
+           could never evict anything: its own held lock marks every entry
+           "locked" and the pool would grow past the cap.
+        2. Oldest entry of any other server whose per-server slot lock is
+           unheld (a held lock means a call is in flight against that entry;
+           closing it mid-call is forbidden).
+        3. None — every entry is locked; the caller allows the overflow
+           rather than blocking (the cap is a soft threshold).
+        """
+        target: tuple[str, str] | None = next(
+            (key for key in self._mcp_step_managers if key[0] == current_server),
+            None,
+        )
+        if target is None:
+            for pool_key in self._mcp_step_managers:
+                lock = self._mcp_step_locks.get(pool_key[0])
+                if lock is None or not lock.locked():
+                    target = pool_key
+                    break
+        return target
+
+    async def _close_evicted_mcp_step_manager(
+        self, evicted_key: tuple[str, str], evicted: MCPManager
+    ) -> None:
+        """Close an evicted pool manager without swallowing task cancellation.
+
+        :meth:`MCPManager.close` deliberately absorbs ``CancelledError`` until
+        owner-task teardown completes (task-affine MCP contexts must not be
+        orphaned). Awaited directly, that means a workflow cancellation (or a
+        fail-fast sibling) landing mid-close would be swallowed here and the
+        caller would carry on to connect — and then invoke a new tool call —
+        after the workflow was cancelled. So the close runs as its own
+        shielded task: repeated cancellation is tolerated while teardown
+        drains, then ``CancelledError`` is re-raised BEFORE the caller goes
+        on to connect or invoke anything. The close itself stays best-effort:
+        a failing close is logged and never fails the run.
+        """
+        cleanup = asyncio.ensure_future(evicted.close())
+        cancelled = False
+        while True:
+            try:
+                await asyncio.shield(cleanup)
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+                if cleanup.done():
+                    break
+        exc = cleanup.exception() if cleanup.done() else None
+        if isinstance(exc, Exception):
+            logger.warning("Error closing evicted MCP manager for %s: %s", evicted_key, exc)
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _close_mcp_step_managers(self) -> None:
+        """Close every pooled MCP manager (best-effort) and clear the pool."""
+        # Unconditional: the lock dict must be cleared even when the pool is
+        # empty (reachable after a failed connect, which creates a slot lock
+        # without pooling a manager), and clearing happens before closing so
+        # the pool is consistent even if a close raises.
+        managers = list(self._mcp_step_managers.items())
+        self._mcp_step_managers.clear()
+        self._mcp_step_locks.clear()
+        for key, manager in managers:
+            try:
+                await manager.close()
+            except Exception as e:  # noqa: BLE001 - cleanup must not mask the run outcome
+                logger.warning("Error closing MCP manager for %s: %s", key, e)
+
     def _resolve_agent_directory(
         self,
         agent: AgentDef,
@@ -602,6 +949,7 @@ class WorkflowEngine:
         raw: str,
     ) -> str:
         """Render and absolutize one authored directory value.
+
 
         Shared by ``working_dir`` and ``settings_dir`` so the two cannot drift
         apart: the raw value is Jinja-rendered against the per-agent context
@@ -1484,6 +1832,372 @@ class WorkflowEngine:
             },
         )
         return set_output
+
+    async def _run_mcp_step(
+        self,
+        agent: AgentDef,
+        agent_context: dict[str, Any],
+        *,
+        event_fields: Mapping[str, Any] | None = None,
+        allow_interrupt: bool = False,
+    ) -> dict[str, Any]:
+        """Execute an mcp step end-to-end with events and output validation.
+
+        Shared between the main dispatch loop (``event_fields=None``) and
+        parallel / for-each groups (``event_fields`` carries ``group_name`` /
+        ``item_key`` so per-item events can be told apart).
+
+        Lifecycle is strict: the timer starts, ``mcp_started`` is emitted,
+        then ONE ``try`` block covers the runtime checks, the slot-locked
+        connect + tool existence check + invoke, and the ``output:`` schema
+        validation. Failures split into three arms:
+
+        - Authored, value-free errors (unknown server, non-stdio transport,
+          disallowed/missing tool, the cwd check, a per-call timeout) emit
+          ``mcp_failed`` carrying their authored message and propagate
+          verbatim.
+        - ``_McpStepInterrupted`` (only reachable when ``allow_interrupt``)
+          is control flow, not a failure: no ``mcp_failed``, and the
+          main-loop caller routes into the dashboard/CLI pause flow.
+        - Every other exception is REDACTED: raw exception text can carry
+          argument or result values, so events and the raised
+          ``ExecutionError`` carry only a generic message pointing at the
+          private per-run diagnostic file (:meth:`_write_mcp_diagnostic`),
+          the one place the full traceback lands. This arm is deliberately
+          ``BaseException``: a value-bearing ``SystemExit`` from SDK /
+          mcp_auth / connect / renderer code would otherwise bypass the
+          handler and publish the value via ``str(e)`` in
+          ``workflow_failed``.
+
+        The runtime checks mirror the static validator because
+        ``conductor run`` never calls it: the server must be declared in
+        ``runtime.mcp_servers``, be stdio, and allow the tool — plus the
+        tool must actually exist on the connected server, which only a live
+        connection can prove. The whole call runs under the per-server slot
+        lock, serializing concurrent executions against one server process.
+
+        Args:
+            agent: The mcp step definition.
+            agent_context: Render context for ``arguments``.
+            event_fields: Extra fields merged into every ``mcp_*`` payload
+                (group membership / item identity).
+            allow_interrupt: Watch ``self._interrupt_event`` during the
+                slot/connect/call waits and raise ``_McpStepInterrupted``
+                when it fires. Only the main loop passes True — group
+                members mirror LLM group members, which never receive the
+                interrupt signal mid-call either.
+
+        Callers are responsible for storing the returned envelope in context,
+        recording iteration, and evaluating routes.
+        """
+        # Guaranteed by AgentDef.validate_agent_type (config/schema.py) for
+        # type == "mcp": both fields are required and non-empty.
+        assert agent.server is not None
+        assert agent.tool is not None
+        server = agent.server
+        tool = agent.tool
+        extra = dict(event_fields or {})
+
+        iteration = self.limits.get_agent_execution_count(agent.name) + 1
+        start = _time.time()
+        self._emit(
+            "mcp_started",
+            {
+                "agent_name": agent.name,
+                "iteration": iteration,
+                "server": server,
+                "tool": tool,
+                "argument_keys": sorted((agent.arguments or {}).keys()),
+                **extra,
+            },
+        )
+
+        try:
+            # Runtime half of the static validator checks (conductor run
+            # never calls the validator). Unknown server short-circuits so
+            # the allowlist/transport checks don't cascade.
+            mcp_servers = self.config.workflow.runtime.mcp_servers
+            if server not in mcp_servers:
+                available = ", ".join(sorted(mcp_servers)) or "(none)"
+                raise _McpStepRuntimeCheckError(
+                    f"MCP step '{agent.name}' references unknown server "
+                    f"'{server}'. Available servers: {available}",
+                    agent_name=agent.name,
+                )
+            server_def = mcp_servers[server]
+            if server_def.type != "stdio":
+                raise _McpStepRuntimeCheckError(
+                    f"MCP step '{agent.name}': server '{server}' has type "
+                    f"'{server_def.type}'; type: mcp supports stdio servers only "
+                    f"(http/sse support is not implemented yet)",
+                    agent_name=agent.name,
+                )
+            # Wildcard rule mirrors the static validator exactly
+            # (config/validator.py::_validate_mcp_steps): a ``"*"`` MEMBER
+            # means unrestricted, so a mixed list like ["*", "health"] is
+            # accepted here precisely when validate accepts it.
+            if "*" not in server_def.tools and tool not in server_def.tools:
+                raise _McpStepRuntimeCheckError(
+                    f"MCP step '{agent.name}': tool '{tool}' is not enabled on "
+                    f"server '{server}' (enabled tools: {server_def.tools})",
+                    agent_name=agent.name,
+                )
+
+            # Resolve the server process cwd under THIS execution's context,
+            # by the same rules as _resolve_agent_working_dir (render Jinja
+            # -> expanduser -> normpath against the workflow dir -> existence
+            # check). Per-step working_dir is forbidden by the schema, so
+            # only the runtime-level value renders.
+            raw_cwd = self.config.workflow.runtime.working_dir
+            if raw_cwd is None:
+                resolved_cwd = os.path.normpath(
+                    str(self._workflow_dir) if self._workflow_dir is not None else os.getcwd()
+                )
+            else:
+                rendered_cwd = self.renderer.render(raw_cwd, agent_context)
+                cwd_path = Path(rendered_cwd).expanduser()
+                if not cwd_path.is_absolute():
+                    base = self._workflow_dir if self._workflow_dir is not None else Path.cwd()
+                    cwd_path = base / cwd_path
+                resolved_cwd = os.path.normpath(cwd_path)
+                if not Path(resolved_cwd).is_dir():
+                    # Redacted on purpose: resolved_cwd and raw_cwd are
+                    # Jinja-rendered from the execution context and can carry
+                    # values (e.g. "{{ item.secret_path }}"). They land only
+                    # in the private diagnostic file; the propagated message
+                    # names the failure, nothing else.
+                    diag = self._write_mcp_diagnostic(
+                        agent_name=agent.name,
+                        server=server,
+                        tool=tool,
+                        detail=(
+                            f"runtime working_dir does not exist or is not a directory: "
+                            f"resolved={resolved_cwd!r} rendered_from={raw_cwd!r}"
+                        ),
+                    )
+                    raise _McpStepRedactedCheckError(
+                        f"MCP step '{agent.name}': runtime working_dir does not exist "
+                        f"or is not a directory{self._diagnostic_suffix(diag)}",
+                        agent_name=agent.name,
+                    )
+
+            async def _invoke_under_slot() -> dict[str, Any]:
+                async with await self._mcp_step_slot(server):
+                    manager = await self._get_mcp_step_manager(server, resolved_cwd)
+                    # The static validator cannot check this: the tool must
+                    # actually exist on the connected server.
+                    server_tools = {
+                        t.get("original_name") or t.get("name", "")
+                        for t in manager.get_server_tools(server)
+                    }
+                    if tool not in server_tools:
+                        raise _McpStepRuntimeCheckError(
+                            f"MCP step '{agent.name}': tool '{tool}' does not exist "
+                            f"on server '{server}'",
+                            agent_name=agent.name,
+                        )
+                    return await self.mcp_step_executor.execute(agent, agent_context, manager)
+
+            if allow_interrupt and self._interrupt_event is not None:
+                envelope = await self._invoke_mcp_interruptible(agent, _invoke_under_slot())
+            else:
+                envelope = await _invoke_under_slot()
+
+            # `output:` schema validation runs here so the contract holds in
+            # the main loop, parallel groups, and for-each alike (mirrors the
+            # set-step path).
+            if agent.output is not None:
+                validate_output(envelope, agent.output)
+        except (
+            _McpStepRuntimeCheckError,
+            _McpStepRedactedCheckError,
+            McpStepTimeoutError,
+        ) as exc:
+            # Authored, value-free errors: the message is safe to surface as
+            # the event payload AND to propagate verbatim (the timeout keeps
+            # its duration, the name checks keep their literal config names).
+            elapsed = _time.time() - start
+            self._emit(
+                "mcp_failed",
+                {
+                    "agent_name": agent.name,
+                    "elapsed": elapsed,
+                    "server": server,
+                    "tool": tool,
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                    **extra,
+                },
+            )
+            raise
+        except _McpStepInterrupted:
+            # Control flow, not a failure: no mcp_failed. The main-loop
+            # caller routes into the pause flow.
+            raise
+        except (asyncio.CancelledError, GeneratorExit):
+            # Cancellation is not a step failure: re-raise untouched with no
+            # mcp_failed, preserving the engine's cancellation semantics.
+            raise
+        except BaseException as exc:
+            elapsed = _time.time() - start
+            diag = self._write_mcp_diagnostic(
+                agent_name=agent.name, server=server, tool=tool, exc=exc
+            )
+            self._emit(
+                "mcp_failed",
+                {
+                    "agent_name": agent.name,
+                    "elapsed": elapsed,
+                    "server": server,
+                    "tool": tool,
+                    "error_type": type(exc).__name__,
+                    "message": (f"MCP step '{agent.name}' failed{self._diagnostic_suffix(diag)}"),
+                    **extra,
+                },
+            )
+            # Re-raise a generic redacted error so workflow_failed and group
+            # failure events stay value-free. The full exception (including
+            # the connect-time cause chain) is in the diagnostic file.
+            raise ExecutionError(
+                f"MCP step '{agent.name}' failed{self._diagnostic_suffix(diag)}",
+                agent_name=agent.name,
+            ) from None
+        elapsed = _time.time() - start
+
+        content = envelope.get("content")
+        # Truncation markers are trusted here because call_tool_structured
+        # strips server-supplied fields of these names at ingestion — this
+        # envelope came straight from the live call. The synthetic replay
+        # path never republishes stored markers (see _synth_mcp_pair).
+        truncated, spill_path = mcp_truncation_metadata(content)
+        self._emit(
+            "mcp_completed",
+            {
+                "agent_name": agent.name,
+                "elapsed": elapsed,
+                "server": server,
+                "tool": tool,
+                "is_error": envelope.get("is_error", False),
+                "result_bytes": mcp_result_bytes(content, envelope.get("structured")),
+                "truncated": truncated,
+                "spill_path": spill_path,
+                **extra,
+            },
+        )
+        return envelope
+
+    def _mcp_diagnostic_path(self) -> Path:
+        """Return the per-run private diagnostic file for mcp step failures.
+
+        Sits next to the run's JSONL event log (``<stem>.mcp-diagnostics.log``)
+        when the CLI wired one — both ``run`` and ``resume`` always do — and
+        otherwise falls back to the shared ``$TMPDIR/conductor`` directory
+        keyed by run id. This file is the one place raw mcp step exception
+        text lands: events, checkpoints, and raised errors carry redacted
+        messages, and ``--log-file`` never sees them (it mirrors the console,
+        it is not a Python logging sink).
+        """
+        log_file = self._run_context.log_file
+        if log_file:
+            path = Path(log_file)
+            name = path.name
+            events_suffix = ".events.jsonl"
+            if name.endswith(events_suffix):
+                name = name[: -len(events_suffix)]
+            return path.with_name(f"{name}.mcp-diagnostics.log")
+        run_id = self._run_id or f"pid-{os.getpid()}"
+        return Path(tempfile.gettempdir()) / "conductor" / f"{run_id}.mcp-diagnostics.log"
+
+    @staticmethod
+    def _diagnostic_suffix(path: Path | None) -> str:
+        """Render the redacted-message pointer to the diagnostic file."""
+        if path is None:
+            return "; diagnostic file could not be written (see stderr warning)"
+        return f"; full diagnostic: {path}"
+
+    def _write_mcp_diagnostic(
+        self,
+        *,
+        agent_name: str,
+        server: str,
+        tool: str,
+        exc: BaseException | None = None,
+        detail: str | None = None,
+    ) -> Path | None:
+        """Append the full diagnostic for an mcp step failure to the private sink.
+
+        Args:
+            agent_name: The failed step.
+            server: MCP server name (literal config).
+            tool: MCP tool name (literal config).
+            exc: The exception to dump with its full traceback (including the
+                ``__cause__`` chain), mutually exclusive with ``detail``.
+            detail: A precomposed detail string for failures that discarded
+                rendered values before raising (e.g. the cwd existence check),
+                mutually exclusive with ``exc``.
+
+        Returns:
+            The sink path so the redacted public message can point at it, or
+            None when the write itself failed (best-effort — a diagnostics
+            failure must never mask the step failure).
+        """
+        path = self._mcp_diagnostic_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(
+                    f"=== {_time.strftime('%Y-%m-%d %H:%M:%S')} step={agent_name!r} "
+                    f"server={server!r} tool={tool!r} ===\n"
+                )
+                if exc is not None:
+                    fh.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+                elif detail is not None:
+                    fh.write(detail)
+                fh.write("\n")
+        except OSError as write_exc:
+            logger.warning(
+                "Failed to write MCP step diagnostic for '%s': %s", agent_name, write_exc
+            )
+            return None
+        return path
+
+    async def _invoke_mcp_interruptible(
+        self, agent: AgentDef, invocation: Coroutine[Any, Any, dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Race an mcp slot/connect/call invocation against a user Stop.
+
+        When the interrupt wins, the in-flight call is cancelled and drained
+        (re-cancellation-proof, via the shared group-drain helper) and
+        :class:`_McpStepInterrupted` is raised — the call is NEVER auto-
+        replayed, because its external side effects are unknown (the
+        documented at-least-once semantics cover the explicit Resume
+        re-execution, not a transparent retry). The interrupt event itself
+        stays SET for the caller's pause flow to consume. A call that already
+        completed when the interrupt fires returns its result — the between-
+        step interrupt check handles the pending Stop as usual.
+        """
+        assert self._interrupt_event is not None  # guarded by the caller
+        call_task = asyncio.ensure_future(invocation)
+        stop_task = asyncio.ensure_future(self._interrupt_event.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {call_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+        except BaseException:
+            # The engine task itself was cancelled (Kill / teardown): cancel
+            # both arms so neither leaks past this await.
+            stop_task.cancel()
+            await _cancel_and_drain_group_tasks([call_task])
+            with contextlib.suppress(asyncio.CancelledError):
+                await stop_task
+            raise
+        if call_task in done:
+            stop_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stop_task
+            return call_task.result()
+        await _cancel_and_drain_group_tasks([call_task])
+        raise _McpStepInterrupted(agent.name)
 
     def _validate_script_output_schema(
         self,
@@ -2532,6 +3246,9 @@ class WorkflowEngine:
         try:
             result = await self._execute_loop(current_agent_name)
         finally:
+            # Best-effort shutdown of MCP step connections; each close runs
+            # in its own guard so a failing manager cannot mask the run outcome.
+            await self._close_mcp_step_managers()
             # The pricing verdict belongs to the run ending, not to anyone
             # asking for a summary. Drawing it here covers the run that dies
             # part way -- the case where "these numbers came from the static
@@ -2574,6 +3291,7 @@ class WorkflowEngine:
         try:
             result = await self._execute_loop(current_agent_name)
         finally:
+            await self._close_mcp_step_managers()
             # Same reasoning as :meth:`run` -- a resumed run that dies part way
             # is still a run that priced nothing.
             self._warn_if_pricing_hook_silent()
@@ -3686,43 +4404,54 @@ class WorkflowEngine:
                 return current_agent_name
 
     async def _handle_web_pause(
-        self, agent_name: str, partial_output: AgentOutput
+        self, agent_name: str, partial_output: AgentOutput | None
     ) -> WebPauseOutcome:
         """Handle a mid-agent interrupt when the web dashboard is connected.
 
         Emits an ``agent_paused`` event and waits for the user to click
         Resume or Kill in the dashboard, or to submit guidance (issue #400).
-        If all browser clients disconnect while waiting, auto-resumes to
-        avoid hanging the workflow.
+        If all browser clients disconnect while waiting, the wait resolves
+        with ``reason="disconnect"`` (no ``agent_resumed`` is emitted):
+        whether that means auto-resume (the LLM path) or park as a
+        resumable stop (an interrupted ``type: mcp`` call) is the caller's
+        decision.
 
         Args:
             agent_name: The name of the interrupted agent.
             partial_output: The partial output from the interrupted agent.
+                ``None`` for a provider-free step (an interrupted ``type:
+                mcp`` call produces no partial content) — the pause preview
+                is then a fixed placeholder, never step data.
 
         Returns:
             A :class:`WebPauseOutcome`. ``handled=True`` means the pause was
-            resolved here (Resume clicked, guidance submitted, or all clients
-            disconnected) — ``guidance`` carries any submitted text(s), empty
-            for a plain Resume/disconnect. ``handled=False`` covers two
-            distinct cases the caller branches on separately: a dashboard is
-            attached but has no connected clients (auto-resume — there is no
-            one to wait on), or no dashboard is attached at all (fall
+            resolved here, with ``reason`` saying how: ``resume`` / ``guidance``
+            are explicit user decisions, ``disconnect`` means every browser
+            client went away mid-pause (NOT a resume decision — the
+            ``agent_resumed`` event is deliberately not emitted on that arm;
+            the caller emits it only if it actually resumes). ``handled=False``
+            (``reason="unavailable"``) covers two distinct cases the caller
+            branches on separately: a dashboard is attached but has no
+            connected clients, or no dashboard is attached at all (fall
             through to the CLI interactive handler, ``_handle_partial_output``).
 
         Raises:
             InterruptError: If the user chose Kill (``POST /api/kill``).
         """
         if self._web_dashboard is None or not self._web_dashboard.has_connections():
-            return WebPauseOutcome(False, [])
+            return WebPauseOutcome(False, [], reason="unavailable")
 
-        try:
-            # ``ensure_ascii=False`` so the preview shows real non-ASCII
-            # text instead of \uXXXX escapes (issue #356).
-            preview = json.dumps(partial_output.content, indent=2, default=str, ensure_ascii=False)[
-                :500
-            ]
-        except (TypeError, ValueError):
-            preview = str(partial_output.content)[:500]
+        if partial_output is None:
+            preview = "(no partial output available for this step)"
+        else:
+            try:
+                # ``ensure_ascii=False`` so the preview shows real non-ASCII
+                # text instead of \uXXXX escapes (issue #356).
+                preview = json.dumps(
+                    partial_output.content, indent=2, default=str, ensure_ascii=False
+                )[:500]
+            except (TypeError, ValueError):
+                preview = str(partial_output.content)[:500]
 
         self._emit(
             "agent_paused",
@@ -3836,13 +4565,24 @@ class WorkflowEngine:
                 resume_event.clear()
                 self._emit("agent_resumed", {"agent_name": agent_name, "with_guidance": True})
                 logger.info("Agent '%s' resumed with guidance — re-executing", agent_name)
-                return WebPauseOutcome(True, texts)
+                return WebPauseOutcome(True, texts, reason="guidance")
 
-        if disconnect_task in done:
+        if disconnect_task in done and resume_task not in done:
+            # Deliberately NO agent_resumed on this arm: whether the
+            # interrupted work is actually re-executed is the caller's
+            # decision — the LLM path auto-resumes (and emits the event
+            # there), while an interrupted mcp call is parked as a resumable
+            # stop, where a resumed event would be a lie. Disconnecting is
+            # not a resume decision. An explicit Resume click completed in
+            # the same wait batch WINS over the disconnect and takes the
+            # shared resume path below: the user made the decision, the lost
+            # client is incidental.
             logger.info(
-                "All dashboard clients disconnected while '%s' was paused — auto-resuming",
+                "All dashboard clients disconnected while '%s' was paused",
                 agent_name,
             )
+            resume_event.clear()
+            return WebPauseOutcome(True, [], reason="disconnect")
 
         # Clear resume_event after consumption so a stale signal from a
         # double-click or prior API call doesn't skip the next legitimate pause.
@@ -3850,7 +4590,7 @@ class WorkflowEngine:
 
         self._emit("agent_resumed", {"agent_name": agent_name, "with_guidance": False})
         logger.info("Agent '%s' resumed — re-executing", agent_name)
-        return WebPauseOutcome(True, [])
+        return WebPauseOutcome(True, [], reason="resume")
 
     async def _send_guidance_followup(
         self,
@@ -5122,6 +5862,89 @@ class WorkflowEngine:
                                 )
                             continue
 
+                        # Handle mcp steps. Direct tool calls against a server
+                        # from runtime.mcp_servers — no LLM involved. The
+                        # result envelope (with merged structured keys) lands
+                        # in context like set/script outputs, so routing on
+                        # e.g. ``output.is_error`` works unchanged.
+                        if agent.type == "mcp":
+                            try:
+                                mcp_envelope = await self._run_mcp_step(
+                                    agent, agent_context, allow_interrupt=True
+                                )
+                            except _McpStepInterrupted:
+                                # Stop landed mid-call: the call was cancelled
+                                # and is NOT replayed here — its external side
+                                # effects are unknown. The call is re-entered
+                                # from the loop top ONLY on an explicit resume
+                                # decision: a dashboard Resume/guidance, or the
+                                # CLI interrupt menu. When no one can decide
+                                # (every browser disconnected mid-pause, or the
+                                # dashboard has no clients at all) the run
+                                # parks as a resumable stop instead of silently
+                                # repeating a side-effecting call — ``conductor
+                                # resume`` is then the explicit at-least-once
+                                # boundary. Kill unwinds via InterruptError.
+                                pause_outcome = await self._handle_web_pause(agent.name, None)
+                                if pause_outcome.handled:
+                                    if pause_outcome.reason == "disconnect":
+                                        raise _McpStepOutcomeUncertain(agent.name) from None
+                                    # Explicit Resume / guidance (the guidance
+                                    # was applied to context inside
+                                    # _handle_web_pause).
+                                    if self._interrupt_event is not None:
+                                        self._interrupt_event.clear()
+                                    continue
+                                if self._web_dashboard is not None:
+                                    # Dashboard attached but zero clients:
+                                    # park rather than auto-resume (see
+                                    # above) — unlike the LLM branch, whose
+                                    # re-run only costs tokens.
+                                    raise _McpStepOutcomeUncertain(agent.name) from None
+                                # No dashboard: the interrupt flag is still
+                                # set, so the shared check presents the CLI
+                                # interrupt menu and consumes it — every menu
+                                # outcome is an explicit decision.
+                                interrupt_result = await self._check_interrupt(agent.name)
+                                if interrupt_result is not None:
+                                    current_agent_name = await self._handle_interrupt_result(
+                                        interrupt_result, agent.name
+                                    )
+                                continue
+                            self.context.store(agent.name, mcp_envelope)
+                            self.limits.record_execution(agent.name)
+                            self.limits.check_timeout()
+
+                            route_result = self._evaluate_routes(agent, mcp_envelope)
+
+                            self._emit(
+                                "route_taken",
+                                {
+                                    "from_agent": agent.name,
+                                    "to_agent": route_result.target,
+                                },
+                            )
+
+                            if route_result.target == "$end":
+                                result = self._build_final_output(route_result.output_transform)
+                                self._emit(
+                                    "workflow_completed",
+                                    {
+                                        "elapsed": _time.time() - _workflow_start,
+                                        "output": result,
+                                    },
+                                )
+                                return result
+
+                            current_agent_name = route_result.target
+
+                            interrupt_result = await self._check_interrupt(current_agent_name)
+                            if interrupt_result is not None:
+                                current_agent_name = await self._handle_interrupt_result(
+                                    interrupt_result, current_agent_name
+                                )
+                            continue
+
                         # Handle sub-workflow steps
                         if agent.type == "workflow":
                             _sub_start = _time.time()
@@ -5233,6 +6056,16 @@ class WorkflowEngine:
                         if output.partial:
                             pause_outcome = await self._handle_web_pause(agent.name, output)
                             if pause_outcome.handled:
+                                if pause_outcome.reason == "disconnect":
+                                    # _handle_web_pause deliberately emits no
+                                    # agent_resumed on the disconnect arm (an
+                                    # interrupted mcp step is parked, not
+                                    # resumed); the LLM path auto-resumes, so
+                                    # it emits the event here.
+                                    self._emit(
+                                        "agent_resumed",
+                                        {"agent_name": agent.name, "with_guidance": False},
+                                    )
                                 # Web mode: agent paused then resumed. Clear
                                 # interrupt_event to prevent a re-executed agent
                                 # from seeing the stale signal and returning
@@ -6264,6 +7097,34 @@ class WorkflowEngine:
                     )
                     return (agent.name, set_output.value)
 
+                # `mcp` steps are provider-free tool calls; per-server
+                # serialization lives inside _run_mcp_step (slot lock). Like
+                # the set branch above: no `parallel_agent_started` (that
+                # event is LLM-only), and `parallel_agent_completed` carries
+                # no `output` field — the no-values policy for step events.
+                if agent.type == "mcp":
+                    mcp_envelope = await self._run_mcp_step(
+                        agent,
+                        agent_context,
+                        event_fields={"group_name": parallel_group.name},
+                    )
+                    _agent_elapsed = _time.time() - _agent_start
+                    self._emit(
+                        "parallel_agent_completed",
+                        {
+                            "group_name": parallel_group.name,
+                            "agent_name": agent.name,
+                            "elapsed": _agent_elapsed,
+                            "model": "",
+                            "tokens": 0,
+                            "cost_usd": 0.0,
+                            "context_window_used": 0,
+                            "context_window_max": None,
+                            "agent_type": "mcp",
+                        },
+                    )
+                    return (agent.name, mcp_envelope)
+
                 # Resolve working_dir / settings_dir for provider-backed LLM agents against
                 # this agent's own (pre-group snapshot) context. `set` steps
                 # returned above; other types in a parallel group are LLM agents.
@@ -6360,17 +7221,45 @@ class WorkflowEngine:
         parallel_output = ParallelGroupOutput()
 
         if parallel_group.failure_mode == "fail_fast":
-            # Fail immediately on first error
+            # Fail immediately on first error. Tasks are created explicitly so
+            # that on failure the siblings can be cancelled and drained before
+            # propagating: gather() alone leaves them running, and an in-flight
+            # step (e.g. an mcp call) must not outlive the group — it would
+            # race manager cleanup in run()'s finally and emit late events
+            # after the failure.
+            tasks = [asyncio.ensure_future(execute_single_agent(agent)) for agent in agents]
             try:
-                results = await asyncio.gather(
-                    *[execute_single_agent(agent) for agent in agents],
-                    return_exceptions=False,
-                )
+                # Shield the gather: the gathering future re-cascades every
+                # cancel() of this task to the children, and it stays pending
+                # while a cancelled child is still in cleanup — so a second
+                # cancel arriving mid-cleanup would re-cancel the child and
+                # kill its cleanup (_must_cancel). The except arm cancels each
+                # child exactly once instead; shield detaches the cascade.
+                results = await asyncio.shield(asyncio.gather(*tasks, return_exceptions=False))
                 # All succeeded
                 for agent_name, output_content in results:
                     parallel_output.outputs[agent_name] = output_content
 
-            except Exception as e:
+            except BaseException as e:
+                # BaseException, not Exception: a child completing with
+                # CancelledError (a BaseException) propagates out of gather
+                # WITHOUT entering an except-Exception arm, and external
+                # cancellation of this group lands here as CancelledError too
+                # — either way the siblings must be cancelled and drained
+                # before anything propagates, or an in-flight step (e.g. an
+                # mcp call) outlives the group and races manager cleanup in
+                # run()'s finally. The drain is re-cancellation-proof: a
+                # second cancel() arriving mid-drain must not abandon it.
+                await _cancel_and_drain_group_tasks(tasks)
+
+                # Cancellation semantics are preserved by re-raising
+                # non-Exception base exceptions (CancelledError from a child
+                # or from external cancellation, GeneratorExit) unchanged —
+                # converting them to a group failure would defeat the
+                # engine's cancellation handling upstream.
+                if not isinstance(e, Exception):
+                    raise
+
                 # Extract agent name and exception type from wrapped exception
                 agent_name = getattr(e, "_parallel_agent_name", "unknown")
                 exception_type = type(e).__name__
@@ -6742,6 +7631,31 @@ class WorkflowEngine:
                     )
                     return (key, set_output.value)
 
+                # `mcp` steps per item: the item_key is only known here inside
+                # execute_single_item, so it rides event_fields into all three
+                # mcp_* payloads (merged inside _run_mcp_step). No `output`
+                # field on for_each_item_completed — deliberate divergence
+                # from the set branch above: mcp events follow the no-values
+                # policy, the envelope is data for routing, never for events.
+                if for_each_group.agent.type == "mcp":
+                    mcp_envelope = await self._run_mcp_step(
+                        for_each_group.agent,
+                        agent_context,
+                        event_fields={"group_name": for_each_group.name, "item_key": key},
+                    )
+                    _item_elapsed = _time.time() - _item_start
+                    self._emit(
+                        "for_each_item_completed",
+                        {
+                            "group_name": for_each_group.name,
+                            "item_key": key,
+                            "elapsed": _item_elapsed,
+                            "tokens": 0,
+                            "cost_usd": 0.0,
+                        },
+                    )
+                    return (key, mcp_envelope)
+
                 # Qualify the per-iteration agent name so that any verbose
                 # provider-side logging (e.g. CopilotProvider tool/reasoning
                 # lines) can attribute interleaved output to a specific
@@ -6873,15 +7787,22 @@ class WorkflowEngine:
 
             # Execute based on failure mode
             if for_each_group.failure_mode == "fail_fast":
-                # Fail immediately on first error
-                try:
-                    results = await asyncio.gather(
-                        *[
-                            execute_single_item(item, batch_start_idx + i, batch_keys[i])
-                            for i, item in enumerate(batch_items)
-                        ],
-                        return_exceptions=False,
+                # Fail immediately on first error. Explicit tasks + drain for
+                # the same reason as the parallel fail_fast branch: a sibling
+                # item still in flight (e.g. an mcp call) must be cancelled
+                # and awaited before the exception propagates.
+                tasks = [
+                    asyncio.ensure_future(
+                        execute_single_item(item, batch_start_idx + i, batch_keys[i])
                     )
+                    for i, item in enumerate(batch_items)
+                ]
+                try:
+                    # Shield for the same reason as the parallel fail_fast
+                    # branch: a second cancel() of this task mid-cleanup must
+                    # not re-cancel the items through the pending gathering
+                    # future; the except arm cancels each item exactly once.
+                    results = await asyncio.shield(asyncio.gather(*tasks, return_exceptions=False))
                     # All succeeded - store outputs
                     for item_key, output_content in results:
                         if for_each_group.key_by:
@@ -6889,7 +7810,20 @@ class WorkflowEngine:
                         else:
                             for_each_output.outputs.append(output_content)  # type: ignore[union-attr]
 
-                except Exception as e:
+                except BaseException as e:
+                    # Same reasoning as the parallel fail_fast branch: a child
+                    # completing with CancelledError, or external cancellation
+                    # of this group, must still cancel+drain the in-flight
+                    # sibling items before anything propagates. The drain is
+                    # re-cancellation-proof: a second cancel() arriving
+                    # mid-drain must not abandon it.
+                    await _cancel_and_drain_group_tasks(tasks)
+
+                    # Preserve cancellation semantics (see the parallel
+                    # fail_fast branch).
+                    if not isinstance(e, Exception):
+                        raise
+
                     # Extract item key from wrapped exception
                     item_key = getattr(e, "_for_each_item_key", "unknown")
                     exception_type = type(e).__name__

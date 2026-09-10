@@ -10,6 +10,7 @@ This module tests:
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -542,6 +543,44 @@ class TestMCPManagerTaskAffinity:
             await manager.close()
 
         assert environment.exits == environment.entries
+
+    async def test_redacted_connection_error_logs_safe_metadata_only(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Requirement: with redact_errors=True (the deterministic `type: mcp`
+        # step path), a connection failure logs only the safe server name at
+        # ERROR — the raw exception (which can embed server-supplied stderr,
+        # i.e. values the step's no-values policy excludes) must not appear in
+        # the log record or its traceback. The raised RuntimeError still chains
+        # the original exception for the caller's own diagnostic sink.
+        async with _task_affine_manager() as (manager, environment):
+            environment.initialize_error = RuntimeError("server stderr: SECRET_CANARY")
+
+            with pytest.raises(RuntimeError, match="Failed to connect"):
+                await manager.connect_server(name="fs", command="server", redact_errors=True)
+
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(error_records) == 1
+        assert error_records[0].exc_info is None
+        assert "SECRET_CANARY" not in caplog.text
+        # The chained cause survives for the caller's diagnostic sink.
+        assert manager.sessions == {}
+
+    async def test_unredacted_connection_error_keeps_full_log(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Requirement: the default path (providers relying on it elsewhere) is
+        # unchanged — the raw exception text and traceback are logged at ERROR.
+        async with _task_affine_manager() as (manager, environment):
+            environment.initialize_error = RuntimeError("plain failure text")
+
+            with pytest.raises(RuntimeError, match="Failed to connect"):
+                await manager.connect_server(name="fs", command="server")
+
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(error_records) == 1
+        assert "plain failure text" in caplog.text
+        assert error_records[0].exc_info is not None
 
     async def test_cancelled_connection_cleans_up_in_lifecycle_owner_task(self) -> None:
         # Requirement: cancelling a connection cannot orphan its task-affine MCP contexts.

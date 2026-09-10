@@ -946,3 +946,33 @@ describe('buildGraphElements — for_each-of-workflow inline expansion', () => {
     ]);
   });
 });
+
+describe('graph-layout parallel group node types', () => {
+  // Requirement: Parallel group members must inherit their declared step type, not just 'agent' (Finding B).
+  it('assigns correct React Flow node types to parallel group members based on declared type', () => {
+    const { processEvent } = useWorkflowStore.getState();
+    processEvent(event('workflow_started', {
+      name: 'root',
+      agents: [
+        { name: 'mcp_member', type: 'mcp' },
+        { name: 'script_member', type: 'script' }
+      ],
+      routes: [],
+      parallel_groups: [{ name: 'pg1', agents: ['mcp_member', 'script_member'] }],
+      for_each_groups: [],
+      entry_point: 'pg1',
+    }));
+
+    const { nodes } = buildGraphElements(rootBase(), [], new Set());
+    const mcpNode = nodes.find(n => n.id === nodeKey([], 'mcp_member'))!;
+    const scriptNode = nodes.find(n => n.id === nodeKey([], 'script_member'))!;
+    
+    expect(mcpNode).toBeDefined();
+    expect(mcpNode.type).toBe('mcpNode');
+    expect(mcpNode.data.type).toBe('mcp');
+
+    expect(scriptNode).toBeDefined();
+    expect(scriptNode.type).toBe('scriptNode');
+    expect(scriptNode.data.type).toBe('script');
+  });
+});
