@@ -212,6 +212,14 @@ def _dispatch(state: SpanState, event: WorkflowEvent) -> None:
             execution.step_completed(state, event)
         case "script_failed" | "set_failed" | "wait_failed":
             execution.step_failed(state, event)
+        case "mcp_started":
+            execution.mcp_started(state, event)
+        case "mcp_completed":
+            execution.mcp_completed(state, event)
+        case "mcp_failed":
+            execution.mcp_failed(state, event)
+        case "agent_paused":
+            execution.mcp_interrupted(state, event)
         case "agent_validator_start":
             execution.validator_started(state, event)
         case "agent_validator_complete":

@@ -67,6 +67,8 @@ class SpanState:
         self.subworkflow_parents: dict[PathKey, SubworkflowParent] = {}
         self.tool_keys_by_id: dict[ToolKey, SpanKey] = {}
         self.tool_queues: dict[tuple[SpanKey, str], deque[SpanKey]] = {}
+        self.mcp_queues: dict[tuple[PathKey, SpanKey, str, str, str], deque[SpanKey]] = {}
+        self.mcp_agent_queues: dict[tuple[PathKey, str], deque[SpanKey]] = {}
         self._attach_tokens: dict[SpanKey, tuple[Token[Context], asyncio.Task[None] | None]] = {}
         self.run_id: str | None = None
         self.resumed = resumed
@@ -253,6 +255,24 @@ class SpanState:
         )
         return parallel or self.latest_agent(path, agent)
 
+    def mcp_parent(self, event: WorkflowEvent) -> SpanKey | None:
+        """Resolve a deterministic MCP call to its item, group, or workflow parent."""
+        path = event_path(event, "subworkflow_path")
+        group = event_text(event, "group_name")
+        item = self.item_key(
+            path,
+            group,
+            event_text(event, "item_key"),
+            event_number(event, "index"),
+        )
+        if item in self.open_spans:
+            return item
+        if group is not None:
+            parallel = self.group_keys.get((path, "parallel", group))
+            if parallel in self.open_spans:
+                return parallel
+        return self.parent_for_path(path)
+
     def clear_indexes(self) -> None:
         """Clear all run-local identities after terminal cleanup."""
         self.open_spans.clear()
@@ -269,6 +289,8 @@ class SpanState:
         self.subworkflow_parents.clear()
         self.tool_keys_by_id.clear()
         self.tool_queues.clear()
+        self.mcp_queues.clear()
+        self.mcp_agent_queues.clear()
         self.run_id = None
 
     def _detach_if_owner(self, key: SpanKey) -> bool:
@@ -305,6 +327,8 @@ class SpanState:
         self._discard_queue_index(self.agent_keys, key)
         self._discard_queue_index(self.item_keys_by_name, key)
         self._discard_queue_index(self.tool_queues, key)
+        self._discard_queue_index(self.mcp_queues, key)
+        self._discard_queue_index(self.mcp_agent_queues, key)
         for child_path, parent in tuple(self.subworkflow_parents.items()):
             if parent.span_key == key:
                 self.subworkflow_parents.pop(child_path)

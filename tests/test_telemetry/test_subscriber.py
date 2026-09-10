@@ -13,6 +13,9 @@ import pytest
 from conductor.events import WorkflowEvent
 from conductor.telemetry import guards
 from conductor.telemetry.semconv import (
+    CONDUCTOR_MCP_RESULT_BYTES,
+    CONDUCTOR_MCP_SERVER,
+    CONDUCTOR_MCP_TRUNCATED,
     CONDUCTOR_RESUMED,
     CONDUCTOR_STEP_TYPE,
     ERROR_TYPE,
@@ -375,6 +378,365 @@ def test_same_tool_call_id_from_parallel_agents_closes_matching_spans(
     assert len(tools_by_parent) == 2
     assert alpha_tool.end_time == 17_000_000_000
     assert beta_tool.end_time == 16_000_000_000
+
+
+def test_mcp_step_creates_one_tool_span_without_recording_values(
+    tracing: Tracing,
+) -> None:
+    """Requirement: a deterministic MCP step is traced as one value-free tool call."""
+    # Given: a sequential MCP step with metadata that must remain outside telemetry.
+    subscriber = tracing.subscriber
+    subscriber.on_event(_event("workflow_started", 10.0, name="mcp", run_id="run-mcp"))
+
+    # When: the MCP lifecycle completes successfully.
+    subscriber.on_event(
+        _event(
+            "mcp_started",
+            11.0,
+            agent_name="lookup",
+            iteration=2,
+            server="catalog",
+            tool="search",
+            argument_keys=["secret_query"],
+        )
+    )
+    subscriber.on_event(
+        _event(
+            "mcp_completed",
+            12.0,
+            agent_name="lookup",
+            server="catalog",
+            tool="search",
+            is_error=False,
+            result_bytes=42,
+            truncated=True,
+            spill_path="/private/result.txt",
+        )
+    )
+    subscriber.on_event(_event("workflow_completed", 13.0))
+
+    # Then: the call is a direct workflow child with safe MCP metadata only.
+    spans = _spans(tracing.exporter)
+    root = _span(spans, f"{INVOKE_WORKFLOW} mcp")
+    tool = _span(spans, "execute_tool search")
+    assert root.context is not None
+    assert tool.parent is not None
+    assert tool.parent.span_id == root.context.span_id
+    assert tool.start_time == 11_000_000_000
+    assert tool.end_time == 12_000_000_000
+    assert tool.attributes is not None
+    assert tool.attributes[GEN_AI_OPERATION_NAME] == "execute_tool"
+    assert tool.attributes[GEN_AI_AGENT_NAME] == "lookup"
+    assert tool.attributes[GEN_AI_TOOL_NAME] == "search"
+    assert tool.attributes[CONDUCTOR_STEP_TYPE] == "mcp"
+    assert tool.attributes[CONDUCTOR_MCP_SERVER] == "catalog"
+    assert tool.attributes[CONDUCTOR_MCP_RESULT_BYTES] == 42
+    assert tool.attributes[CONDUCTOR_MCP_TRUNCATED] is True
+    assert "argument_keys" not in tool.attributes
+    assert "spill_path" not in tool.attributes
+    assert all(span.name != f"{INVOKE_AGENT} lookup" for span in spans)
+
+
+def test_mcp_steps_in_parallel_close_by_member_identity(
+    tracing: Tracing,
+) -> None:
+    """Requirement: overlapping MCP members remain distinct when completion order reverses."""
+    # Given: two parallel members calling the same server tool.
+    subscriber = tracing.subscriber
+    subscriber.on_event(_event("workflow_started", 10.0, name="mcp", run_id="run-parallel"))
+    subscriber.on_event(_event("parallel_started", 11.0, group_name="workers"))
+    for timestamp, agent in ((12.0, "alpha"), (13.0, "beta")):
+        subscriber.on_event(
+            _event(
+                "mcp_started",
+                timestamp,
+                agent_name=agent,
+                group_name="workers",
+                server="catalog",
+                tool="search",
+            )
+        )
+
+    # When: terminal events arrive in reverse order.
+    subscriber.on_event(
+        _event(
+            "mcp_completed",
+            14.0,
+            agent_name="beta",
+            group_name="workers",
+            server="catalog",
+            tool="search",
+            is_error=False,
+        )
+    )
+    subscriber.on_event(
+        _event(
+            "mcp_completed",
+            15.0,
+            agent_name="alpha",
+            group_name="workers",
+            server="catalog",
+            tool="search",
+            is_error=False,
+        )
+    )
+    subscriber.on_event(_event("parallel_completed", 16.0, group_name="workers"))
+    subscriber.on_event(_event("workflow_completed", 17.0))
+
+    # Then: both tool spans are children of the group and preserve their own end time.
+    spans = _spans(tracing.exporter)
+    group = _span(spans, f"{INVOKE_AGENT} workers")
+    assert group.context is not None
+    tools = [span for span in spans if span.name == "execute_tool search"]
+    assert len(tools) == 2
+    by_agent = {
+        span.attributes[GEN_AI_AGENT_NAME]: span for span in tools if span.attributes is not None
+    }
+    assert by_agent["alpha"].end_time == 15_000_000_000
+    assert by_agent["beta"].end_time == 14_000_000_000
+    assert {span.parent.span_id for span in tools if span.parent is not None} == {
+        group.context.span_id
+    }
+
+
+def test_mcp_tool_error_marks_only_the_tool_span_as_error(
+    tracing: Tracing,
+) -> None:
+    """Requirement: a routed MCP error is visible without failing its workflow span."""
+    # Given: an MCP server returns a protocol-level error envelope.
+    subscriber = tracing.subscriber
+    subscriber.on_event(_event("workflow_started", 10.0, name="mcp", run_id="run-error"))
+    subscriber.on_event(
+        _event(
+            "mcp_started",
+            11.0,
+            agent_name="lookup",
+            server="catalog",
+            tool="search",
+        )
+    )
+
+    # When: the result is routable data and the workflow completes successfully.
+    subscriber.on_event(
+        _event(
+            "mcp_completed",
+            12.0,
+            agent_name="lookup",
+            server="catalog",
+            tool="search",
+            is_error=True,
+        )
+    )
+    subscriber.on_event(_event("workflow_completed", 13.0))
+
+    # Then: only the tool operation reports an error.
+    from opentelemetry.trace import StatusCode
+
+    spans = _spans(tracing.exporter)
+    root = _span(spans, f"{INVOKE_WORKFLOW} mcp")
+    tool = _span(spans, "execute_tool search")
+    assert tool.attributes is not None
+    assert tool.attributes[ERROR_TYPE] == "MCPToolError"
+    assert tool.status.status_code is StatusCode.ERROR
+    assert root.status.status_code is StatusCode.UNSET
+
+
+def test_mcp_failure_closes_the_tool_span_with_redacted_error(
+    tracing: Tracing,
+) -> None:
+    """Requirement: an MCP execution failure records only its safe event message."""
+    # Given: an active deterministic MCP call.
+    subscriber = tracing.subscriber
+    subscriber.on_event(_event("workflow_started", 10.0, name="mcp", run_id="run-failed"))
+    subscriber.on_event(
+        _event(
+            "mcp_started",
+            11.0,
+            agent_name="lookup",
+            server="catalog",
+            tool="search",
+        )
+    )
+
+    # When: the engine emits its redacted MCP and workflow failures.
+    subscriber.on_event(
+        _event(
+            "mcp_failed",
+            12.0,
+            agent_name="lookup",
+            server="catalog",
+            tool="search",
+            error_type="ExecutionError",
+            message="MCP step 'lookup' failed; details: /tmp/diagnostic.log",
+        )
+    )
+    subscriber.on_event(
+        _event(
+            "workflow_failed",
+            13.0,
+            error_type="ExecutionError",
+            message="MCP step 'lookup' failed; details: /tmp/diagnostic.log",
+        )
+    )
+
+    # Then: the tool span carries the bounded event error and no span leaks.
+    from opentelemetry.trace import StatusCode
+
+    tool = _span(_spans(tracing.exporter), "execute_tool search")
+    assert tool.attributes is not None
+    assert tool.attributes[ERROR_TYPE] == "ExecutionError"
+    assert tool.attributes["error.message"] == (
+        "MCP step 'lookup' failed; details: /tmp/diagnostic.log"
+    )
+    assert tool.status.status_code is StatusCode.ERROR
+    assert subscriber._open_spans == {}
+
+
+def test_agent_pause_does_not_close_an_ordinary_agent_span(
+    tracing: Tracing,
+) -> None:
+    """Requirement: MCP interruption handling cannot alter an ordinary LLM span."""
+    # Given: an active provider-backed agent.
+    subscriber = tracing.subscriber
+    subscriber.on_event(_event("workflow_started", 10.0, name="agent", run_id="run-agent"))
+    subscriber.on_event(_event("agent_started", 11.0, agent_name="lookup", iteration=1))
+
+    # When: the dashboard reports a pause with the same agent name.
+    subscriber.on_event(_event("agent_paused", 12.0, agent_name="lookup"))
+
+    # Then: the agent remains open until its own terminal lifecycle event.
+    assert [key[0] for key in subscriber._open_spans] == [
+        f"{INVOKE_WORKFLOW} agent",
+        f"{INVOKE_AGENT} lookup",
+    ]
+    subscriber.on_event(_event("agent_completed", 13.0, agent_name="lookup"))
+    subscriber.on_event(_event("workflow_completed", 14.0))
+    agent = _span(_spans(tracing.exporter), f"{INVOKE_AGENT} lookup")
+    assert agent.end_time == 13_000_000_000
+
+
+def test_for_each_mcp_steps_use_index_to_select_their_item_parent(
+    tracing: Tracing,
+) -> None:
+    """Requirement: duplicate item keys cannot cross-parent concurrent MCP calls."""
+    # Given: two active items with the same display key but distinct indexes.
+    subscriber = tracing.subscriber
+    subscriber.on_event(_event("workflow_started", 10.0, name="mcp", run_id="run-items"))
+    subscriber.on_event(_event("for_each_started", 11.0, group_name="items"))
+    subscriber.on_event(
+        _event("for_each_item_started", 12.0, group_name="items", item_key="same", index=0)
+    )
+    subscriber.on_event(
+        _event("for_each_item_started", 13.0, group_name="items", item_key="same", index=1)
+    )
+    for timestamp, index in ((14.0, 0), (15.0, 1)):
+        subscriber.on_event(
+            _event(
+                "mcp_started",
+                timestamp,
+                agent_name="lookup",
+                group_name="items",
+                item_key="same",
+                index=index,
+                server="catalog",
+                tool="search",
+            )
+        )
+
+    # When: both calls and item envelopes complete independently.
+    for timestamp, index in ((16.0, 1), (17.0, 0)):
+        subscriber.on_event(
+            _event(
+                "mcp_completed",
+                timestamp,
+                agent_name="lookup",
+                group_name="items",
+                item_key="same",
+                index=index,
+                server="catalog",
+                tool="search",
+                is_error=False,
+            )
+        )
+        subscriber.on_event(
+            _event(
+                "for_each_item_completed",
+                timestamp + 0.1,
+                group_name="items",
+                item_key="same",
+                index=index,
+            )
+        )
+    subscriber.on_event(_event("for_each_completed", 18.0, group_name="items"))
+    subscriber.on_event(_event("workflow_completed", 19.0))
+
+    # Then: each tool span belongs to the item identified by its index.
+    spans = _spans(tracing.exporter)
+    item_spans = sorted(
+        (span for span in spans if span.name == f"{INVOKE_AGENT} items[same]"),
+        key=lambda span: span.start_time or 0,
+    )
+    tools = sorted(
+        (span for span in spans if span.name == "execute_tool search"),
+        key=lambda span: span.start_time or 0,
+    )
+    assert len(item_spans) == len(tools) == 2
+    assert all(item.context is not None for item in item_spans)
+    assert all(tool.parent is not None for tool in tools)
+    assert [tool.parent.span_id for tool in tools if tool.parent is not None] == [
+        item.context.span_id for item in item_spans if item.context is not None
+    ]
+
+
+def test_pausing_an_mcp_step_closes_the_interrupted_attempt(
+    tracing: Tracing,
+) -> None:
+    """Requirement: resuming an MCP step starts a new span without leaking the first."""
+    # Given: an in-flight MCP call that is interrupted by a dashboard pause.
+    subscriber = tracing.subscriber
+    subscriber.on_event(_event("workflow_started", 10.0, name="mcp", run_id="run-pause"))
+    subscriber.on_event(
+        _event(
+            "mcp_started",
+            11.0,
+            agent_name="lookup",
+            server="catalog",
+            tool="search",
+        )
+    )
+
+    # When: the user pauses, resumes, and the replacement attempt succeeds.
+    subscriber.on_event(_event("agent_paused", 12.0, agent_name="lookup"))
+    subscriber.on_event(
+        _event(
+            "mcp_started",
+            13.0,
+            agent_name="lookup",
+            server="catalog",
+            tool="search",
+        )
+    )
+    subscriber.on_event(
+        _event(
+            "mcp_completed",
+            14.0,
+            agent_name="lookup",
+            server="catalog",
+            tool="search",
+            is_error=False,
+        )
+    )
+    subscriber.on_event(_event("workflow_completed", 15.0))
+
+    # Then: both attempts end at their own lifecycle boundary.
+    tools = sorted(
+        (span for span in _spans(tracing.exporter) if span.name == "execute_tool search"),
+        key=lambda span: span.start_time or 0,
+    )
+    assert len(tools) == 2
+    assert tools[0].end_time == 12_000_000_000
+    assert tools[1].end_time == 14_000_000_000
+    assert subscriber._open_spans == {}
 
 
 def test_close_attempts_shutdown_when_force_flush_raises(

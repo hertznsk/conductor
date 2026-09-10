@@ -4,13 +4,19 @@ from __future__ import annotations
 
 from collections import deque
 
+from opentelemetry import trace
+
 from conductor.events import WorkflowEvent
 from conductor.providers.capabilities import has_native_otel_spans
 from conductor.telemetry.semconv import (
     CONDUCTOR_GROUP_NAME,
     CONDUCTOR_ITEM_KEY,
     CONDUCTOR_ITERATION,
+    CONDUCTOR_MCP_RESULT_BYTES,
+    CONDUCTOR_MCP_SERVER,
+    CONDUCTOR_MCP_TRUNCATED,
     CONDUCTOR_STEP_TYPE,
+    ERROR_TYPE,
     EXECUTE_TOOL,
     GEN_AI_AGENT_NAME,
     GEN_AI_OPERATION_NAME,
@@ -163,6 +169,84 @@ def step_completed(state: SpanState, event: WorkflowEvent) -> None:
 def step_failed(state: SpanState, event: WorkflowEvent) -> None:
     """Finish a non-provider step as failed."""
     _finish_agent(state, event, failed=True)
+
+
+def mcp_started(state: SpanState, event: WorkflowEvent) -> None:
+    """Start one deterministic MCP tool span under its orchestration parent."""
+    path = event_path(event, "subworkflow_path")
+    parent = state.mcp_parent(event)
+    agent = event_text(event, "agent_name")
+    server = event_text(event, "server")
+    tool = event_text(event, "tool")
+    if parent not in state.open_spans or agent is None or server is None or tool is None:
+        return
+    attributes: dict[str, AttributeValue] = {
+        GEN_AI_OPERATION_NAME: EXECUTE_TOOL,
+        GEN_AI_AGENT_NAME: agent,
+        GEN_AI_TOOL_NAME: tool,
+        GEN_AI_TOOL_TYPE: "function",
+        CONDUCTOR_STEP_TYPE: "mcp",
+        CONDUCTOR_MCP_SERVER: server,
+    }
+    iteration = event_number(event, "iteration")
+    if iteration is not None:
+        attributes[CONDUCTOR_ITERATION] = iteration
+    group = event_text(event, "group_name")
+    if group is not None:
+        attributes[CONDUCTOR_GROUP_NAME] = group
+    item = event_text(event, "item_key")
+    if item is not None:
+        attributes[CONDUCTOR_ITEM_KEY] = item
+    key = state.start(event, f"{EXECUTE_TOOL} {tool}", parent, attributes, attach=False)
+    state.mcp_queues.setdefault((path, parent, agent, server, tool), deque()).append(key)
+    state.mcp_agent_queues.setdefault((path, agent), deque()).append(key)
+
+
+def mcp_completed(state: SpanState, event: WorkflowEvent) -> None:
+    """Finish a deterministic MCP call and retain bounded result metadata."""
+    key = _mcp_key(state, event)
+    if key not in state.open_spans:
+        return
+    span = state.open_spans[key]
+    result_bytes = event_number(event, "result_bytes")
+    if result_bytes is not None:
+        span.set_attribute(CONDUCTOR_MCP_RESULT_BYTES, result_bytes)
+    truncated = event.data.get("truncated")
+    if isinstance(truncated, bool):
+        span.set_attribute(CONDUCTOR_MCP_TRUNCATED, truncated)
+    if event.data.get("is_error") is True:
+        span.set_attribute(ERROR_TYPE, "MCPToolError")
+        span.set_status(trace.Status(trace.StatusCode.ERROR))
+    state.end(key, event)
+
+
+def mcp_failed(state: SpanState, event: WorkflowEvent) -> None:
+    """Finish a deterministic MCP call as an execution failure."""
+    state.end(_mcp_key(state, event), event, failed=True)
+
+
+def mcp_interrupted(state: SpanState, event: WorkflowEvent) -> None:
+    """Close an interrupted MCP attempt before a user can resume the step."""
+    path = event_path(event, "subworkflow_path")
+    agent = event_text(event, "agent_name")
+    queue = state.mcp_agent_queues.get((path, agent)) if agent is not None else None
+    key = next(
+        (candidate for candidate in reversed(queue or ()) if candidate in state.open_spans),
+        None,
+    )
+    state.end(key, event)
+
+
+def _mcp_key(state: SpanState, event: WorkflowEvent) -> SpanKey | None:
+    path = event_path(event, "subworkflow_path")
+    parent = state.mcp_parent(event)
+    agent = event_text(event, "agent_name")
+    server = event_text(event, "server")
+    tool = event_text(event, "tool")
+    if parent is None or agent is None or server is None or tool is None:
+        return None
+    queue = state.mcp_queues.get((path, parent, agent, server, tool))
+    return queue.popleft() if queue else None
 
 
 def validator_started(state: SpanState, event: WorkflowEvent) -> None:
