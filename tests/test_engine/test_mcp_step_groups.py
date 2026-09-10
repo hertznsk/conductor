@@ -694,12 +694,15 @@ class TestMcpInForEach:
         for ev in mcp_started + mcp_completed:
             assert ev.data["group_name"] == "loop"
             assert ev.data["item_key"] in {"0", "1", "2"}
+            assert ev.data["index"] in {0, 1, 2}
         assert {ev.data["item_key"] for ev in mcp_started} == {"0", "1", "2"}
+        assert {ev.data["index"] for ev in mcp_started} == {0, 1, 2}
 
         item_completed = [ev for ev in received if ev.type == "for_each_item_completed"]
         assert len(item_completed) == 3
         for ev in item_completed:
             assert ev.data["item_key"] in {"0", "1", "2"}
+            assert ev.data["index"] in {0, 1, 2}
             assert "output" not in ev.data
 
     @pytest.mark.asyncio

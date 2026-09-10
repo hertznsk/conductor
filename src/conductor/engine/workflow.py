@@ -7700,7 +7700,11 @@ class WorkflowEngine:
                     mcp_envelope = await self._run_mcp_step(
                         for_each_group.agent,
                         agent_context,
-                        event_fields={"group_name": for_each_group.name, "item_key": key},
+                        event_fields={
+                            "group_name": for_each_group.name,
+                            "item_key": key,
+                            "index": index,
+                        },
                     )
                     _item_elapsed = _time.time() - _item_start
                     self._emit(
@@ -7708,6 +7712,7 @@ class WorkflowEngine:
                         {
                             "group_name": for_each_group.name,
                             "item_key": key,
+                            "index": index,
                             "elapsed": _item_elapsed,
                             "tokens": 0,
                             "cost_usd": 0.0,
