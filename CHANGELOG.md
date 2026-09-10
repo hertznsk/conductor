@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   message). See
   [`docs/workflow-syntax.md`](docs/workflow-syntax.md#mcp-steps) and
   [`examples/mcp-step.yaml`](examples/mcp-step.yaml).
+- **OpenTelemetry spans for direct MCP workflow steps**: each `type: mcp`
+  execution is exported as an `execute_tool` span under its workflow, parallel
+  group, or for-each item. Spans include bounded server, tool, result-size, and
+  truncation metadata without recording arguments, result contents, or spill
+  paths, and preserve routed tool errors, execution failures, and interrupted
+  attempts as distinct outcomes.
 
 ## [0.1.37](https://github.com/microsoft/conductor/compare/v0.1.36...v0.1.37) - 2026-09-09
 
