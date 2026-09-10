@@ -26,8 +26,12 @@ CHARS_PER_TOKEN = 4
 # mode, because workflow inputs are the workflow's external interface — set
 # once at startup and present for the lifetime of the run. Per-step agent
 # outputs remain explicitly declared in ``input:`` for traceability, even for
-# local renders.
-_LOCAL_RENDER_AGENT_TYPES = frozenset({"script", "set", "wait", "workflow"})
+# local renders. ``mcp`` joins set/script/wait/workflow because the static
+# validator's explicit-mode warning exclusion covers mcp arguments
+# (``workflow.input.*`` references pass validation), so the runtime context
+# must make those references renderable in every mode — a reference that
+# passes ``conductor validate`` must render at ``conductor run``.
+_LOCAL_RENDER_AGENT_TYPES = frozenset({"script", "set", "wait", "workflow", "mcp"})
 
 
 def estimate_tokens(text: str) -> int:

@@ -28,6 +28,9 @@ export type EventType =
   | 'set_started'
   | 'set_completed'
   | 'set_failed'
+  | 'mcp_started'
+  | 'mcp_completed'
+  | 'mcp_failed'
   | 'gate_presented'
   | 'gate_resolved'
   | 'questions_presented'
@@ -336,6 +339,42 @@ export interface SetFailedData {
   elapsed?: number;
   error_type?: string;
   message?: string;
+}
+
+// --- MCP lifecycle ---
+
+export interface McpStartedData {
+  agent_name: string;
+  iteration?: number;
+  server: string;
+  tool: string;
+  argument_keys: string[];
+  group_name?: string;
+  item_key?: string;
+}
+
+export interface McpCompletedData {
+  agent_name: string;
+  elapsed?: number;
+  server: string;
+  tool: string;
+  is_error: boolean;
+  result_bytes: number;
+  truncated: boolean;
+  spill_path?: string;
+  group_name?: string;
+  item_key?: string;
+}
+
+export interface McpFailedData {
+  agent_name: string;
+  elapsed?: number;
+  server: string;
+  tool: string;
+  error_type?: string;
+  message?: string;
+  group_name?: string;
+  item_key?: string;
 }
 
 // --- Gate events ---

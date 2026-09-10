@@ -1,0 +1,69 @@
+# MCP Step Example
+#
+# Demonstrates `type: mcp` steps that call MCP server tools directly without
+# an LLM. Direct MCP steps run deterministically, cost zero LLM tokens, and
+# capture structured tool outputs and error flags into the workflow context.
+#
+# This workflow:
+#   1. read_project_readme: calls the `read_file` tool on a configured stdio
+#      MCP server (`filesystem`).
+#   2. Routes on `output.is_error` to handle tool errors versus success.
+#   3. On success, inspects the retrieved content in a downstream step.
+#
+# Try it:
+#   uv run conductor run examples/mcp-step.yaml
+#
+# Validate offline:
+#   uv run conductor validate examples/mcp-step.yaml
+
+workflow:
+  name: mcp-step-demo
+  description: "Demonstrates deterministic type: mcp steps calling an MCP server"
+  version: "1.0.0"
+  entry_point: read_project_readme
+
+  runtime:
+    provider: copilot
+    mcp_servers:
+      filesystem:
+        type: stdio
+        command: npx
+        args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
+        tools: ["read_file", "list_directory"]
+
+  limits:
+    max_iterations: 10
+
+agents:
+  - name: read_project_readme
+    type: mcp
+    description: Read the project README file via the filesystem MCP server
+    server: filesystem
+    tool: read_file
+    arguments:
+      path: "README.md"
+    timeout: 30
+    routes:
+      - to: handle_error
+        when: "{{ output.is_error }}"
+      - to: inspect_content
+
+  - name: inspect_content
+    type: script
+    description: Process the file content returned by the MCP step
+    command: python3
+    args: ["-c", "import sys; print('Successfully read file via direct MCP step')"]
+    routes:
+      - to: $end
+
+  - name: handle_error
+    type: script
+    description: Handle tool-reported execution failure
+    command: python3
+    args: ["-c", "import sys; print('MCP tool execution reported an error')"]
+    routes:
+      - to: $end
+
+output:
+  content_blocks: "{{ read_project_readme.output.content }}"
+  is_error: "{{ read_project_readme.output.is_error }}"

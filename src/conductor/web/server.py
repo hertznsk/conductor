@@ -854,25 +854,20 @@ class WebDashboard:
         for name in execution_history:
             output = agent_outputs.get(name, {})
             if name in parallel_groups:
-                started_type, started_data, completed_type, completed_data = self._synth_parallel(
-                    name, parallel_groups[name], output
-                )
+                events = self._synth_parallel(name, parallel_groups[name], output, agent_defs)
             elif name in for_each_groups:
-                started_type, started_data, completed_type, completed_data = self._synth_for_each(
-                    name, output
-                )
+                events = self._synth_for_each(name, for_each_groups[name], output)
             else:
                 started_type, started_data, completed_type, completed_data = (
                     self._synth_agent_or_script(name, agent_defs.get(name), output)
                 )
+                events = [(started_type, started_data), (completed_type, completed_data)]
 
-            self._event_history.append(
-                {"type": started_type, "timestamp": ts, "data": started_data}
-            )
-            self._event_history.append(
-                {"type": completed_type, "timestamp": ts, "data": completed_data}
-            )
-            count += 2
+            for event_type, event_data in events:
+                self._event_history.append(
+                    {"type": event_type, "timestamp": ts, "data": event_data}
+                )
+            count += len(events)
 
         logger.info(
             "Synthesized %d replay events from %d history entries",
@@ -883,36 +878,93 @@ class WebDashboard:
 
     @staticmethod
     def _synth_parallel(
-        name: str, pg: Any, output: Any
-    ) -> tuple[str, dict[str, Any], str, dict[str, Any]]:
-        """Build synthetic (started, completed) event payloads for a parallel group.
+        name: str, pg: Any, output: Any, agent_defs: dict[str, Any]
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """Build synthetic replay events for a parallel group.
 
         The frontend renders ``parallel_completed`` as failed unless
-        ``failure_count === 0`` (workflow-store.ts:1266), so always emit
+        ``failure_count === 0`` (workflow-store.ts), so always emit
         zeros — we can't know the original counts from the restored
         context, but assuming success is the closest match to "the engine
         kept going past this group".
+
+        ``type: mcp`` members need the member step types (``agent_defs``):
+        their saved outputs are full result envelopes, and live execution
+        deliberately never publishes argument/result values — so a replay
+        that dropped them into the aggregate ``parallel_completed.outputs``
+        would expose exactly what the live path excludes. MCP members are
+        instead stripped from the aggregate and replayed as metadata-only
+        ``mcp_started``/``mcp_completed`` pairs (via the shared
+        :meth:`_synth_agent_or_script` shape, tagged with ``group_name``)
+        plus the LLM-less ``parallel_agent_completed`` the live engine
+        emits for them.
         """
         agents = list(getattr(pg, "agents", []) or [])
         output_dict = output if isinstance(output, dict) else {}
-        started_data: dict[str, Any] = {
-            "group_name": name,
-            "agents": agents,
-            "synthetic": True,
-        }
-        completed_data: dict[str, Any] = {
-            "group_name": name,
-            "outputs": output_dict,
-            "success_count": len(agents),
-            "failure_count": 0,
-            "elapsed": 0.0,
-            "synthetic": True,
-        }
-        return "parallel_started", started_data, "parallel_completed", completed_data
+        member_outputs = output_dict.get("outputs")
+        if not isinstance(member_outputs, dict):
+            member_outputs = {}
+        events: list[tuple[str, dict[str, Any]]] = [
+            (
+                "parallel_started",
+                {
+                    "group_name": name,
+                    "agents": agents,
+                    "synthetic": True,
+                },
+            ),
+        ]
+        stripped_outputs: dict[str, Any] = {}
+        for member_name, member_output in member_outputs.items():
+            member_def = agent_defs.get(member_name)
+            if getattr(member_def, "type", None) == "mcp":
+                started_data, completed_data = WebDashboard._synth_mcp_pair(
+                    member_name, member_def, member_output
+                )
+                started_data["group_name"] = name
+                completed_data["group_name"] = name
+                events.append(("mcp_started", started_data))
+                events.append(("mcp_completed", completed_data))
+                # Mirror the live engine's LLM-less member completion (no
+                # `output` field — the no-values policy for step events).
+                events.append(
+                    (
+                        "parallel_agent_completed",
+                        {
+                            "group_name": name,
+                            "agent_name": member_name,
+                            "elapsed": 0.0,
+                            "model": "",
+                            "tokens": 0,
+                            "cost_usd": 0.0,
+                            "context_window_used": 0,
+                            "context_window_max": None,
+                            "agent_type": "mcp",
+                            "synthetic": True,
+                        },
+                    )
+                )
+            else:
+                stripped_outputs[member_name] = member_output
+        aggregate = {**output_dict, "outputs": stripped_outputs}
+        events.append(
+            (
+                "parallel_completed",
+                {
+                    "group_name": name,
+                    "outputs": aggregate,
+                    "success_count": len(agents),
+                    "failure_count": 0,
+                    "elapsed": 0.0,
+                    "synthetic": True,
+                },
+            )
+        )
+        return events
 
     @staticmethod
-    def _synth_for_each(name: str, output: Any) -> tuple[str, dict[str, Any], str, dict[str, Any]]:
-        """Build synthetic (started, completed) event payloads for a for-each group.
+    def _synth_for_each(name: str, fg: Any, output: Any) -> list[tuple[str, dict[str, Any]]]:
+        """Build synthetic replay events for a for-each group.
 
         The engine stores for-each output as
         ``{"outputs": <list-or-dict>, "errors": {...}, "count": N}`` (see
@@ -921,6 +973,14 @@ class WebDashboard:
         when that field is missing. Naïve ``output.get("outputs") or ...``
         would treat an empty list as missing and use the wrapper dict's
         key count (3) as the item count.
+
+        A group whose inline agent is a ``type: mcp`` step stores one full
+        result envelope per item; live execution never publishes those
+        values, so the envelopes are stripped from the aggregate and each
+        item is replayed as the metadata-only event sequence the live
+        engine emits (``for_each_item_started`` -> ``mcp_started`` ->
+        ``mcp_completed`` -> ``for_each_item_completed`` without
+        ``output``).
         """
         output_dict = output if isinstance(output, dict) else {}
         item_count = 0
@@ -928,17 +988,131 @@ class WebDashboard:
             item_count = output_dict["count"]
         elif isinstance(output_dict.get("outputs"), (list, dict)):
             item_count = len(output_dict["outputs"])
-        started_data: dict[str, Any] = {"group_name": name, "synthetic": True}
-        completed_data: dict[str, Any] = {
-            "group_name": name,
-            "outputs": output_dict,
-            "item_count": item_count,
-            "success_count": item_count,
-            "failure_count": 0,
-            "elapsed": 0.0,
+        events: list[tuple[str, dict[str, Any]]] = [
+            ("for_each_started", {"group_name": name, "synthetic": True}),
+        ]
+
+        aggregate = output_dict
+        agent_def = getattr(fg, "agent", None)
+        if getattr(agent_def, "type", None) == "mcp":
+            raw_outputs = output_dict.get("outputs")
+            items: list[tuple[str, int, Any]] = []
+            if isinstance(raw_outputs, dict):
+                items = [
+                    (str(key), index, env) for index, (key, env) in enumerate(raw_outputs.items())
+                ]
+            elif isinstance(raw_outputs, list):
+                items = [(str(index), index, env) for index, env in enumerate(raw_outputs)]
+            for item_key, index, envelope in items:
+                events.append(
+                    (
+                        "for_each_item_started",
+                        {
+                            "group_name": name,
+                            "item_key": item_key,
+                            "index": index,
+                            "synthetic": True,
+                        },
+                    )
+                )
+                started_data, completed_data = WebDashboard._synth_mcp_pair(
+                    getattr(agent_def, "name", name), agent_def, envelope
+                )
+                started_data["group_name"] = name
+                started_data["item_key"] = item_key
+                completed_data["group_name"] = name
+                completed_data["item_key"] = item_key
+                events.append(("mcp_started", started_data))
+                events.append(("mcp_completed", completed_data))
+                # Deliberate divergence from the set-step branch, matching
+                # live: no `output` field on the item completion.
+                events.append(
+                    (
+                        "for_each_item_completed",
+                        {
+                            "group_name": name,
+                            "item_key": item_key,
+                            "elapsed": 0.0,
+                            "tokens": 0,
+                            "cost_usd": 0.0,
+                            "synthetic": True,
+                        },
+                    )
+                )
+            # Strip the per-item envelopes from the aggregate: they are
+            # result values the live event stream deliberately excludes.
+            aggregate = {
+                **output_dict,
+                "outputs": {} if isinstance(raw_outputs, dict) else [],
+            }
+
+        events.append(
+            (
+                "for_each_completed",
+                {
+                    "group_name": name,
+                    "outputs": aggregate,
+                    "item_count": item_count,
+                    "success_count": item_count,
+                    "failure_count": 0,
+                    "elapsed": 0.0,
+                    "synthetic": True,
+                },
+            )
+        )
+        return events
+
+    @staticmethod
+    def _synth_mcp_pair(
+        name: str, agent_def: Any, output: Any
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Build the metadata-only (mcp_started, mcp_completed) data payloads.
+
+        Shared by the standalone branch of :meth:`_synth_agent_or_script`
+        and the group syntheses (which add ``group_name`` / ``item_key``
+        themselves). Mirrors the live runtime's mcp payload shape so
+        synthetic replays render identically to live runs. The result size
+        is measured by the same helper the engine emitter uses.
+
+        Truncation markers are NEVER republished from a stored envelope.
+        ``truncated`` / ``spill_path`` on a content block are trustworthy
+        only on the live path, where
+        :meth:`conductor.mcp.manager.MCPManager.call_tool_structured` strips
+        server-supplied fields of those names at ingestion before its own
+        truncation pass sets them. A checkpoint may have been written before
+        that stripping existed, so a stored ``spill_path`` can be a
+        server-supplied string — republishing it would present
+        server-controlled data as Conductor-generated metadata. Synthetic
+        events therefore report no truncation; the stored envelope itself
+        stays intact in the workflow context for routing and templates.
+        """
+        from conductor.executor.mcp_step import mcp_result_bytes
+
+        server = getattr(agent_def, "server", None)
+        tool = getattr(agent_def, "tool", None)
+        arguments = getattr(agent_def, "arguments", None)
+        output_dict = output if isinstance(output, dict) else {}
+        content = output_dict.get("content")
+        started_data: dict[str, Any] = {
+            "agent_name": name,
+            "iteration": 1,
+            "server": server,
+            "tool": tool,
+            "argument_keys": sorted(arguments.keys()) if isinstance(arguments, dict) else [],
             "synthetic": True,
         }
-        return "for_each_started", started_data, "for_each_completed", completed_data
+        completed_data: dict[str, Any] = {
+            "agent_name": name,
+            "elapsed": 0.0,
+            "server": server,
+            "tool": tool,
+            "is_error": output_dict.get("is_error", False),
+            "result_bytes": mcp_result_bytes(content, output_dict.get("structured")),
+            "truncated": False,
+            "spill_path": None,
+            "synthetic": True,
+        }
+        return started_data, completed_data
 
     @staticmethod
     def _synth_agent_or_script(
@@ -1006,6 +1180,14 @@ class WebDashboard:
                 "synthetic": True,
             }
             return "set_started", started_data, "set_completed", completed_data
+
+        if agent_type == "mcp":
+            # Shared metadata-only shape with the group syntheses — the
+            # result-size measurement and the trusted truncation markers
+            # must not drift between live, standalone replay, and group
+            # replay (see _synth_mcp_pair).
+            started_data, completed_data = WebDashboard._synth_mcp_pair(name, agent_def, output)
+            return "mcp_started", started_data, "mcp_completed", completed_data
 
         started_data = {
             "agent_name": name,

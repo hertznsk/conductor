@@ -277,11 +277,19 @@ class TestStreamEventLog:
                 _event("script_completed", {"agent_name": "e"}),
                 _event("wait_completed", {"agent_name": "f"}),
                 _event("set_completed", {"agent_name": "g"}),
+                _event(
+                    "mcp_completed",
+                    {"agent_name": "g2", "server": "fs", "tool": "read", "result_bytes": 8},
+                ),
                 _event("subworkflow_completed", {"agent_name": "h"}),
                 _event("questions_completed", {"agent_name": "i"}),
                 _event("script_failed", {"agent_name": "j"}),
                 _event("wait_failed", {"agent_name": "k"}),
                 _event("set_failed", {"agent_name": "l"}),
+                _event(
+                    "mcp_failed",
+                    {"agent_name": "l2", "server": "fs", "tool": "read", "error_type": "Error"},
+                ),
                 _event("subworkflow_failed", {"agent_name": "m"}),
                 _event("agent_failed", {"agent_name": "n"}),
                 _event(
@@ -608,6 +616,114 @@ class TestCurrentStep:
                     },
                 ),
                 _event("gate_resolved", {"agent_name": "review", "selected_option": "yes"}),
+            ],
+        )
+        record = _make_record(tmp_path, event_log_path=str(path))
+
+        summary = derive_run_summary(record)
+
+        assert summary.current_step is None
+        assert summary.status == "running"
+
+    def test_mcp_step_closes_via_mcp_completed(self, tmp_path: Path) -> None:
+        """An mcp step opens via the generic `agent_started` (like script/wait/set)
+        and must close via `mcp_completed` — `mcp_started` is NOT an opening
+        event, otherwise one close would leave a second open record behind."""
+        path = tmp_path / "run.events.jsonl"
+        _write_jsonl(
+            path,
+            [
+                _event("agent_started", {"agent_name": "fetch", "agent_type": "mcp"}),
+                _event(
+                    "mcp_started",
+                    {
+                        "agent_name": "fetch",
+                        "iteration": 1,
+                        "server": "filesystem",
+                        "tool": "read_file",
+                        "argument_keys": ["path"],
+                    },
+                ),
+                _event(
+                    "mcp_completed",
+                    {
+                        "agent_name": "fetch",
+                        "elapsed": 0.5,
+                        "server": "filesystem",
+                        "tool": "read_file",
+                        "is_error": False,
+                        "result_bytes": 128,
+                        "truncated": False,
+                    },
+                ),
+            ],
+        )
+        record = _make_record(tmp_path, event_log_path=str(path))
+
+        summary = derive_run_summary(record)
+
+        assert summary.current_step is None
+        assert summary.status == "running"
+
+    def test_mcp_step_closes_via_mcp_failed(self, tmp_path: Path) -> None:
+        """An mcp failure must also close the open step (as a failed one), not
+        leave the step stuck "running" after the workflow has moved on."""
+        path = tmp_path / "run.events.jsonl"
+        _write_jsonl(
+            path,
+            [
+                _event("agent_started", {"agent_name": "fetch", "agent_type": "mcp"}),
+                _event(
+                    "mcp_failed",
+                    {
+                        "agent_name": "fetch",
+                        "elapsed": 0.1,
+                        "server": "filesystem",
+                        "tool": "read_file",
+                        "error_type": "ConnectionError",
+                        "message": "MCP step 'fetch' failed",
+                    },
+                ),
+                _event(
+                    "workflow_failed",
+                    {"agent_name": "fetch", "error_type": "ConnectionError"},
+                ),
+            ],
+        )
+        record = _make_record(tmp_path, event_log_path=str(path))
+
+        summary = derive_run_summary(record)
+
+        assert summary.current_step is None
+        assert summary.status == "failed"
+
+    def test_mcp_step_in_for_each_group_closes_without_residual_open_step(
+        self, tmp_path: Path
+    ) -> None:
+        """An mcp step inside a for_each group emits `mcp_completed` carrying
+        `group_name`/`item_key`; the scanner closes by `agent_name` like any
+        other step-close event, so no residual open step remains."""
+        path = tmp_path / "run.events.jsonl"
+        _write_jsonl(
+            path,
+            [
+                _event("for_each_started", {"group_name": "fanout"}),
+                _event("agent_started", {"agent_name": "fetch", "agent_type": "mcp"}),
+                _event(
+                    "mcp_completed",
+                    {
+                        "agent_name": "fetch",
+                        "elapsed": 0.2,
+                        "server": "filesystem",
+                        "tool": "read_file",
+                        "is_error": False,
+                        "result_bytes": 64,
+                        "truncated": False,
+                        "group_name": "fanout",
+                        "item_key": "a",
+                    },
+                ),
+                _event("for_each_completed", {"group_name": "fanout"}),
             ],
         )
         record = _make_record(tmp_path, event_log_path=str(path))

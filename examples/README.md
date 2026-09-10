@@ -75,6 +75,22 @@ conductor run examples/set-step.yaml \
   --input model=claude-haiku-4.5
 ```
 
+## MCP Step Examples
+
+### mcp-step.yaml
+
+Call an MCP server tool directly without an LLM. Demonstrates:
+
+- `type: mcp` step executing a tool on a configured stdio MCP server
+- Passing Jinja2-templated arguments to the tool
+- Capturing the result envelope (`content`, `structured`, `is_error`) in context
+- Routing conditionally on `output.is_error` to handle tool errors
+- Zero LLM tokens spent on tool execution
+
+```bash
+conductor run examples/mcp-step.yaml
+```
+
 ## Human-in-the-Loop Examples
 
 ### design-review.yaml
@@ -304,6 +320,19 @@ Demonstrates:
 
 ```bash
 conductor run examples/script-step.yaml
+```
+
+### mcp-step.yaml
+
+Direct MCP step with tool execution and `is_error`-based routing. Demonstrates:
+- `type: mcp` agents calling stdio MCP server tools directly
+- Passing Jinja2-templated arguments to the tool
+- Capturing structured content and error flags
+- Routing on `is_error` (`when: "{{ output.is_error }}"`)
+- Passing MCP step output to downstream steps
+
+```bash
+conductor run examples/mcp-step.yaml
 ```
 
 ### script-stdin.yaml

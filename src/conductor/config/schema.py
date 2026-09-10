@@ -17,6 +17,7 @@ from pydantic import (
     Field,
     SecretStr,
     StringConstraints,
+    ValidationInfo,
     ValidatorFunctionWrapHandler,
     field_validator,
     model_serializer,
@@ -1185,6 +1186,10 @@ class AgentDef(BaseModel):
       ``args``, ``env``, ``working_dir``, ``timeout``. Output is always
       ``{stdout, stderr, exit_code}`` with parsed-JSON keys merged on top
       when ``stdout`` is valid JSON.
+    - ``mcp``: Direct MCP tool call (no LLM). Requires ``server`` (a name
+      from ``runtime.mcp_servers``) and ``tool``; supports ``arguments``,
+      ``output``, ``routes``, and ``timeout``. Both ``server`` and ``tool``
+      must be literal — Jinja2 templates are rejected at load time.
     - ``workflow``: Sub-workflow black-box step. Requires ``workflow:``
       (path or registry reference); supports ``input_mapping`` and
       ``max_depth``.
@@ -1214,6 +1219,7 @@ class AgentDef(BaseModel):
         Literal[
             "agent",
             "human_gate",
+            "mcp",
             "questions",
             "script",
             "set",
@@ -1484,7 +1490,31 @@ class AgentDef(BaseModel):
     """
 
     timeout: int | None = None
-    """Per-script timeout in seconds."""
+    """Per-call timeout in seconds (script subprocess or MCP tool call)."""
+
+    server: str | None = None
+    """MCP server name to call (required for ``type='mcp'`` steps).
+
+    Must name a server declared in ``workflow.runtime.mcp_servers``. Never
+    Jinja2-rendered — a template is rejected at load time (see
+    :meth:`validate_mcp_fields_are_literal`), because static validation of
+    the server/tool pair is only possible on literal values.
+    """
+
+    tool: str | None = None
+    """Tool name to invoke on the MCP server (required for ``type='mcp'`` steps).
+
+    Never Jinja2-rendered — a template is rejected at load time for the same
+    reason as :attr:`server`.
+    """
+
+    arguments: dict[str, Any] | None = None
+    """Optional argument mapping passed to the MCP tool (``type='mcp'`` only).
+
+    String values (at any nesting depth) are Jinja2-rendered recursively
+    against the workflow context before the call; other JSON scalars pass
+    through unchanged. ``None`` calls the tool with no arguments.
+    """
 
     duration: str | int | float | None = None
     """Duration to pause for ``type='wait'`` steps.
@@ -1935,6 +1965,24 @@ class AgentDef(BaseModel):
             raise ValueError("timeout must be a positive integer")
         return v
 
+    @field_validator("server", "tool", mode="before")
+    @classmethod
+    def validate_mcp_fields_are_literal(cls, v: Any, info: ValidationInfo) -> Any:
+        """Reject a Jinja2 template in ``server`` / ``tool`` (type: mcp steps).
+
+        Neither field is ever rendered, and static validation of the
+        server/tool pair (declared server exists, tool is on its allowlist)
+        is only possible on literal values — a template would defer that
+        check entirely to runtime.
+        """
+        if isinstance(v, str) and ("{{" in v or "{%" in v):
+            raise ValueError(
+                f"{info.field_name} {v!r} looks like a Jinja2 template, but "
+                f"{info.field_name} is never rendered — static validation of the "
+                f"server/tool pair requires a literal value. Use a static name."
+            )
+        return v
+
     @field_validator("session_key")
     @classmethod
     def validate_session_key_is_literal(cls, v: str | None) -> str | None:
@@ -2050,6 +2098,18 @@ class AgentDef(BaseModel):
                 f"'{self.type or 'agent'}' agents cannot have 'stdin' "
                 "(only 'script' agents support this field)"
             )
+
+        # Fields exclusive to ``type: mcp`` — a standalone guard, like the
+        # terminate/script/questions ones above, so it also covers types with
+        # no branch of their own (the ``mcp`` branch below only rejects
+        # fields, it cannot reject its own required ones on other types).
+        if self.type != "mcp":
+            for field_name in ("server", "tool", "arguments"):
+                if getattr(self, field_name) is not None:
+                    raise ValueError(
+                        f"'{self.type or 'agent'}' agents cannot have '{field_name}' "
+                        "(only 'mcp' agents support this field)"
+                    )
 
         # Fields exclusive to ``type: questions``. A standalone guard, like the
         # terminate/script ones above, so it also covers types with no branch
@@ -2280,6 +2340,94 @@ class AgentDef(BaseModel):
                 raise ValueError("workflow agents cannot have 'working_dir'")
             if self.settings_dir is not None:
                 raise ValueError("workflow agents cannot have 'settings_dir'")
+        elif self.type == "mcp":
+            # Required fields.
+            if not self.server:
+                raise ValueError("mcp agents require 'server'")
+            if not self.tool:
+                raise ValueError("mcp agents require 'tool'")
+            # Field matrix for ``type: mcp`` — every AgentDef field is
+            # accounted for below so future fields cannot silently leak:
+            #   ALLOWED (no check): name, description, type, input, output,
+            #       routes, timeout (per-call seconds — unlike wait/set,
+            #       an MCP call has no other timeout knob), server, tool,
+            #       arguments
+            #   FORBIDDEN (checked here): prompt, system_prompt, provider,
+            #       model, tools, reasoning, context_tier, skills, plugins,
+            #       validator, dialog, sandbox, session_key,
+            #       max_agent_iterations, max_session_seconds, output_mode,
+            #       retry, timeout_seconds, command, args, env, working_dir,
+            #       settings_dir, options, workflow, input_mapping, max_depth,
+            #       value, values, output_type
+            #   COVERED BY STANDALONE GUARDS (no check needed here):
+            #       stdin (script guard above), duration + reason
+            #       (wait/terminate guard at the bottom of this method),
+            #       status + output_template (terminate guard above),
+            #       questions/source/allow_*/abort_route (questions guard
+            #       above), server/tool/arguments on non-mcp types (guard
+            #       above)
+            if self.prompt:
+                raise ValueError("mcp agents cannot have 'prompt'")
+            if self.provider:
+                raise ValueError("mcp agents cannot have 'provider'")
+            if self.model:
+                raise ValueError("mcp agents cannot have 'model'")
+            if self.tools is not None:
+                raise ValueError("mcp agents cannot have 'tools'")
+            if self.system_prompt:
+                raise ValueError("mcp agents cannot have 'system_prompt'")
+            if self.options:
+                raise ValueError("mcp agents cannot have 'options'")
+            if self.command:
+                raise ValueError("mcp agents cannot have 'command'")
+            if self.args:
+                raise ValueError("mcp agents cannot have 'args'")
+            if self.env:
+                raise ValueError("mcp agents cannot have 'env'")
+            if self.working_dir:
+                raise ValueError("mcp agents cannot have 'working_dir'")
+            if self.settings_dir is not None:
+                raise ValueError("mcp agents cannot have 'settings_dir'")
+            if self.workflow:
+                raise ValueError("mcp agents cannot have 'workflow'")
+            if self.input_mapping is not None:
+                raise ValueError("mcp agents cannot have 'input_mapping'")
+            if self.max_depth is not None:
+                raise ValueError("mcp agents cannot have 'max_depth'")
+            if self.max_session_seconds:
+                raise ValueError("mcp agents cannot have 'max_session_seconds'")
+            if self.max_agent_iterations is not None:
+                raise ValueError("mcp agents cannot have 'max_agent_iterations'")
+            if self.session_key is not None:
+                raise ValueError("mcp agents cannot have 'session_key'")
+            if self.retry is not None:
+                raise ValueError("mcp agents cannot have 'retry'")
+            if self.dialog is not None:
+                raise ValueError("mcp agents cannot have 'dialog'")
+            if self.validator is not None:
+                raise ValueError("mcp agents cannot have 'validator'")
+            if self.sandbox is not None:
+                raise ValueError("mcp agents cannot have 'sandbox'")
+            if self.reasoning is not None:
+                raise ValueError("mcp agents cannot have 'reasoning'")
+            if self.context_tier is not None:
+                raise ValueError("mcp agents cannot have 'context_tier'")
+            if self.skills is not None:
+                raise ValueError("mcp agents cannot have 'skills'")
+            if self.plugins is not None:
+                raise ValueError("mcp agents cannot have 'plugins'")
+            if self.timeout_seconds is not None:
+                raise ValueError(
+                    "mcp agents cannot have 'timeout_seconds' (use 'timeout' for mcp call timeouts)"
+                )
+            if self.output_mode is not None:
+                raise ValueError("mcp agents cannot have 'output_mode'")
+            if self.value is not None:
+                raise ValueError("mcp agents cannot have 'value' (only 'set' agents do)")
+            if self.values is not None:
+                raise ValueError("mcp agents cannot have 'values' (only 'set' agents do)")
+            if self.output_type is not None:
+                raise ValueError("mcp agents cannot have 'output_type' (only 'set' agents do)")
         elif self.type == "wait":
             if self.duration is None:
                 raise ValueError("wait agents require 'duration'")

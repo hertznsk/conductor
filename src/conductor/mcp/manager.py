@@ -146,6 +146,7 @@ class MCPManager:
         env: dict[str, str] | None = None,
         timeout: int | None = None,
         cwd: str | None = None,
+        redact_errors: bool = False,
     ) -> list[dict[str, Any]]:
         """Connect to an MCP server and return its tools.
 
@@ -161,6 +162,14 @@ class MCPManager:
             cwd: Working directory for the spawned server process. When None,
                 the server inherits the conductor process's current working
                 directory (pre-pool legacy behavior).
+            redact_errors: When True, a connection failure is logged with
+                safe metadata only (server name; no exception text or
+                traceback — the exception a stdio failure carries can embed
+                server-supplied stderr, which may contain values the caller's
+                redaction policy excludes). The raised ``RuntimeError`` still
+                chains the original exception for the caller's own diagnostic
+                sink. Deterministic ``type: mcp`` steps use this; the default
+                preserves the existing provider-facing logging behavior.
 
         Returns:
             List of tool definitions from this server. Each tool dict contains:
@@ -274,7 +283,14 @@ class MCPManager:
             self._connection_tasks.pop(name, None)
             self._connection_stops.pop(name, None)
             self._discard_server_state(name)
-            logger.error(f"Failed to connect to MCP server '{name}': {exc}", exc_info=exc)
+            if redact_errors:
+                logger.error(
+                    "Failed to connect to MCP server '%s' "
+                    "(details redacted; see the MCP step diagnostic file)",
+                    name,
+                )
+            else:
+                logger.error(f"Failed to connect to MCP server '{name}': {exc}", exc_info=exc)
             raise RuntimeError(f"Failed to connect to MCP server '{name}': {exc}") from exc
 
         logger.info(
@@ -367,6 +383,121 @@ class MCPManager:
         except Exception as e:
             logger.error(f"MCP tool call failed: {prefixed_name}: {e}")
             raise RuntimeError(f"MCP tool call failed: {prefixed_name}: {e}") from e
+
+    async def call_tool_structured(
+        self,
+        server_name: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Call a tool on a named server and return a JSON-safe structured envelope.
+
+        Unlike :meth:`call_tool`, this keeps the result as structured data
+        instead of flattening it to a string, for ``type: mcp`` workflow steps.
+
+        The returned envelope has the shape::
+
+            {"content": [...], "structured": dict | None, "is_error": bool}
+
+        where each entry of ``content`` is a JSON-safe dict produced by
+        ``block.model_dump(mode="json")`` (with a ``{"type", "text"}`` fallback
+        for blocks that are not pydantic models). ``structured`` is read from
+        the ``structuredContent``/``structured_content`` field and is strictly
+        ``dict | None`` — any other shape is a malformed MCP response.
+        ``is_error`` mirrors the result's error flag.
+
+        The per-result text budget (``runtime.tool_output``) applies to TEXT
+        blocks only: when the combined text length exceeds ``max_chars``,
+        blocks are walked in order and each keeps ``min(len(text), remaining)``
+        characters, where ``remaining`` starts at ``max_chars``. Every
+        truncated block gets ``"truncated": true`` and, when spilling is
+        enabled, a ``"spill_path"`` written by :meth:`_spill_full_output`
+        holding that block's FULL original text. ``structured`` is structural
+        data and is NEVER truncated.
+
+        Logging contract: this method emits no log records at all, so argument
+        values, result values, and exception text can never leak into logs.
+
+        Args:
+            server_name: Name of the connected MCP server.
+            tool_name: Tool name as exposed by the server (no server prefix).
+            arguments: Tool input arguments matching the tool's input schema.
+
+        Returns:
+            The envelope described above.
+
+        Raises:
+            ValueError: If the server is unknown.
+            RuntimeError: If the server has no live session, the call fails,
+                or the response carries malformed structured content.
+        """
+        if server_name not in self.sessions:
+            raise ValueError(f"Unknown server: {server_name}")
+        session = self.sessions[server_name]
+        if not session:
+            raise RuntimeError(f"No session for server: {server_name}")
+
+        try:
+            result = await session.call_tool(tool_name, arguments=arguments)
+        except Exception as e:
+            raise RuntimeError(f"MCP tool call failed: {tool_name}: {e}") from e
+
+        content: list[dict[str, Any]] = []
+        for block in result.content or []:
+            try:
+                dumped = block.model_dump(mode="json")
+            except Exception:
+                dumped = {"type": getattr(block, "type", "unknown"), "text": str(block)}
+            # ``truncated`` / ``spill_path`` are Conductor-local metadata
+            # generated by the truncation pass below — a server must not set
+            # them. A forged ``spill_path`` would otherwise be forwarded into
+            # ``mcp_completed`` as trusted metadata (leaking result data the
+            # no-values policy excludes, and breaking the frontend's ``str``
+            # type for that field); strip any server-supplied values here so
+            # live events and checkpoint/replay reads stay trusted.
+            dumped.pop("truncated", None)
+            dumped.pop("spill_path", None)
+            content.append(dumped)
+
+        structured = _mcp_field(result, "structured_content", "structuredContent")
+        if structured is not None and not isinstance(structured, dict):
+            raise RuntimeError(
+                f"MCP tool '{tool_name}' on server '{server_name}' returned malformed "
+                "structured content (expected a dict or null)"
+            )
+
+        if self._tool_output.enabled:
+            max_chars = self._tool_output.max_chars
+            text_total = sum(
+                len(block["text"])
+                for block in content
+                if block.get("type") == "text" and isinstance(block.get("text"), str)
+            )
+            if text_total > max_chars:
+                remaining = max_chars
+                for block in content:
+                    if block.get("type") != "text" or not isinstance(block.get("text"), str):
+                        continue
+                    text = block["text"]
+                    kept = min(len(text), max(remaining, 0))
+                    if kept < len(text):
+                        block["text"] = text[:kept]
+                        block["truncated"] = True
+                        if self._tool_output.spill_to_file:
+                            spill_path = self._spill_full_output(
+                                full_text=text,
+                                server_name=server_name,
+                                original_name=tool_name,
+                            )
+                            if spill_path:
+                                block["spill_path"] = spill_path
+                    remaining -= kept
+
+        return {
+            "content": content,
+            "structured": structured,
+            "is_error": bool(_mcp_field(result, "is_error", "isError")),
+        }
 
     def _maybe_truncate_response(
         self,
