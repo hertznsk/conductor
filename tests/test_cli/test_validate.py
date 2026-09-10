@@ -358,8 +358,15 @@ agents:
         assert "workflow.input.topic" in out
         assert "explicit" in out
 
+    @pytest.mark.parametrize(
+        "endpoint_variable",
+        ["OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"],
+    )
     def test_otlp_endpoint_without_sdk_warns_without_failing_validation(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        endpoint_variable: str,
     ) -> None:
         from io import StringIO
 
@@ -382,7 +389,7 @@ agents:
 """,
         )
         output = StringIO()
-        monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
+        monkeypatch.setenv(endpoint_variable, "http://localhost:4317")
         monkeypatch.setattr("conductor.cli.validate.OTEL_SDK_AVAILABLE", False)
 
         # Given: an OTLP endpoint is configured where the optional SDK is unavailable.
@@ -394,7 +401,7 @@ agents:
         # Then: the configuration remains valid and names the required extra.
         assert is_valid is True
         assert config is not None
-        assert "OTEL_EXPORTER_OTLP_ENDPOINT is set" in output.getvalue()
+        assert "An OTLP endpoint is set" in output.getvalue()
         assert "telemetry" in output.getvalue()
 
     def test_for_loop_var_does_not_block_validation(self, tmp_path: Path) -> None:

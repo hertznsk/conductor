@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import logging
-import os
-from collections.abc import Generator
+from collections.abc import Generator, Iterator
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -220,27 +219,49 @@ def test_otlp_resolution_copies_the_environment_before_reading_values(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Requirement: one run cannot combine OTLP values from two environment states."""
-    # Given: copying the live environment also mutates it immediately afterwards.
-    original = {
-        "OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector-one:4318",
-        "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
-    }
 
-    class MutatingEnvironment(dict[str, str]):
-        def __iter__(self):
-            iterator = super().__iter__()
-            os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = "http://collector-two:4317"
-            os.environ["OTEL_EXPORTER_OTLP_PROTOCOL"] = "grpc"
-            return iterator
+    # Given: a live mapping whose first direct get mutates the protocol.
+    # A resolver reading os.environ fields one by one observes a mixed state;
+    # dict(environment) uses iteration/item access and captures the initial state.
+    class MutatingEnvironment:
+        def __init__(self) -> None:
+            self._values = {
+                "OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector-one:4318",
+                "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+            }
+            self.get_calls = 0
 
-    environment = MutatingEnvironment(original)
-    monkeypatch.setattr(telemetry_setup.os, "environ", environment)
+        def __getitem__(self, key: str) -> str:
+            return self._values[key]
 
-    # When: the resolver captures and resolves one run configuration.
-    config = telemetry_setup._resolve_otlp_config()
+        def __iter__(self) -> Iterator[str]:
+            return iter(self._values)
+
+        def __len__(self) -> int:
+            return len(self._values)
+
+        def keys(self):
+            return self._values.keys()
+
+        def get(self, key: str, default: str = "") -> str:
+            value = self._values.get(key, default)
+            self.get_calls += 1
+            if self.get_calls == 1:
+                self._values["OTEL_EXPORTER_OTLP_PROTOCOL"] = "grpc"
+            return value
+
+    environment = MutatingEnvironment()
+    original_environment = telemetry_setup.os.environ
+    telemetry_setup.os.environ = environment
+    try:
+        # When: the resolver captures and resolves one run configuration.
+        config = telemetry_setup._resolve_otlp_config()
+    finally:
+        telemetry_setup.os.environ = original_environment
 
     # Then: endpoint and protocol both come from the copied initial state.
     assert config is not None
+    assert environment.get_calls == 0
     assert config.protocol == "http/protobuf"
     assert config.exporter_endpoint == "http://collector-one:4318/v1/traces"
 
