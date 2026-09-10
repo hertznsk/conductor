@@ -459,7 +459,7 @@ output:
     assert is_valid is True
     assert config is not None
     output_text = output.getvalue()
-    assert "OTEL_EXPORTER_OTLP_ENDPOINT is set" in output_text
+    assert "An OTLP endpoint is set" in output_text
     assert "telemetry" in output_text
 
 

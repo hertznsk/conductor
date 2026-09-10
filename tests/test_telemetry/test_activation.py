@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Generator
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -209,9 +210,39 @@ def test_trace_specific_otlp_settings_take_precedence(
 
     # Then: the exporter receives the full trace-specific URL and protocol,
     # while Copilot retains the unsuffixed general endpoint.
+    assert config is not None
     assert config.exporter_endpoint == "http://traces:4318/custom"
     assert config.protocol == "http/protobuf"
     assert config.copilot_endpoint == "http://general:4317"
+
+
+def test_otlp_resolution_copies_the_environment_before_reading_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Requirement: one run cannot combine OTLP values from two environment states."""
+    # Given: copying the live environment also mutates it immediately afterwards.
+    original = {
+        "OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector-one:4318",
+        "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+    }
+
+    class MutatingEnvironment(dict[str, str]):
+        def __iter__(self):
+            iterator = super().__iter__()
+            os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = "http://collector-two:4317"
+            os.environ["OTEL_EXPORTER_OTLP_PROTOCOL"] = "grpc"
+            return iterator
+
+    environment = MutatingEnvironment(original)
+    monkeypatch.setattr(telemetry_setup.os, "environ", environment)
+
+    # When: the resolver captures and resolves one run configuration.
+    config = telemetry_setup._resolve_otlp_config()
+
+    # Then: endpoint and protocol both come from the copied initial state.
+    assert config is not None
+    assert config.protocol == "http/protobuf"
+    assert config.exporter_endpoint == "http://collector-one:4318/v1/traces"
 
 
 def test_trace_specific_endpoint_activates_without_general_endpoint(
@@ -265,6 +296,7 @@ def test_http_general_endpoint_gets_the_standard_trace_path(
     config = telemetry_setup._resolve_otlp_config()
 
     # Then: the exporter URL follows the SDK's path-appending rule.
+    assert config is not None
     assert config.exporter_endpoint == expected
 
 
@@ -281,6 +313,7 @@ def test_grpc_trace_specific_endpoint_is_forwarded_verbatim(
     config = telemetry_setup._resolve_otlp_config()
 
     # Then: the gRPC exporter receives the trace-specific endpoint verbatim.
+    assert config is not None
     assert config.exporter_endpoint == "http://traces:4317"
 
 

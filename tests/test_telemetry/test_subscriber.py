@@ -396,15 +396,17 @@ def test_close_attempts_shutdown_when_force_flush_raises(
     shutdown.assert_called_once_with()
 
 
-def test_close_contains_thread_start_failure(
+@pytest.mark.parametrize("method", ["start", "join"])
+def test_close_contains_thread_failure(
     tracing: Tracing,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    method: str,
 ) -> None:
-    """Requirement: thread startup failure cannot escape telemetry cleanup."""
-    # Given: the platform refuses to start the exporter-drain thread.
+    """Requirement: thread lifecycle failure cannot escape telemetry cleanup."""
+    # Given: the platform refuses one exporter-drain thread operation.
     monkeypatch.setattr(
-        "conductor.telemetry.subscriber.threading.Thread.start",
+        f"conductor.telemetry.subscriber.threading.Thread.{method}",
         Mock(side_effect=RuntimeError("thread unavailable")),
     )
     caplog.set_level(logging.WARNING, logger="conductor.telemetry.subscriber")

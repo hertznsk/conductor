@@ -80,11 +80,13 @@ def validate_workflow(
 
 
 def _report_telemetry_sdk(console: MarkupFreeConsole) -> None:
-    if os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip() and not OTEL_SDK_AVAILABLE:
+    endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
+    traces_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "").strip()
+    if (endpoint or traces_endpoint) and not OTEL_SDK_AVAILABLE:
         console.print(
             styled(
-                "  [yellow]⚠[/yellow] OTEL_EXPORTER_OTLP_ENDPOINT is set but the telemetry "
-                "extra is not installed. Install it with: {}",
+                "  [yellow]⚠[/yellow] An OTLP endpoint is set but the telemetry extra is "
+                "not installed. Install it with: {}",
                 install_command("telemetry"),
             )
         )

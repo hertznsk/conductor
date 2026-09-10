@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from importlib import import_module
 from typing import TYPE_CHECKING, Protocol
@@ -91,22 +92,24 @@ def init_tracer_provider(*, run_id: str) -> TracerProvider | None:
     return provider
 
 
-def _resolve_otlp_protocol() -> str:
+def _resolve_otlp_protocol(environment: Mapping[str, str] | None = None) -> str:
     """Resolve the standard OTLP protocol variable to a stable exporter value."""
+    values = environment if environment is not None else dict(os.environ)
     return (
-        os.environ.get("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL")
-        or os.environ.get("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc")
+        values.get("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL")
+        or values.get("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc")
     ).strip().lower() or "grpc"
 
 
 def _resolve_otlp_config() -> _OtlpConfig | None:
     """Capture standard OTLP endpoint and protocol precedence once per run."""
-    general_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
-    traces_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "").strip()
+    environment = dict(os.environ)
+    general_endpoint = environment.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
+    traces_endpoint = environment.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "").strip()
     if not general_endpoint and not traces_endpoint:
         return None
 
-    protocol = _resolve_otlp_protocol()
+    protocol = _resolve_otlp_protocol(environment)
     if traces_endpoint:
         exporter_endpoint = traces_endpoint
     elif protocol == "grpc":
