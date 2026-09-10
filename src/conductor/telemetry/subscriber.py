@@ -102,6 +102,12 @@ class TelemetrySubscriber:
         try:
             if self._tracer_provider is not None:
                 self._drain_provider(self._tracer_provider, run_id)
+        except Exception:  # noqa: BLE001 -- cleanup must honor its never-raises contract.
+            logger.warning(
+                "OpenTelemetry exporter cleanup failed for run %s; some spans may be lost",
+                run_id,
+                exc_info=True,
+            )
         finally:
             guards.reset_telemetry_context()
 

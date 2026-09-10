@@ -47,6 +47,9 @@ class _ProviderRegistry:
     async def get_provider(self, _agent: AgentDef) -> AgentProvider:
         return self._provider
 
+    def provider_type_for(self, agent: AgentDef) -> str:
+        return agent.provider or "copilot"
+
     def get_active_providers(self) -> dict[str, Any]:
         return {}
 

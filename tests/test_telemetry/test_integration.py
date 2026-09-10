@@ -59,7 +59,10 @@ class MockProviderRegistry:
     async def get_provider(self, agent: AgentDef) -> AgentProvider:
         return self.provider
 
-    def provider_settings_for(self, provider_type: str) -> None:
+    def provider_type_for(self, agent: AgentDef) -> str:
+        return agent.provider or "copilot"
+
+    def provider_settings_for(self, provider_type: str) -> Any:
         """The mock provider carries no structured runtime settings."""
         return None
 
@@ -1311,3 +1314,141 @@ output:
     # the delegate span that launched the child.
     assert inner_agent.parent is not None
     assert inner_agent.parent.span_id == child_workflow.get_span_context().span_id
+
+
+@pytest.mark.asyncio
+async def test_nested_subworkflow_uses_inherited_registry_provider_identity(
+    tmp_path, monkeypatch, mock_otlp_exporter
+):
+    """Scenario 14: child events reflect the provider its inherited registry executes."""
+    from conductor.config.schema import (
+        AgentDef,
+        LimitsConfig,
+        ProviderSettings,
+        RouteDef,
+        RuntimeConfig,
+        WorkflowConfig,
+        WorkflowDef,
+    )
+    from conductor.engine.workflow import RunContext, WorkflowEngine
+    from conductor.events import WorkflowEventEmitter
+
+    # Given: the root registry executes Copilot through an external runtime,
+    # while the child workflow declares OpenAI as its own unused default.
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")
+    (tmp_path / "child-provider.yaml").write_text(
+        """\
+workflow:
+  name: child-provider-wf
+  entry_point: inner
+  runtime:
+    provider: openai
+agents:
+  - name: inner
+    model: gpt-4
+    prompt: "Do inner work"
+    output:
+      result:
+        type: string
+    routes:
+      - to: $end
+output:
+  result: "{{ inner.output.result }}"
+""",
+        encoding="utf-8",
+    )
+    config = WorkflowConfig(
+        workflow=WorkflowDef(
+            name="parent-provider-wf",
+            entry_point="delegate",
+            runtime=RuntimeConfig(
+                provider=ProviderSettings(
+                    name="copilot",
+                    runtime_url="http://localhost:9000",
+                )
+            ),
+            limits=LimitsConfig(max_iterations=5),
+        ),
+        agents=[
+            AgentDef(
+                name="delegate",
+                type="workflow",
+                workflow="child-provider.yaml",
+                routes=[RouteDef(to="$end")],
+            )
+        ],
+        output={"result": "{{ delegate.output.result }}"},
+    )
+
+    class ToolProvider(AgentProvider, abstract=True):
+        async def execute(
+            self,
+            agent: AgentDef,
+            context: dict[str, Any],
+            rendered_prompt: str,
+            *,
+            tools: list[str] | None = None,
+            interrupt_signal: asyncio.Event | None = None,
+            event_callback: Callable[[str, dict[str, Any]], None] | None = None,
+            skill_directories: list[str] | None = None,
+            custom_agents: list[dict[str, Any]] | None = None,
+            extra_mcp_servers: dict[str, Any] | None = None,
+            continuation_state: object | None = None,
+        ) -> AgentOutput:
+            if event_callback is not None:
+                event_callback("agent_tool_start", {"tool_name": "lookup"})
+                event_callback("agent_tool_complete", {"tool_name": "lookup"})
+            return AgentOutput(content={"result": "done"}, raw_response=None, model="test")
+
+        async def validate_connection(self) -> bool:
+            return True
+
+        async def close(self) -> None:
+            return None
+
+    class RootRegistry(MockProviderRegistry):
+        def provider_type_for(self, agent: AgentDef) -> str:
+            return agent.provider or "copilot"
+
+        def provider_settings_for(self, provider_type: str) -> ProviderSettings | None:
+            if provider_type == "copilot":
+                return config.workflow.runtime.provider
+            return None
+
+    tracer_provider = init_tracer_provider(run_id="run-provider-identity")
+    assert tracer_provider is not None
+    subscriber = TelemetrySubscriber(tracer_provider)
+    emitter = WorkflowEventEmitter()
+    events: list[WorkflowEvent] = []
+    emitter.subscribe(subscriber.on_event)
+    emitter.subscribe(events.append)
+
+    engine = WorkflowEngine(
+        config,
+        registry=RootRegistry(ToolProvider()),
+        event_emitter=emitter,
+        workflow_path=tmp_path / "parent-provider.yaml",
+        run_context=RunContext(run_id="run-provider-identity"),
+    )
+
+    # When: the child agent executes through the inherited root registry.
+    result = await engine.run({})
+    subscriber.close()
+
+    # Then: its event names Copilot, native spans remain disabled for the
+    # external runtime, and Conductor retains the fallback tool span.
+    assert result == {"result": "done"}
+    inner_started = next(
+        event
+        for event in events
+        if event.type == "agent_started" and event.data.get("agent_name") == "inner"
+    )
+    assert inner_started.data["provider"] == "copilot"
+    assert inner_started.data["native_otel_spans_active"] is False
+    tool_spans = [
+        span
+        for span in mock_otlp_exporter.get_finished_spans()
+        if span.name == "execute_tool lookup"
+    ]
+    assert len(tool_spans) == 1

@@ -2569,34 +2569,39 @@ async def run_workflow_async(
         # dashboard/event-log/file-logging cleanup below from running.
         _remove_run_record_for_current_process_safe()
 
-        # Stop dashboard if it was started. Telemetry cleanup lives in the
-        # finally: a dashboard stop failure must not skip exporter shutdown
-        # and telemetry-state reset.
-        try:
-            if dashboard is not None:
+        if dashboard is not None:
+            try:
                 await dashboard.stop()
-        finally:
-            if telemetry_subscriber is not None:
-                # Spans still open here never saw a terminal workflow event
-                # (interrupt/cancellation escaping the engine) — mark them
-                # failed rather than let them read as clean completions.
-                telemetry_subscriber.close(
-                    failed=terminal_status != "success",
-                    error_type=terminal_error_type,
-                    error_message=terminal_error_message,
-                )
+            except Exception:  # noqa: BLE001 -- teardown must preserve the workflow outcome.
+                logger.warning("Failed to stop dashboard during workflow cleanup", exc_info=True)
+
+        if telemetry_subscriber is not None:
+            # Spans still open here never saw a terminal workflow event
+            # (interrupt/cancellation escaping the engine) — mark them
+            # failed rather than let them read as clean completions.
+            telemetry_subscriber.close(
+                failed=terminal_status != "success",
+                error_type=terminal_error_type,
+                error_message=terminal_error_message,
+            )
 
         # Close JSONL event log and report path
         if event_log_subscriber is not None:
-            event_log_subscriber.close()
-            _verbose_console.print(
-                styled("[dim]Event log written to: {}[/dim]", event_log_subscriber.path)
-            )
+            try:
+                event_log_subscriber.close()
+                _verbose_console.print(
+                    styled("[dim]Event log written to: {}[/dim]", event_log_subscriber.path)
+                )
+            except Exception:  # noqa: BLE001 -- teardown must preserve the workflow outcome.
+                logger.warning("Failed to close workflow event log", exc_info=True)
 
         # Report log file path to stderr and close file logging
         if log_file is not None and _file_console is not None:
             _verbose_console.print(styled("[dim]Log written to: {}[/dim]", log_file))
-        close_file_logging()
+        try:
+            close_file_logging()
+        except Exception:  # noqa: BLE001 -- teardown must preserve the workflow outcome.
+            logger.warning("Failed to close workflow file logging", exc_info=True)
 
 
 def format_routes(routes: list[dict[str, Any]]) -> Text:
@@ -3402,31 +3407,36 @@ async def resume_workflow_async(
         # cleanup below from running.
         _remove_run_record_for_current_process_safe()
 
-        # Stop dashboard if it was started. Telemetry cleanup lives in the
-        # finally: a dashboard stop failure must not skip exporter shutdown
-        # and telemetry-state reset (mirrors run_workflow_async).
-        try:
-            if dashboard is not None:
+        if dashboard is not None:
+            try:
                 await dashboard.stop()
-        finally:
-            if telemetry_subscriber is not None:
-                telemetry_subscriber.close(
-                    failed=terminal_status != "success",
-                    error_type=terminal_error_type,
-                    error_message=terminal_error_message,
-                )
+            except Exception:  # noqa: BLE001 -- teardown must preserve the workflow outcome.
+                logger.warning("Failed to stop dashboard during resume cleanup", exc_info=True)
+
+        if telemetry_subscriber is not None:
+            telemetry_subscriber.close(
+                failed=terminal_status != "success",
+                error_type=terminal_error_type,
+                error_message=terminal_error_message,
+            )
 
         # Close JSONL event log and report path
         if event_log_subscriber is not None:
-            event_log_subscriber.close()
-            _verbose_console.print(
-                styled("[dim]Event log written to: {}[/dim]", event_log_subscriber.path)
-            )
+            try:
+                event_log_subscriber.close()
+                _verbose_console.print(
+                    styled("[dim]Event log written to: {}[/dim]", event_log_subscriber.path)
+                )
+            except Exception:  # noqa: BLE001 -- teardown must preserve the workflow outcome.
+                logger.warning("Failed to close resumed workflow event log", exc_info=True)
 
         # Report log file path to stderr and close file logging
         if log_file is not None and _file_console is not None:
             _verbose_console.print(styled("[dim]Log written to: {}[/dim]", log_file))
-        close_file_logging()
+        try:
+            close_file_logging()
+        except Exception:  # noqa: BLE001 -- teardown must preserve the workflow outcome.
+            logger.warning("Failed to close resumed workflow file logging", exc_info=True)
 
 
 async def _prefetch_plugin_sources(config: Any, workflow_path: Path) -> dict[str, Any]:

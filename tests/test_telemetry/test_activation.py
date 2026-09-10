@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Generator
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -192,6 +192,129 @@ def test_resolve_otlp_protocol_normalizes_environment_value(
 
     # Then: the stable protocol value is selected.
     assert protocol == expected_protocol
+
+
+def test_trace_specific_otlp_settings_take_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Requirement: trace-specific OTLP settings override general settings."""
+    # Given: conflicting general and trace-specific endpoint/protocol values.
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://general:4317")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://traces:4318/custom")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "HTTP/PROTOBUF")
+
+    # When: one immutable run configuration is captured.
+    config = telemetry_setup._resolve_otlp_config()
+
+    # Then: the exporter receives the full trace-specific URL and protocol,
+    # while Copilot retains the unsuffixed general endpoint.
+    assert config.exporter_endpoint == "http://traces:4318/custom"
+    assert config.protocol == "http/protobuf"
+    assert config.copilot_endpoint == "http://general:4317"
+
+
+def test_trace_specific_endpoint_activates_without_general_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Requirement: a standard per-signal endpoint independently enables tracing."""
+    pytest.importorskip("opentelemetry.sdk")
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    # Given: only the standard trace-specific endpoint is configured.
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://traces:4318/custom")
+    captured: list[tuple[str, str]] = []
+
+    def capture_exporter(protocol: str, endpoint: str) -> InMemorySpanExporter:
+        captured.append((protocol, endpoint))
+        return InMemorySpanExporter()
+
+    with patch("conductor.telemetry.setup._create_otlp_exporter", side_effect=capture_exporter):
+        # When: tracing initializes.
+        provider = init_tracer_provider(run_id="run-signal-only")
+
+    # Then: the per-signal URL activates the exporter without becoming a
+    # Copilot general/base endpoint.
+    assert provider is not None
+    assert captured == [("grpc", "http://traces:4318/custom")]
+    assert guards.current_otlp_endpoint() is None
+    provider.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("base_endpoint", "expected"),
+    [
+        ("http://localhost:4318", "http://localhost:4318/v1/traces"),
+        ("http://localhost:4318/", "http://localhost:4318/v1/traces"),
+        ("http://localhost:4318/custom", "http://localhost:4318/custom/v1/traces"),
+    ],
+)
+def test_http_general_endpoint_gets_the_standard_trace_path(
+    monkeypatch: pytest.MonkeyPatch,
+    base_endpoint: str,
+    expected: str,
+) -> None:
+    """Requirement: an HTTP general endpoint gains exactly one trace path."""
+    # Given: no trace-specific override and an HTTP general endpoint.
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", raising=False)
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", base_endpoint)
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")
+
+    # When: the configuration snapshot resolves the signal URL.
+    config = telemetry_setup._resolve_otlp_config()
+
+    # Then: the exporter URL follows the SDK's path-appending rule.
+    assert config.exporter_endpoint == expected
+
+
+def test_grpc_trace_specific_endpoint_is_forwarded_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Requirement: gRPC honors the trace-specific endpoint without rewriting it."""
+    # Given: a trace-specific gRPC endpoint overriding the general endpoint.
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://general:4317")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://traces:4317")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "grpc")
+
+    # When: the configuration snapshot is resolved.
+    config = telemetry_setup._resolve_otlp_config()
+
+    # Then: the gRPC exporter receives the trace-specific endpoint verbatim.
+    assert config.exporter_endpoint == "http://traces:4317"
+
+
+def test_add_span_processor_failure_shuts_down_constructed_processor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Requirement: failure attaching a processor rolls back all owned resources."""
+    pytest.importorskip("opentelemetry.sdk")
+    from opentelemetry.sdk.trace import TracerProvider
+
+    # Given: an exporter and processor are built, but provider attachment fails.
+    exporter = SimpleNamespace(shutdown=Mock())
+    processor = SimpleNamespace(shutdown=Mock())
+    monkeypatch.setattr(
+        TracerProvider,
+        "add_span_processor",
+        Mock(side_effect=RuntimeError("attach failed")),
+    )
+    monkeypatch.setattr(
+        telemetry_setup,
+        "_create_otlp_exporter",
+        Mock(return_value=exporter),
+    )
+    monkeypatch.setattr(
+        "opentelemetry.sdk.trace.export.BatchSpanProcessor",
+        Mock(return_value=processor),
+    )
+
+    # When: provider construction attempts the failing attachment.
+    with pytest.raises(RuntimeError, match="attach failed"):
+        telemetry_setup._build_tracer_provider("run-rollback", "http://collector:4317", "grpc")
+
+    # Then: the unattached processor owns exporter cleanup and is shut down.
+    processor.shutdown.assert_called_once_with()
 
 
 def test_typo_protocol_uses_http_exporter_and_latches_normalized_value(

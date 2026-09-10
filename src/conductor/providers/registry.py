@@ -75,7 +75,7 @@ class ProviderRegistry:
         """Get the default provider type from workflow config."""
         return self._default_provider_type
 
-    def _get_provider_type_for_agent(self, agent: AgentDef) -> ProviderType:
+    def provider_type_for(self, agent: AgentDef) -> ProviderType:
         """Determine which provider type an agent should use.
 
         Args:
@@ -104,7 +104,7 @@ class ProviderRegistry:
         Raises:
             ProviderError: If provider creation fails.
         """
-        provider_type = self._get_provider_type_for_agent(agent)
+        provider_type = self.provider_type_for(agent)
         return await self._get_or_create_provider(provider_type)
 
     async def _get_or_create_provider(self, provider_type: ProviderType) -> AgentProvider:

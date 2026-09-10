@@ -272,8 +272,10 @@ class TestNativeOtelSpansActive:
         inactive-run half of the contract lives in
         ``test_inactive_without_an_active_telemetry_run``.
         """
+        monkeypatch.setattr("conductor.telemetry.guards.is_telemetry_active", lambda: True)
         monkeypatch.setattr(
-            "conductor.telemetry.guards.is_telemetry_active", lambda: True
+            "conductor.telemetry.guards.current_otlp_endpoint",
+            lambda: "http://collector:4318",
         )
 
     @pytest.mark.parametrize(
@@ -404,19 +406,14 @@ class TestNativeOtelSpansActive:
         # Given no telemetry initialized for the run, when even a natively
         # capable provider is evaluated, then it reports inactive rather than
         # answering from static capability alone.
-        monkeypatch.setattr(
-            "conductor.telemetry.guards.is_telemetry_active", lambda: False
-        )
+        monkeypatch.setattr("conductor.telemetry.guards.is_telemetry_active", lambda: False)
         native_capabilities = _stable_capabilities(native_otel_spans=True)
         monkeypatch.setattr(
             "conductor.providers.capabilities.get_capabilities",
             lambda _provider_name: native_capabilities,
         )
 
-        assert (
-            native_otel_spans_active("openai", None, telemetry_protocol="http/protobuf")
-            is False
-        )
+        assert native_otel_spans_active("openai", None, telemetry_protocol="http/protobuf") is False
 
 
 class TestSubclassEnforcement:

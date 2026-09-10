@@ -106,7 +106,7 @@ class TestProviderResolution:
         registry = ProviderRegistry(config)
 
         agent = AgentDef(name="test", prompt="test", provider=None)
-        provider_type = registry._get_provider_type_for_agent(agent)
+        provider_type = registry.provider_type_for(agent)
 
         assert provider_type == "copilot"
 
@@ -116,7 +116,7 @@ class TestProviderResolution:
         registry = ProviderRegistry(config)
 
         agent = AgentDef(name="test", prompt="test", provider="claude")
-        provider_type = registry._get_provider_type_for_agent(agent)
+        provider_type = registry.provider_type_for(agent)
 
         assert provider_type == "claude"
 

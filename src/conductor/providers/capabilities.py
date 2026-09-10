@@ -579,6 +579,8 @@ def native_otel_spans_active(
         return True
     if telemetry_protocol not in {"http/protobuf", "http/json"}:
         return False
+    if guards.current_otlp_endpoint() is None:
+        return False
 
     settings = (
         provider_settings

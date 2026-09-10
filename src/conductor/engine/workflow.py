@@ -2245,6 +2245,12 @@ class WorkflowEngine:
                 return None
         return self._single_provider
 
+    def _provider_name_for(self, agent: AgentDef) -> ProviderName:
+        """Resolve provider identity through the same registry used for execution."""
+        if self._registry is not None:
+            return self._registry.provider_type_for(agent)
+        return agent.provider or self.config.workflow.runtime.provider.name
+
     def _native_otel_spans_active_for(self, provider_name: ProviderName) -> bool:
         """Report native-span availability from the provider actually executing.
 
@@ -4564,9 +4570,7 @@ class WorkflowEngine:
                             if is_llm_agent
                             else agent
                         )
-                        event_provider = (
-                            resolved_agent.provider or self.config.workflow.runtime.provider.name
-                        )
+                        event_provider = self._provider_name_for(resolved_agent)
 
                         # Only an LLM agent has a context window to report, and
                         # asking for one *constructs the provider* — an SDK
@@ -6310,9 +6314,7 @@ class WorkflowEngine:
                 # LLM-only per-member start event: emitted only here (after the
                 # per-agent resolution) so ``working_dir`` is the resolved value;
                 # the pre-context envelope ``parallel_started`` stays unchanged.
-                event_provider = (
-                    resolved_agent.provider or self.config.workflow.runtime.provider.name
-                )
+                event_provider = self._provider_name_for(resolved_agent)
                 self._emit(
                     "parallel_agent_started",
                     {
@@ -6817,9 +6819,7 @@ class WorkflowEngine:
                 # per-item resolution) so ``working_dir`` is the resolved value;
                 # the pre-context envelope ``for_each_item_started`` stays
                 # unchanged.
-                event_provider = (
-                    qualified_agent.provider or self.config.workflow.runtime.provider.name
-                )
+                event_provider = self._provider_name_for(qualified_agent)
                 self._emit(
                     "for_each_agent_started",
                     {

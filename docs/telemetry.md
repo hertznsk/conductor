@@ -103,7 +103,7 @@ To capture native spans from the Copilot CLI, you must configure the exporter to
 
 When content capture is enabled, `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` values of `SPAN_ONLY` and `SPAN_AND_EVENT` collapse to plain content capture in the Copilot CLI spans.
 
-If you connect to an external runtime via `runtime_url`, the operator must start that runtime with `COPILOT_OTEL_ENABLED=true` and `OTEL_EXPORTER_OTLP_ENDPOINT` set in its environment. Trace context still propagates automatically to the external process, ensuring spans parent correctly under Conductor.
+If you connect to an external runtime via `runtime_url`, the operator must instrument that runtime separately with `COPILOT_OTEL_ENABLED=true` and `OTEL_EXPORTER_OTLP_ENDPOINT` set in its environment. Conductor does not configure or export that external process's native spans; trace correlation and parenting depend on the runtime connection supporting W3C trace-context propagation.
 
 ### MCP Tool Spans
 

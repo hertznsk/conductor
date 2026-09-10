@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from importlib import import_module
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from conductor.install_hint import install_command
 from conductor.telemetry import guards
@@ -25,6 +26,21 @@ _host_provider_warning_emitted = False
 _sdk_unavailable_warning_emitted = False
 
 
+@dataclass(frozen=True, slots=True)
+class _OtlpConfig:
+    """Immutable trace-export configuration captured from one environment snapshot."""
+
+    protocol: str
+    exporter_endpoint: str
+    copilot_endpoint: str | None
+
+
+class _ShutdownResource(Protocol):
+    """Conductor-owned telemetry resource with deterministic cleanup."""
+
+    def shutdown(self) -> None: ...
+
+
 def init_tracer_provider(*, run_id: str) -> TracerProvider | None:
     """Create and latch a run-specific tracer provider when OTLP is configured.
 
@@ -32,8 +48,8 @@ def init_tracer_provider(*, run_id: str) -> TracerProvider | None:
     invalid environment configuration leaves the run uninstrumented rather than
     preventing workflow execution.
     """
-    endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
-    if not endpoint or guards.sdk_disabled():
+    config = _resolve_otlp_config()
+    if config is None or guards.sdk_disabled():
         guards.reset_telemetry_context()
         return None
 
@@ -42,10 +58,13 @@ def init_tracer_provider(*, run_id: str) -> TracerProvider | None:
         _warn_sdk_unavailable_once()
         return None
 
-    protocol = _resolve_otlp_protocol()
     provider: TracerProvider | None = None
     try:
-        provider = _build_tracer_provider(run_id, endpoint, protocol)
+        provider = _build_tracer_provider(
+            run_id,
+            config.exporter_endpoint,
+            config.protocol,
+        )
         _install_delegating_global_provider()
     except Exception:  # noqa: BLE001 -- optional tracing must never stop a workflow.
         # Roll back whatever was allocated so a failure after construction
@@ -67,14 +86,38 @@ def init_tracer_provider(*, run_id: str) -> TracerProvider | None:
 
     guards.set_current_tracer_provider(provider)
     guards.set_current_run_id(run_id)
-    guards.set_current_otlp_protocol(protocol)
-    guards.set_current_otlp_endpoint(endpoint)
+    guards.set_current_otlp_protocol(config.protocol)
+    guards.set_current_otlp_endpoint(config.copilot_endpoint)
     return provider
 
 
 def _resolve_otlp_protocol() -> str:
     """Resolve the standard OTLP protocol variable to a stable exporter value."""
-    return os.environ.get("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc").strip().lower() or "grpc"
+    return (
+        os.environ.get("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL")
+        or os.environ.get("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc")
+    ).strip().lower() or "grpc"
+
+
+def _resolve_otlp_config() -> _OtlpConfig | None:
+    """Capture standard OTLP endpoint and protocol precedence once per run."""
+    general_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
+    traces_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "").strip()
+    if not general_endpoint and not traces_endpoint:
+        return None
+
+    protocol = _resolve_otlp_protocol()
+    if traces_endpoint:
+        exporter_endpoint = traces_endpoint
+    elif protocol == "grpc":
+        exporter_endpoint = general_endpoint
+    else:
+        exporter_endpoint = _append_http_traces_path(general_endpoint)
+    return _OtlpConfig(
+        protocol=protocol,
+        exporter_endpoint=exporter_endpoint,
+        copilot_endpoint=general_endpoint or None,
+    )
 
 
 def _build_tracer_provider(run_id: str, endpoint: str, protocol: str) -> TracerProvider:
@@ -99,12 +142,29 @@ def _build_tracer_provider(run_id: str, endpoint: str, protocol: str) -> TracerP
     try:
         exporter = _create_otlp_exporter(protocol, endpoint)
     except Exception:
-        # Keep the failure atomic: a provider whose exporter never got built
-        # must not leak into the caller's success path.
-        provider.shutdown()
+        _rollback_resource(provider, "provider")
         raise
-    provider.add_span_processor(BatchSpanProcessor(exporter))
+    try:
+        processor = BatchSpanProcessor(exporter)
+    except Exception:
+        _rollback_resource(exporter, "exporter")
+        _rollback_resource(provider, "provider")
+        raise
+    try:
+        provider.add_span_processor(processor)
+    except Exception:
+        _rollback_resource(processor, "span processor")
+        _rollback_resource(provider, "provider")
+        raise
     return provider
+
+
+def _rollback_resource(resource: _ShutdownResource, name: str) -> None:
+    """Shut down one Conductor-owned telemetry resource without replacing the root error."""
+    try:
+        resource.shutdown()
+    except Exception:  # noqa: BLE001 -- rollback must preserve the original setup failure.
+        logger.warning("OpenTelemetry %s rollback failed", name, exc_info=True)
 
 
 def _install_delegating_global_provider() -> None:
@@ -150,31 +210,16 @@ def _create_otlp_exporter(protocol: str, endpoint: str) -> SpanExporter:
     """Create the OTLP exporter selected by the captured protocol and endpoint."""
     if protocol == "grpc":
         module_name = "opentelemetry.exporter.otlp.proto.grpc.trace_exporter"
-        exporter_endpoint = endpoint
     else:
         module_name = "opentelemetry.exporter.otlp.proto.http.trace_exporter"
-        exporter_endpoint = _http_traces_endpoint(endpoint)
 
     exporter_module = import_module(module_name)
     return exporter_module.OTLPSpanExporter(
-        endpoint=exporter_endpoint,
+        endpoint=endpoint,
         timeout=_DEFAULT_EXPORT_TIMEOUT_SECONDS,
     )
 
 
-def _http_traces_endpoint(base_endpoint: str) -> str:
-    """Derive the per-signal traces URL from the captured base OTLP endpoint.
-
-    The HTTP exporter uses an explicit ``endpoint=`` constructor argument
-    verbatim — unlike the ``OTEL_EXPORTER_OTLP_ENDPOINT`` environment
-    variable, no ``/v1/traces`` path is appended for it. Passing the
-    documented base URL (``http://localhost:4318``) straight through would
-    post spans to ``/``, which a standard collector rejects. Apply the same
-    path-appending rule the SDK applies to the environment variable here.
-    An explicit ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` is already a
-    per-signal URL and wins when set.
-    """
-    override = os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "").strip()
-    if override:
-        return override
+def _append_http_traces_path(base_endpoint: str) -> str:
+    """Append the standard trace path to a general OTLP/HTTP endpoint."""
     return base_endpoint.rstrip("/") + "/v1/traces"

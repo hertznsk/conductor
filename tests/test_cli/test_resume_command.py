@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -1867,6 +1868,67 @@ class TestResumeWiring:
         subscriber_type.assert_called_once_with(init.return_value, resumed=True)
         assert telemetry_subscriber.on_event in subscribed_callbacks
         telemetry_subscriber.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_dashboard_stop_failure_preserves_resume_error_and_late_cleanup(
+        self, tmp_path: Path
+    ) -> None:
+        """Requirement: resume teardown preserves its primary failure and closes resources."""
+        from conductor.cli.run import resume_workflow_async
+        from conductor.config.loader import load_config
+
+        # Given: resumed execution fails before dashboard shutdown also fails.
+        wf_path = _write_workflow(tmp_path)
+        cp_path = _write_checkpoint(tmp_path, wf_path)
+        config = load_config(wf_path)
+        mock_registry, mock_engine = _make_resume_mocks()
+        mock_engine.resume = AsyncMock(side_effect=RuntimeError("resume boom"))
+
+        dashboard = MagicMock()
+        dashboard.start = AsyncMock()
+        dashboard.stop = AsyncMock(side_effect=RuntimeError("dashboard boom"))
+        dashboard.wait_for_stop = AsyncMock()
+        dashboard.port = 8080
+        dashboard.url = "http://localhost:8080"
+        web_module = MagicMock()
+        web_module.WebDashboard.return_value = dashboard
+
+        event_log = MagicMock()
+        event_log.run_id = "run-resume-cleanup"
+        event_log.path = tmp_path / "run-resume-cleanup.events.jsonl"
+        telemetry = MagicMock()
+
+        with (
+            patch("conductor.cli.run.load_config", return_value=config),
+            patch("conductor.cli.run.ProviderRegistry", return_value=mock_registry),
+            patch("conductor.cli.run.WorkflowEngine", return_value=mock_engine),
+            patch(
+                "conductor.cli.run._build_mcp_servers", new_callable=AsyncMock, return_value=None
+            ),
+            patch(
+                "conductor.cli.run._prefetch_plugin_sources",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
+            patch("conductor.cli.run._write_run_record_for_current_process"),
+            patch("conductor.cli.run._write_terminal_record_for_current_process"),
+            patch("conductor.cli.run._remove_run_record_for_current_process_safe"),
+            patch("conductor.fleet.retention.maybe_prune_event_logs"),
+            patch("conductor.engine.event_log.EventLogSubscriber", return_value=event_log),
+            patch("conductor.telemetry.setup.init_tracer_provider", return_value=MagicMock()),
+            patch("conductor.telemetry.subscriber.TelemetrySubscriber", return_value=telemetry),
+            patch("conductor.cli.run.close_file_logging") as close_logging,
+            patch.dict(sys.modules, {"conductor.web.server": web_module}),
+            pytest.raises(RuntimeError, match="resume boom"),
+        ):
+            # When: the resume command unwinds both failures.
+            await resume_workflow_async(checkpoint_path=cp_path, web=True, no_interactive=True)
+
+        # Then: the resume error remains primary and every later resource closes.
+        dashboard.stop.assert_awaited_once()
+        telemetry.close.assert_called_once()
+        event_log.close.assert_called_once()
+        close_logging.assert_called_once()
 
     def test_metadata_value_with_equals_sign_via_cli(self, tmp_path: Path) -> None:
         """Regression: --metadata key=https://x?a=b must keep the right-hand =."""

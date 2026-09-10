@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Generator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
@@ -393,6 +394,27 @@ def test_close_attempts_shutdown_when_force_flush_raises(
     # Then: shutdown is attempted and the cleanup error remains suppressed.
     force_flush.assert_called_once_with(timeout_millis=5_000)
     shutdown.assert_called_once_with()
+
+
+def test_close_contains_thread_start_failure(
+    tracing: Tracing,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Requirement: thread startup failure cannot escape telemetry cleanup."""
+    # Given: the platform refuses to start the exporter-drain thread.
+    monkeypatch.setattr(
+        "conductor.telemetry.subscriber.threading.Thread.start",
+        Mock(side_effect=RuntimeError("thread unavailable")),
+    )
+    caplog.set_level(logging.WARNING, logger="conductor.telemetry.subscriber")
+
+    # When: subscriber cleanup runs.
+    tracing.subscriber.close()
+
+    # Then: cleanup returns, resets guards, and reports possible trace loss.
+    assert guards.is_telemetry_active() is False
+    assert "exporter cleanup failed" in caplog.text
 
 
 def test_child_workflow_failure_does_not_close_the_parent_run(

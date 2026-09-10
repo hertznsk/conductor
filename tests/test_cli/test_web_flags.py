@@ -731,6 +731,77 @@ class TestDashboardStartupFailure:
         assert telemetry_subscriber.on_event in subscribed_callbacks
         telemetry_subscriber.close.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_dashboard_stop_failure_preserves_workflow_error_and_late_cleanup(self) -> None:
+        """Requirement: cleanup failures cannot replace a workflow failure or skip resources."""
+        from conductor.cli.run import run_workflow_async
+
+        # Given: workflow execution fails, and dashboard shutdown fails afterwards.
+        mock_config = MagicMock()
+        mock_config.workflow.name = "telemetry-cleanup"
+        mock_config.workflow.entry_point = "agent1"
+        mock_config.workflow.runtime.provider = ProviderSettings(name="copilot")
+        mock_config.workflow.cost.show_summary = False
+        mock_config.agents = []
+        mock_config.tools = None
+        mock_config.mcp_servers = []
+
+        mock_engine = MagicMock()
+        mock_engine.run = AsyncMock(side_effect=RuntimeError("workflow boom"))
+        mock_engine._last_checkpoint_path = None
+        mock_engine.get_execution_summary.return_value = {}
+        mock_registry = AsyncMock()
+        mock_registry.__aenter__ = AsyncMock(return_value=mock_registry)
+        mock_registry.__aexit__ = AsyncMock(return_value=False)
+
+        dashboard = MagicMock()
+        dashboard.start = AsyncMock()
+        dashboard.stop = AsyncMock(side_effect=RuntimeError("dashboard boom"))
+        dashboard.wait_for_stop = AsyncMock()
+        dashboard.port = 8080
+        dashboard.url = "http://localhost:8080"
+        web_module = MagicMock()
+        web_module.WebDashboard.return_value = dashboard
+
+        event_log = MagicMock()
+        event_log.run_id = "run-cleanup"
+        event_log.path = Path("/tmp/run-cleanup.events.jsonl")
+        telemetry = MagicMock()
+
+        with (
+            patch("conductor.cli.run.load_config", return_value=mock_config),
+            patch("conductor.cli.run.ProviderRegistry", return_value=mock_registry),
+            patch("conductor.cli.run.WorkflowEngine", return_value=mock_engine),
+            patch(
+                "conductor.cli.run._build_mcp_servers", new_callable=AsyncMock, return_value=None
+            ),
+            patch(
+                "conductor.cli.run._prefetch_plugin_sources",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
+            patch("conductor.cli.run._write_run_record_for_current_process"),
+            patch("conductor.cli.run._write_terminal_record_for_current_process"),
+            patch("conductor.cli.run._remove_run_record_for_current_process_safe"),
+            patch("conductor.fleet.retention.maybe_prune_event_logs"),
+            patch("conductor.engine.event_log.EventLogSubscriber", return_value=event_log),
+            patch("conductor.telemetry.setup.init_tracer_provider", return_value=MagicMock()),
+            patch("conductor.telemetry.subscriber.TelemetrySubscriber", return_value=telemetry),
+            patch("conductor.cli.run.close_file_logging") as close_logging,
+            patch.dict(sys.modules, {"conductor.web.server": web_module}),
+            patch("sys.stdin") as mock_stdin,
+            pytest.raises(RuntimeError, match="workflow boom"),
+        ):
+            # When: the CLI run unwinds both failures.
+            mock_stdin.isatty.return_value = False
+            await run_workflow_async(Path("/tmp/telemetry-cleanup.yaml"), {}, web=True)
+
+        # Then: the workflow error remains primary and every later resource closes.
+        dashboard.stop.assert_awaited_once()
+        telemetry.close.assert_called_once()
+        event_log.close.assert_called_once()
+        close_logging.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # --web-bg + human_gate validation (external-workflow-friction Item 4)
