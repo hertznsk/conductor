@@ -1929,6 +1929,7 @@ def _validate_template_references(
 # Provider capability cross-checks (issue #241)
 # ---------------------------------------------------------------------------
 
+
 def _is_llm_agent(agent: StepDef) -> TypeGuard[AgentDef]:
     return isinstance(agent, AgentDef)
 

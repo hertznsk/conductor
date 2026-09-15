@@ -329,9 +329,7 @@ class TestSessionKeyExample:
         from conductor.config.schema import AgentDef
 
         config = load_config(self._workflow_file)
-        keys = {
-            a.name: a.session_key if isinstance(a, AgentDef) else None for a in config.agents
-        }
+        keys = {a.name: a.session_key if isinstance(a, AgentDef) else None for a in config.agents}
 
         assert keys["investigate"] == keys["summarize"] == "investigation"
         # A script step has no provider session; the schema rejects a key there.

@@ -422,9 +422,7 @@ def _build_plan_tree(config: WorkflowConfig) -> dict[str, Any]:
             {
                 "name": agent.name,
                 "type": agent.type,
-                "routes": _route_dicts(agent.routes)
-                if isinstance(agent, RoutableStepBase)
-                else [],
+                "routes": _route_dicts(agent.routes) if isinstance(agent, RoutableStepBase) else [],
             }
         )
     for group in config.parallel:

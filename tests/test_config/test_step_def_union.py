@@ -203,9 +203,7 @@ agents:
     def test_unknown_type_is_union_tag_invalid(self) -> None:
         # Requirement: an unrecognized discriminator is a schema error, not a guess.
         with pytest.raises(PydanticValidationError) as exc_info:
-            WorkflowConfig.model_validate(
-                _workflow_payload([{"name": "x", "type": "bogus"}])
-            )
+            WorkflowConfig.model_validate(_workflow_payload([{"name": "x", "type": "bogus"}]))
 
         assert any(e["type"] == "union_tag_invalid" for e in exc_info.value.errors())
 
@@ -222,9 +220,7 @@ class TestSerializationRoundTrip:
                 prompt="Pick",
                 options=[{"label": "Yes", "value": "yes", "route": "$end"}],
             ),
-            QuestionsStepDef(
-                name="ask", questions=[{"id": "q1", "text": "Why?"}]
-            ),
+            QuestionsStepDef(name="ask", questions=[{"id": "q1", "text": "Why?"}]),
             ScriptStepDef(name="run", command="echo hi"),
             MCPStepDef(name="call", server="docs", tool="search"),
             WaitStepDef(name="pause", duration="1s"),

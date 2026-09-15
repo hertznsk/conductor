@@ -18,15 +18,12 @@ from conductor.config.schema import (
 )
 
 
-def _assert_extra_forbidden(
-    exc_info: pytest.ExceptionInfo[ValidationError], field: str
-) -> None:
+def _assert_extra_forbidden(exc_info: pytest.ExceptionInfo[ValidationError], field: str) -> None:
     """Since issue #517 a sibling-variant field is rejected by the concrete
     step model's ``extra="forbid"``, not by a custom message — so assert the
     standard ``extra_forbidden`` error structurally."""
     assert any(
-        e["loc"] == (field,) and e["type"] == "extra_forbidden"
-        for e in exc_info.value.errors()
+        e["loc"] == (field,) and e["type"] == "extra_forbidden" for e in exc_info.value.errors()
     )
 
 

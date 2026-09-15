@@ -2411,8 +2411,7 @@ async def run_workflow_async(
 
         # Check if workflow uses multiple providers (has per-agent provider overrides)
         uses_multi_provider = any(
-            isinstance(agent, AgentDef) and agent.provider is not None
-            for agent in config.agents
+            isinstance(agent, AgentDef) and agent.provider is not None for agent in config.agents
         )
 
         if uses_multi_provider:

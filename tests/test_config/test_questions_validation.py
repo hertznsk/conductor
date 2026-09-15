@@ -31,8 +31,7 @@ def _questions(**kwargs) -> QuestionsStepDef:
 def _assert_extra_forbidden(exc_info: pytest.ExceptionInfo, field: str) -> None:
     """The step-model split rejects foreign fields with a plain extra_forbidden."""
     assert any(
-        e["loc"] == (field,) and e["type"] == "extra_forbidden"
-        for e in exc_info.value.errors()
+        e["loc"] == (field,) and e["type"] == "extra_forbidden" for e in exc_info.value.errors()
     )
 
 
