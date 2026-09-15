@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from conductor.config.schema import (
     AgentDef,
@@ -20,6 +20,7 @@ from conductor.config.schema import (
     RuntimeConfig,
     ScriptStepDef,
     SetStepDef,
+    StepDef,
     TerminateStepDef,
     ToolOutputConfig,
     ValidatorConfig,
@@ -28,6 +29,8 @@ from conductor.config.schema import (
     WorkflowDef,
     WorkflowStepDef,
 )
+
+_STEP_DEF_ADAPTER = TypeAdapter(StepDef)
 
 
 def _assert_extra_forbidden(exc_info: pytest.ExceptionInfo[ValidationError], field: str) -> None:
@@ -2524,14 +2527,14 @@ class TestTerminateAgent:
     def test_terminate_fields_rejected_on_other_step_types(
         self, step_type: str, forbidden_field: str, field_value: object
     ) -> None:
-        """The terminate-only-fields guard must trip for every non-terminate type
-        and every terminate-exclusive field — not just `status`.
+        """The terminate-only fields must trip on every non-terminate variant.
 
-        Earlier iteration of this test only varied ``step_type`` and asserted on
-        ``status``. A bug in ``validate_agent_type`` that, say, rejected only
-        ``status`` on ``script`` agents but silently accepted ``reason`` and
-        ``output_template`` would have slipped through. Cross-product the
-        parametrisation so every (step_type, terminate-field) pair is exercised.
+        Validated through the ``StepDef`` union so the concrete variant — not
+        the LLM ``AgentDef`` — is what rejects the foreign field. The baseline
+        payload is asserted valid first: without that, the rejection below
+        could be caused by the variant simply not recognizing the payload at
+        all, and would keep passing even if the variant started accepting
+        terminate-only fields tomorrow.
         """
         payload: dict[str, object] = {"name": "a", "type": step_type}
         if step_type == "script":
@@ -2540,11 +2543,18 @@ class TestTerminateAgent:
             payload["workflow"] = "./sub.yaml"
         elif step_type == "human_gate":
             payload["prompt"] = "Pick"
-            payload["options"] = [GateOption(value="x", label="X", route="$end")]
+            payload["options"] = [{"value": "x", "label": "X", "route": "$end"}]
+
+        _STEP_DEF_ADAPTER.validate_python(payload)
+
         payload[forbidden_field] = field_value
         with pytest.raises(ValidationError) as exc_info:
-            AgentDef.model_validate(payload)
-        assert forbidden_field in str(exc_info.value)
+            _STEP_DEF_ADAPTER.validate_python(payload)
+        errors = exc_info.value.errors()
+        assert any(
+            err["type"] == "extra_forbidden" and err["loc"] == (step_type, forbidden_field)
+            for err in errors
+        ), f"Expected extra_forbidden at ({step_type!r}, {forbidden_field!r}), got: {errors}"
 
     def test_input_allowed_on_terminate(self) -> None:
         """Terminate steps may declare context inputs to drive Jinja rendering."""
