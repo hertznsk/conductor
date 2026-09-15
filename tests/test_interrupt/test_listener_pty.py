@@ -212,6 +212,88 @@ async def test_double_start_same_instance_does_not_corrupt_baseline() -> None:
         )
 
 
+async def test_listener_restore_targets_original_terminal_after_stdin_swap() -> None:
+    """Requirement: suspend()/stop() restore the terminal the listener captured,
+    not whatever ``sys.stdin`` points at later (issue #290, review follow-up).
+
+    A provider, gate, or embedding host replacing stdin mid-run must not cause
+    the listener to write the captured baseline into the replacement terminal.
+    """
+    with _replace_stdin_with_pty():
+        # Give the first terminal a distinguishable baseline (ECHO off) so a
+        # restore misdirected at the second terminal is observable.
+        attrs = termios.tcgetattr(0)
+        attrs[3] &= ~termios.ECHO
+        termios.tcsetattr(0, termios.TCSANOW, attrs)
+
+        listener = KeyboardListener(interrupt_event=asyncio.Event())
+        await listener.start()
+        assert listener._task is not None
+
+        with _replace_stdin_with_pty():
+            # sys.stdin and fd 0 now point at a DIFFERENT pty with default
+            # flags (ECHO on). It must survive suspend() and stop() untouched.
+            baseline_b = _tty_flags()
+            assert baseline_b & termios.ECHO
+
+            await listener.suspend()
+            assert _tty_flags() == baseline_b
+
+            await listener.stop()
+            assert _tty_flags() == baseline_b, (
+                f"replacement terminal was overwritten by the captured baseline: "
+                f"{_tty_flags():#x} != {baseline_b:#x}"
+            )
+
+
+async def test_failed_restore_does_not_leak_baseline_into_other_terminal() -> None:
+    """Requirement: a retained baseline is only ever applied to its own terminal.
+
+    A failed final restore keeps the cached baseline for retry. A later
+    invocation attached to a DIFFERENT terminal must neither reuse that
+    baseline nor apply it — the new terminal's own settings are captured
+    instead (issue #290, review follow-up).
+    """
+    with _replace_stdin_with_pty():
+        # Give the first terminal a distinguishable baseline (ECHO off) so a
+        # leaked baseline is observable on the second terminal (ECHO on).
+        attrs = termios.tcgetattr(0)
+        attrs[3] &= ~termios.ECHO
+        termios.tcsetattr(0, termios.TCSANOW, attrs)
+
+        listener = KeyboardListener(interrupt_event=asyncio.Event())
+        await listener.start()
+        await listener.stop()
+
+        # Force the final restore to fail with a real termios.error so the
+        # first terminal's baseline is retained for retry.
+        from unittest.mock import patch
+
+        with patch.object(
+            termios, "tcsetattr", side_effect=termios.error("simulated restore failure")
+        ):
+            restore_terminal_baseline(clear=True)
+
+    with _replace_stdin_with_pty():
+        # A fresh pty has default flags (ECHO on). A leaked first-terminal
+        # baseline would turn ECHO off here.
+        baseline_b = _tty_flags()
+        assert baseline_b & termios.ECHO
+
+        listener_b = KeyboardListener(interrupt_event=asyncio.Event())
+        try:
+            await listener_b.start()
+            await listener_b.stop()
+            restore_terminal_baseline(clear=True)
+        finally:
+            restore_terminal_baseline(clear=True)
+
+        assert _tty_flags() == baseline_b, (
+            f"second terminal's flags were overwritten by the first terminal's "
+            f"retained baseline: {_tty_flags():#x} != {baseline_b:#x}"
+        )
+
+
 async def test_process_baseline_restores_late_teardown_change() -> None:
     """Requirement: final cleanup repairs TTY changes made after listener.stop()."""
     with _replace_stdin_with_pty():

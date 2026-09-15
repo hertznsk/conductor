@@ -9,9 +9,9 @@ into an ``asyncio.Queue`` via ``loop.call_soon_threadsafe``. This avoids
 thread leaks from abandoned ``run_in_executor`` futures.
 
 Terminal safety (issue #290): the original tty settings are captured once per
-process into the module-level ``_captured_baseline_settings`` cache so a second
-listener never re-captures cbreak state as "original", and the SIGTERM cleanup
-handler restores the terminal before delegating to the previous disposition.
+process into the module-level ``_captured_baseline`` cache so a second listener
+never re-captures cbreak state as "original", and the SIGTERM cleanup handler
+restores the terminal before delegating to the previous disposition.
 """
 
 from __future__ import annotations
@@ -37,31 +37,88 @@ _CTRL_G_BYTE = 0x07
 # Timeout for disambiguating bare Esc from escape sequences (seconds)
 _ESC_DISAMBIGUATE_TIMEOUT = 0.05
 
-_captured_baseline_settings: Any = None
+
+@dataclass(frozen=True)
+class _TerminalBaseline:
+    """Process-wide tty baseline plus the identity of the terminal it came from.
+
+    ``fd`` is an owned duplicate of the capture-time stdin descriptor. Holding
+    it open pins the terminal (a pts index cannot be recycled while the
+    descriptor is held) and lets the restore paths target the original
+    terminal even when ``sys.stdin`` has since been replaced or closed.
+    """
+
+    settings: Any
+    """Snapshot returned by ``termios.tcgetattr`` before the first cbreak."""
+
+    fd: int
+    """Owned duplicate of the descriptor the baseline was captured from."""
+
+    identity: tuple[int, int]
+    """``(st_dev, st_ino)`` of the capture-time terminal, for reuse checks."""
+
+
+_captured_baseline: _TerminalBaseline | None = None
 """Process-wide tty baseline captured on the FIRST successful start().
 
 Subsequent KeyboardListener instances reuse this baseline so a second
-listener never re-captures cbreak state as "original". The outer CLI cleanup
-retires it after every teardown step has finished, so a later invocation in
-the same process cannot apply stale settings to a new terminal. Tests also
-reset it via a fixture. See issue #290."""
+listener never re-captures cbreak state as "original" — but only while they
+are attached to the SAME terminal; a different terminal gets its own baseline
+rather than inheriting (or being overwritten with) a stale one. The outer CLI
+cleanup retires it after every teardown step has finished. Tests also reset
+it via a fixture. See issue #290."""
+
+
+def _try_import_termios() -> Any:
+    """Return the ``termios`` module, or ``None`` where it is unavailable."""
+    try:
+        import termios
+    except ImportError:
+        return None
+    return termios
+
+
+def _terminal_identity(fd: int) -> tuple[int, int]:
+    """Return the ``(st_dev, st_ino)`` pair identifying the terminal on ``fd``."""
+    stat = os.fstat(fd)
+    return (stat.st_dev, stat.st_ino)
+
+
+def _retire_cached_baseline() -> None:
+    """Discard the cached baseline, closing its owned descriptor."""
+    global _captured_baseline
+
+    if _captured_baseline is not None:
+        with contextlib.suppress(OSError):
+            os.close(_captured_baseline.fd)
+        _captured_baseline = None
 
 
 def restore_terminal_baseline(*, clear: bool = False) -> None:
-    """Restore the process-wide TTY baseline and optionally retire it."""
-    global _captured_baseline_settings
+    """Restore the process-wide TTY baseline and optionally retire it.
 
-    if _captured_baseline_settings is None:
+    Restores through the baseline's owned descriptor rather than the current
+    ``sys.stdin`` so the settings reach the terminal they were captured from.
+    Never raises: this runs inside ``finally`` blocks and ``atexit``, where an
+    escaping error would overwrite the workflow's own result or exception —
+    and ``termios.error`` is not an ``OSError`` subclass (issue #290).
+    """
+    baseline = _captured_baseline
+    if baseline is None:
+        return
+
+    termios = _try_import_termios()
+    if termios is None:
         return
 
     try:
-        import termios
+        termios.tcsetattr(baseline.fd, termios.TCSANOW, baseline.settings)
+    except (termios.error, ValueError, OSError):
+        # Keep the baseline so a later atexit/SIGTERM/stop() attempt retries.
+        return
 
-        termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, _captured_baseline_settings)
-        if clear:
-            _captured_baseline_settings = None
-    except (ImportError, ValueError, OSError):
-        pass
+    if clear:
+        _retire_cached_baseline()
 
 
 @dataclass
@@ -93,6 +150,13 @@ class KeyboardListener:
 
     _original_settings: Any = field(default=None, repr=False)
     """Saved terminal settings for restoration."""
+
+    _terminal_fd: int | None = field(default=None, repr=False)
+    """Owned duplicate of the capture-time stdin descriptor.
+
+    Restore paths target this descriptor rather than the current ``sys.stdin``
+    so the settings always reach the terminal they were captured from, even
+    if ``sys.stdin`` has since been replaced (issue #290)."""
 
     _task: asyncio.Task[None] | None = field(default=None, repr=False)
     """The asyncio task running the listen loop."""
@@ -142,7 +206,7 @@ class KeyboardListener:
         # re-snapshot an already-cbreak terminal as its "original" state, so
         # the baseline is captured once per process into a module-level cache
         # (issue #290).
-        global _captured_baseline_settings
+        global _captured_baseline
 
         # Idempotent guard: a start() on a truly-active listener (baseline
         # held AND reader thread running) is a no-op so it cannot overwrite
@@ -152,23 +216,46 @@ class KeyboardListener:
             logger.debug("Keyboard listener already active, start() is a no-op")
             return
 
+        created_baseline = False
         try:
-            if _captured_baseline_settings is not None:
-                # Reuse the process-wide pre-listener baseline.
-                self._original_settings = _captured_baseline_settings
+            stdin_fd = sys.stdin.fileno()
+            identity = _terminal_identity(stdin_fd)
+            if _captured_baseline is not None and _captured_baseline.identity == identity:
+                # Same terminal: reuse the process-wide pre-listener baseline.
+                self._original_settings = _captured_baseline.settings
             else:
-                self._original_settings = termios.tcgetattr(sys.stdin.fileno())
-                _captured_baseline_settings = self._original_settings
-        except termios.error:
+                # A different terminal must not inherit another terminal's
+                # baseline: retire the stale one and capture fresh (issue #290).
+                _retire_cached_baseline()
+                self._original_settings = termios.tcgetattr(stdin_fd)
+                _captured_baseline = _TerminalBaseline(
+                    settings=self._original_settings,
+                    fd=os.dup(stdin_fd),
+                    identity=identity,
+                )
+                created_baseline = True
+                # This listener's owned descriptor still targets the previous
+                # terminal — re-target it before capturing the new one below.
+                self._close_terminal_fd()
+            if self._terminal_fd is None:
+                self._terminal_fd = os.dup(stdin_fd)
+        except (termios.error, ValueError, OSError):
             logger.debug("Failed to get terminal settings, listener not started")
+            self._original_settings = None
+            self._close_terminal_fd()
+            if created_baseline:
+                _retire_cached_baseline()
             return
 
         # Enter cbreak mode (not full raw mode, preserves output processing)
         try:
-            tty.setcbreak(sys.stdin.fileno())
+            tty.setcbreak(stdin_fd)
         except termios.error:
             logger.debug("Failed to set cbreak mode, listener not started")
             self._original_settings = None
+            self._close_terminal_fd()
+            if created_baseline:
+                _retire_cached_baseline()
             return
 
         # Register cleanup handlers
@@ -228,12 +315,11 @@ class KeyboardListener:
 
         # Restore terminal but keep _original_settings for resume()
         if self._original_settings is not None:
-            try:
-                import termios
-
-                termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, self._original_settings)
-            except (ImportError, ValueError, OSError):
-                pass
+            termios = _try_import_termios()
+            if termios is not None:
+                with contextlib.suppress(termios.error, ValueError, OSError):
+                    fd = self._terminal_fd if self._terminal_fd is not None else sys.stdin.fileno()
+                    termios.tcsetattr(fd, termios.TCSANOW, self._original_settings)
 
         logger.debug("Keyboard listener suspended")
 
@@ -253,7 +339,8 @@ class KeyboardListener:
 
         # Re-enter cbreak mode
         try:
-            tty.setcbreak(sys.stdin.fileno())
+            fd = self._terminal_fd if self._terminal_fd is not None else sys.stdin.fileno()
+            tty.setcbreak(fd)
         except Exception:
             logger.debug("Failed to re-enter cbreak mode on resume")
             return
@@ -274,17 +361,35 @@ class KeyboardListener:
         logger.debug("Keyboard listener resumed")
 
     def _restore_terminal(self) -> None:
-        """Restore original terminal settings."""
-        if self._original_settings is not None:
-            try:
-                import termios
+        """Restore original terminal settings.
 
-                termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, self._original_settings)
-                # Clear the baseline only after a successful restore so a
-                # transient failure keeps it for a later retry (issue #290).
-                self._original_settings = None
-            except (ImportError, ValueError, OSError):
-                pass
+        Never raises: a failed restore keeps the saved settings so a later
+        atexit/SIGTERM/stop() attempt can retry, and an escaping error would
+        otherwise overwrite the workflow's own outcome (issue #290).
+        """
+        if self._original_settings is None:
+            return
+
+        termios = _try_import_termios()
+        if termios is None:
+            return
+
+        try:
+            fd = self._terminal_fd if self._terminal_fd is not None else sys.stdin.fileno()
+            termios.tcsetattr(fd, termios.TCSANOW, self._original_settings)
+        except (termios.error, ValueError, OSError):
+            return
+        # Clear the baseline only after a successful restore so a transient
+        # failure keeps it for a later retry (issue #290).
+        self._original_settings = None
+        self._close_terminal_fd()
+
+    def _close_terminal_fd(self) -> None:
+        """Close the owned stdin duplicate, if any."""
+        if self._terminal_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(self._terminal_fd)
+            self._terminal_fd = None
 
     def _register_cleanup_handlers(self) -> None:
         """Register atexit and SIGTERM handlers for crash safety."""
@@ -326,6 +431,7 @@ class KeyboardListener:
                     pass
                 finally:
                     self._original_settings = None
+                    self._close_terminal_fd()
                 if previous is signal.SIG_DFL:
                     # In an unmodified process (the common case)
                     # `signal.getsignal(SIGTERM)` is `signal.Handlers.SIG_DFL`

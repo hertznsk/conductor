@@ -79,6 +79,52 @@ async def test_run_restores_after_provider_teardown(
         assert termios.tcgetattr(0) == baseline
 
 
+@pytest.mark.parametrize("cleanup_fails", [False, True], ids=["success", "failure"])
+async def test_run_outcome_survives_failed_final_restore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_fails: bool
+) -> None:
+    """Requirement: a termios.error from the final TTY restore never overwrites
+    the workflow's own result or exception (issue #290)."""
+    from conductor.cli.run import run_workflow_async
+
+    monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path / "home"))
+    with _replace_stdin_with_pty():
+        engine = MagicMock()
+        engine.config.workflow.cost.show_summary = False
+        registry = AsyncMock()
+        registry.__aenter__ = AsyncMock(return_value=registry)
+
+        async def run_then_arm_restore_failure(_inputs: dict) -> dict:
+            # Once the engine is done, every tcsetattr — listener stop() and
+            # the outermost baseline restore — fails with a real termios.error.
+            monkeypatch.setattr(
+                termios, "tcsetattr", MagicMock(side_effect=termios.error("terminal gone"))
+            )
+            return {}
+
+        engine.run = AsyncMock(side_effect=run_then_arm_restore_failure)
+
+        async def maybe_fail_cleanup(*_args: object) -> None:
+            if cleanup_fails:
+                raise RuntimeError("provider cleanup failed")
+
+        registry.__aexit__ = AsyncMock(side_effect=maybe_fail_cleanup)
+        expected_error = (
+            pytest.raises(RuntimeError, match="provider cleanup failed")
+            if cleanup_fails
+            else contextlib.nullcontext()
+        )
+        with (
+            patch("conductor.cli.run.ProviderRegistry", return_value=registry),
+            patch("conductor.cli.run.WorkflowEngine", return_value=engine),
+            expected_error,
+        ):
+            result = await run_workflow_async(_write_wait_workflow(tmp_path), {})
+
+        if not cleanup_fails:
+            assert result == {}
+
+
 async def test_non_interactive_run_does_not_reapply_retired_baseline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

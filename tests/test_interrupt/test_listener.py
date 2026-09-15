@@ -436,13 +436,15 @@ class TestRestoreTerminal:
     ) -> None:
         """Verify a failed restore keeps the baseline so it can be retried.
 
-        Requirement: a transient restore failure must not lose the only
-        correct baseline — the saved settings stay in place so a later
+        Requirement: a real ``termios.error`` from ``tcsetattr`` (not an
+        ``OSError`` — ``termios.error`` derives straight from ``Exception``)
+        must be swallowed, and the saved settings stay in place so a later
         atexit/SIGTERM/stop() attempt can retry the restore (issue #290).
         """
+        real_termios = pytest.importorskip("termios")
         mock_termios = MagicMock()
-        mock_termios.error = OSError
-        mock_termios.tcsetattr.side_effect = OSError("terminal gone")
+        mock_termios.error = real_termios.error
+        mock_termios.tcsetattr.side_effect = real_termios.error("terminal gone")
         listener._original_settings = [1, 2, 3]
 
         with (
@@ -780,6 +782,101 @@ class TestBaselineCacheAndIdempotentStart:
             listener._original_settings = None
 
     @pytest.mark.asyncio
+    async def test_suspend_swallows_termios_error(self, interrupt_event: asyncio.Event) -> None:
+        # Requirement: suspend()'s restore must swallow a real termios.error —
+        # it keeps _original_settings for resume() and must never raise out
+        # of terminal cleanup (issue #290).
+        real_termios = pytest.importorskip("termios")
+        mock_termios = MagicMock()
+        mock_tty = MagicMock()
+        mock_termios.tcgetattr.return_value = [1, 2, 3]
+        mock_termios.error = real_termios.error
+        mock_termios.tcsetattr.side_effect = real_termios.error("terminal gone")
+
+        with (
+            patch("sys.stdin") as mock_stdin,
+            patch.dict("sys.modules", {"termios": mock_termios, "tty": mock_tty}),
+        ):
+            mock_stdin.isatty.return_value = True
+            mock_stdin.fileno.return_value = 0
+
+            listener = KeyboardListener(interrupt_event=interrupt_event)
+            await listener.start()
+            await listener.suspend()  # Must not raise
+
+            assert listener._original_settings is not None
+            listener._original_settings = None
+            listener._close_terminal_fd()
+
+    @pytest.mark.asyncio
+    async def test_failed_setcbreak_retires_newly_created_baseline(
+        self, interrupt_event: asyncio.Event
+    ) -> None:
+        # Requirement: if start() created the process baseline but then fails
+        # to enter cbreak, the baseline's owned fd and the listener's own fd
+        # must not linger for the rest of the process (issue #290).
+        import conductor.interrupt.listener as listener_module
+
+        real_termios = pytest.importorskip("termios")
+        mock_termios = MagicMock()
+        mock_tty = MagicMock()
+        mock_termios.error = real_termios.error
+        mock_termios.tcgetattr.return_value = [1, 2, 3]
+        mock_tty.setcbreak.side_effect = real_termios.error("no tty")
+
+        with (
+            patch("sys.stdin") as mock_stdin,
+            patch.dict("sys.modules", {"termios": mock_termios, "tty": mock_tty}),
+        ):
+            mock_stdin.isatty.return_value = True
+            mock_stdin.fileno.return_value = 0
+
+            listener = KeyboardListener(interrupt_event=interrupt_event)
+            await listener.start()
+
+            assert listener._task is None
+            assert listener._original_settings is None
+            assert listener._terminal_fd is None
+            assert listener_module._captured_baseline is None
+
+    @pytest.mark.asyncio
+    async def test_failed_setcbreak_keeps_reused_baseline(
+        self, interrupt_event: asyncio.Event
+    ) -> None:
+        # Requirement: a listener that REUSED the process baseline and failed
+        # to enter cbreak must not retire the shared baseline — another
+        # listener may still depend on it (issue #290).
+        import conductor.interrupt.listener as listener_module
+
+        real_termios = pytest.importorskip("termios")
+        mock_termios = MagicMock()
+        mock_tty = MagicMock()
+        mock_termios.error = real_termios.error
+        mock_termios.tcgetattr.return_value = [1, 2, 3]
+
+        with (
+            patch("sys.stdin") as mock_stdin,
+            patch.dict("sys.modules", {"termios": mock_termios, "tty": mock_tty}),
+        ):
+            mock_stdin.isatty.return_value = True
+            mock_stdin.fileno.return_value = 0
+
+            listener_a = KeyboardListener(interrupt_event=interrupt_event)
+            await listener_a.start()
+            assert listener_module._captured_baseline is not None
+
+            mock_tty.setcbreak.side_effect = real_termios.error("no tty")
+            listener_b = KeyboardListener(interrupt_event=interrupt_event)
+            await listener_b.start()
+
+            assert listener_b._task is None
+            assert listener_b._original_settings is None
+            assert listener_b._terminal_fd is None
+            assert listener_module._captured_baseline is not None
+
+            await listener_a.stop()
+
+    @pytest.mark.asyncio
     async def test_suspend_restores_with_tcsanow(self, interrupt_event: asyncio.Event) -> None:
         # Requirement: suspend() restores the terminal with TCSANOW so the
         # human gate gets a sane terminal immediately — TCSADRAIN would wait
@@ -804,18 +901,19 @@ class TestBaselineCacheAndIdempotentStart:
             await listener.suspend()
 
             mock_termios.tcsetattr.assert_called_once_with(
-                0, mock_termios.TCSANOW, listener._original_settings
+                listener._terminal_fd, mock_termios.TCSANOW, listener._original_settings
             )
 
             await listener.stop()
 
     def test_restore_clears_baseline_only_on_success(self, interrupt_event: asyncio.Event) -> None:
         # Requirement: _restore_terminal() clears _original_settings only
-        # after a successful tcsetattr; on termios.error the baseline must be
-        # kept so a later restore can retry (issue #290).
+        # after a successful tcsetattr; on a real termios.error the baseline
+        # must be kept so a later restore can retry (issue #290).
+        real_termios = pytest.importorskip("termios")
         mock_termios = MagicMock()
-        mock_termios.error = OSError
-        mock_termios.tcsetattr.side_effect = [OSError("terminal gone"), None]
+        mock_termios.error = real_termios.error
+        mock_termios.tcsetattr.side_effect = [real_termios.error("terminal gone"), None]
         saved_settings = [1, 2, 3]
 
         listener = KeyboardListener(interrupt_event=interrupt_event)
@@ -832,6 +930,85 @@ class TestBaselineCacheAndIdempotentStart:
 
             listener._restore_terminal()
             assert listener._original_settings is None
+
+
+class TestRestoreTerminalBaseline:
+    """Tests for the module-level ``restore_terminal_baseline`` (issue #290)."""
+
+    def test_swallows_termios_error_and_keeps_baseline(self) -> None:
+        # Requirement: a real termios.error from the process-baseline restore
+        # must be swallowed (it runs in finally blocks and atexit, where an
+        # escape would overwrite the workflow outcome), and the baseline must
+        # be retained so a later attempt can retry (issue #290).
+        import conductor.interrupt.listener as listener_module
+
+        real_termios = pytest.importorskip("termios")
+        mock_termios = MagicMock()
+        mock_termios.error = real_termios.error
+        mock_termios.tcsetattr.side_effect = real_termios.error("terminal gone")
+
+        owned_fd = os.dup(0)
+        baseline = listener_module._TerminalBaseline(
+            settings=[1, 2, 3], fd=owned_fd, identity=(0, 0)
+        )
+        listener_module._captured_baseline = baseline
+        try:
+            with patch.dict("sys.modules", {"termios": mock_termios}):
+                listener_module.restore_terminal_baseline(clear=True)
+
+            assert listener_module._captured_baseline is baseline
+        finally:
+            listener_module._retire_cached_baseline()
+
+    def test_successful_clear_retires_baseline_and_closes_fd(self) -> None:
+        # Requirement: a successful clear=True restore retires the baseline
+        # and closes its owned descriptor so no fd leaks (issue #290).
+        import conductor.interrupt.listener as listener_module
+
+        mock_termios = MagicMock()
+        owned_fd = os.dup(0)
+        baseline = listener_module._TerminalBaseline(
+            settings=[1, 2, 3], fd=owned_fd, identity=(0, 0)
+        )
+        listener_module._captured_baseline = baseline
+        try:
+            with patch.dict("sys.modules", {"termios": mock_termios}):
+                listener_module.restore_terminal_baseline(clear=True)
+
+            assert listener_module._captured_baseline is None
+            mock_termios.tcsetattr.assert_called_once_with(
+                owned_fd, mock_termios.TCSANOW, [1, 2, 3]
+            )
+            with pytest.raises(OSError):
+                os.fstat(owned_fd)
+        finally:
+            listener_module._retire_cached_baseline()
+
+    def test_restores_through_owned_fd_not_stdin(self) -> None:
+        # Requirement: the process baseline is applied to the descriptor it
+        # was captured from, not to whatever sys.stdin points at now — a
+        # replaced stdin must not receive another terminal's settings.
+        import conductor.interrupt.listener as listener_module
+
+        mock_termios = MagicMock()
+        owned_fd = os.dup(0)
+        baseline = listener_module._TerminalBaseline(
+            settings=[1, 2, 3], fd=owned_fd, identity=(0, 0)
+        )
+        listener_module._captured_baseline = baseline
+        try:
+            with (
+                patch("sys.stdin") as mock_stdin,
+                patch.dict("sys.modules", {"termios": mock_termios}),
+            ):
+                mock_stdin.fileno.return_value = 999
+                listener_module.restore_terminal_baseline(clear=True)
+
+            mock_termios.tcsetattr.assert_called_once_with(
+                owned_fd, mock_termios.TCSANOW, [1, 2, 3]
+            )
+        finally:
+            listener_module._retire_cached_baseline()
 
 
 class TestSigtermHandlerDelegation:
