@@ -16,6 +16,7 @@ from pydantic_ai import Agent
 from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
+    SystemPromptPart,
     TextPart,
     ToolCallPart,
     ToolReturnPart,
@@ -768,6 +769,122 @@ class TestSummarizerUsageLimits:
         assert len(result.messages) < len(messages), (
             "the sliding-window fallback must still compact the history"
         )
+
+    @pytest.mark.asyncio
+    async def test_second_summarization_receives_previous_summary_once(self) -> None:
+        # Requirement: a second compaction must carry the first compaction's
+        # summary into the next summarization prompt exactly once — inside a
+        # `<previous-summary>` anchor block — alongside the turns summarized in
+        # that cycle. The `_RunLimitsInheritingSummarizingCompaction` override
+        # owns that prompt construction while the harness workaround lives, and
+        # anchored incremental summarization is the harness default
+        # (`incremental=True`), so this drives two full cycles through the
+        # assembled `build_tiered_compaction` stack with a recording
+        # FunctionModel. target_tokens is sized so the summarizing tier alone
+        # brings the history under target: the sliding-window tier never runs,
+        # and therefore cannot discard the summary before cycle two reads it.
+        from pydantic_ai._run_context import RunContext
+        from pydantic_ai.models import ModelRequestContext, ModelRequestParameters
+        from pydantic_ai.models.function import FunctionModel
+        from pydantic_ai.usage import RunUsage, UsageLimits
+
+        recorded_prompts: list[str] = []
+        summaries = [
+            "ANCHOR-SUMMARY-ALPHA cycle one decisions",
+            "BRAVO-SUMMARY cycle two updated state",
+        ]
+
+        def _model_function(messages: list[Any], info: Any) -> ModelResponse:
+            recorded_prompts.append(str(messages[-1].parts[-1].content))
+            return ModelResponse(parts=[TextPart(content=summaries[len(recorded_prompts) - 1])])
+
+        model = FunctionModel(function=_model_function)
+
+        def _request_context(messages: list[Any]) -> ModelRequestContext:
+            return ModelRequestContext(
+                model=model,
+                model_settings=None,
+                messages=messages,
+                model_request_parameters=ModelRequestParameters(),
+            )
+
+        cfg = _make_config(trigger_tokens=100, target_tokens=150)
+        capability = build_tiered_compaction(cfg)
+        summarize_wrapper = capability._tier_wrappers[1]
+
+        usage = RunUsage(requests=10)
+        ctx = RunContext(
+            deps=None,
+            model=model,
+            usage=usage,
+            usage_limits=UsageLimits(request_limit=200),
+            messages=[],
+        )
+
+        # Cycle one: a small first turn, ten large turns that fall inside the
+        # summarized prefix, and a small 20-message tail the tier keeps.
+        cycle1: list[Any] = [ModelRequest(parts=[UserPromptPart(content="the original task")])]
+        for i in range(10):
+            cycle1.append(
+                ModelRequest(parts=[UserPromptPart(content=f"cycle one turn {i} " + "x" * 400)])
+            )
+        for i in range(20):
+            cycle1.append(ModelRequest(parts=[UserPromptPart(content=f"tail {i:02d}")]))
+
+        result1 = await capability.before_model_request(ctx, _request_context(cycle1))  # type: ignore[arg-type]
+
+        assert summarize_wrapper.failed is False
+        assert usage.requests == 11, "the first summary must consume one shared request slot"
+        assert len(recorded_prompts) == 1
+        assert "<previous-summary>" not in recorded_prompts[0], (
+            "the first cycle has no earlier summary to anchor on"
+        )
+        summary_texts = [
+            part.content
+            for message in result1.messages
+            for part in message.parts
+            if isinstance(part, SystemPromptPart)
+        ]
+        assert summary_texts == [
+            "Summary of previous conversation:\n\nANCHOR-SUMMARY-ALPHA cycle one decisions"
+        ], "the first summary must survive the tier chain into the compacted history"
+
+        # Cycle two: ten more large turns plus a fresh small tail, so the new
+        # turns land inside the summarized prefix next to the anchor summary.
+        cycle2 = list(result1.messages)
+        for i in range(10):
+            cycle2.append(
+                ModelRequest(parts=[UserPromptPart(content=f"cycle two turn {i} " + "y" * 400)])
+            )
+        for i in range(20):
+            cycle2.append(ModelRequest(parts=[UserPromptPart(content=f"more {i:02d}")]))
+
+        result2 = await capability.before_model_request(ctx, _request_context(cycle2))  # type: ignore[arg-type]
+
+        assert summarize_wrapper.failed is False
+        assert usage.requests == 12, "the second summary must consume one more shared slot"
+        assert len(recorded_prompts) == 2
+        second_prompt = recorded_prompts[1]
+        assert second_prompt.count(summaries[0]) == 1, (
+            "the previous summary must reach the second prompt exactly once, "
+            "not duplicated into the formatted messages as well"
+        )
+        assert f"<previous-summary>\n{summaries[0]}\n</previous-summary>" in second_prompt, (
+            "the previous summary must arrive inside the anchor block"
+        )
+        assert "cycle two turn 0" in second_prompt, (
+            "the turns summarized in the second cycle must be in its prompt"
+        )
+        assert "cycle two turn 9" in second_prompt
+        summary_texts = [
+            part.content
+            for message in result2.messages
+            for part in message.parts
+            if isinstance(part, SystemPromptPart)
+        ]
+        assert summary_texts == [
+            "Summary of previous conversation:\n\nBRAVO-SUMMARY cycle two updated state"
+        ], "the second summary must replace the first in the compacted history"
 
 
 class TestFailOpen:
