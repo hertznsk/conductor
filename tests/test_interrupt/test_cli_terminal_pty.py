@@ -111,8 +111,27 @@ async def test_non_interactive_run_does_not_reapply_retired_baseline(
 
 
 @pytest.mark.parametrize("interrupt", [False, True], ids=["normal-exit", "ctrl-c"])
-def test_cli_run_restores_terminal(interrupt: bool) -> None:
-    """Requirement: the real CLI restores exact TTY attrs on exit and Ctrl+C."""
+def test_cli_run_restores_terminal(tmp_path: Path, interrupt: bool) -> None:
+    """Requirement: the real CLI restores exact TTY attrs on exit and Ctrl+C.
+
+    The exec'd child must not see the developer's real HOME/tmp dirs: the
+    parent process's monkeypatches (``tempfile.gettempdir()``, ``pid_dir()``,
+    ``runs_dir()``) do not survive an exec, so without an explicit isolated
+    environment the child's startup retention sweep would prune real event
+    logs and legacy PID records.
+    """
+    home_dir = tmp_path / "home"
+    tmp_dir = tmp_path / "tmp"
+    home_dir.mkdir()
+    tmp_dir.mkdir()
+    env = dict(
+        os.environ,
+        HOME=str(home_dir),
+        TMPDIR=str(tmp_dir),
+        TMP=str(tmp_dir),
+        TEMP=str(tmp_dir),
+        CONDUCTOR_HOME=str(tmp_path / "conductor-home"),
+    )
     command = [
         sys.executable,
         "-m",
@@ -126,7 +145,8 @@ def test_cli_run_restores_terminal(interrupt: bool) -> None:
 
     pid, master_fd = pty.fork()
     if pid == 0:
-        os.execv(command[0], command)
+        os.execve(command[0], command, env)
+        os._exit(127)
 
     baseline = termios.tcgetattr(master_fd)
     interrupted = False
