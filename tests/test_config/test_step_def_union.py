@@ -363,6 +363,21 @@ class TestInstanceRevalidation:
                 "reason",
             ),
             (
+                TerminateStepDef(name="t", status="success", reason="done"),
+                {"reason": None},
+                "reason",
+            ),
+            (
+                TerminateStepDef(name="t", status="success", reason="done"),
+                {"status": None},
+                "status",
+            ),
+            (
+                TerminateStepDef(name="t", status="success", reason="done"),
+                {"status": "bogus"},
+                "status",
+            ),
+            (
                 WorkflowStepDef(name="wf", workflow="./sub.yaml"),
                 {"workflow": ""},
                 "workflow",
@@ -374,6 +389,9 @@ class TestInstanceRevalidation:
             "script-empty-command",
             "wait-over-cap-duration",
             "terminate-blank-reason",
+            "terminate-none-reason",
+            "terminate-none-status",
+            "terminate-unknown-status",
             "workflow-empty-path",
             "mcp-empty-server",
             "mcp-empty-tool",
@@ -391,11 +409,25 @@ class TestInstanceRevalidation:
                 {"workflow": {"name": "t", "entry_point": step.name}, "agents": [copied]}
             )
 
-    def test_invalid_copy_rejected_by_for_each_def(self) -> None:
+    @pytest.mark.parametrize(
+        ("copied", "match"),
+        [
+            (
+                ScriptStepDef(name="s", command="echo ok").model_copy(update={"command": ""}),
+                "command",
+            ),
+            (
+                TerminateStepDef(name="t", status="success", reason="done").model_copy(
+                    update={"status": None}
+                ),
+                "status",
+            ),
+        ],
+        ids=["script-empty-command", "terminate-none-status"],
+    )
+    def test_invalid_copy_rejected_by_for_each_def(self, copied: StepDef, match: str) -> None:
         # Requirement: the same boundary holds for inline for-each agents.
-        copied = ScriptStepDef(name="s", command="echo ok").model_copy(update={"command": ""})
-
-        with pytest.raises(PydanticValidationError, match="command"):
+        with pytest.raises(PydanticValidationError, match=match):
             ForEachDef.model_validate(
                 {
                     "name": "loop",

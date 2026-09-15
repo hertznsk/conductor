@@ -1109,7 +1109,9 @@ def _require_step_type_in_schema(schema: dict[str, Any]) -> None:
     every non-LLM branch restores exactly-one-match for those payloads. This is
     a schema-only tightening — runtime types and constructor defaults are
     unchanged, so programmatic construction without an explicit ``type`` keeps
-    working.
+    working. Applied at class level, the tightening also shapes each variant's
+    standalone and serialization schemas; that is deliberate, since a dumped
+    instance always carries its canonical ``type``.
     """
     required = schema.setdefault("required", [])
     if "type" not in required:
@@ -1476,14 +1478,19 @@ class TerminateStepDef(StepBase):
         return value
 
     @model_validator(mode="after")
-    def validate_reason_present(self) -> TerminateStepDef:
-        """Re-assert the reason invariant on instance revalidation.
+    def validate_termination(self) -> TerminateStepDef:
+        """Re-assert the status/reason invariants on instance revalidation.
 
-        Pydantic skips field validators for an already-built instance (e.g. a
-        ``model_copy`` result nested inside ``WorkflowConfig``), so the check
-        above never fires on that path; this after-model validator does.
+        Pydantic skips field validators — including the ``Literal`` check on
+        ``status`` — for an already-built instance (e.g. a ``model_copy``
+        result nested inside ``WorkflowConfig``), so the checks above never
+        fire on that path; this after-model validator does. Both checks are
+        written defensively: the stored values never passed through coercion,
+        so they may be ``None`` or otherwise wrongly typed.
         """
-        if not self.reason.strip():
+        if self.status not in ("success", "failed"):
+            raise ValueError("terminate agents require 'status' (must be 'success' or 'failed')")
+        if not isinstance(self.reason, str) or not self.reason.strip():
             raise ValueError("terminate agents require a non-empty 'reason'")
         return self
 
