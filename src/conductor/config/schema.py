@@ -1098,8 +1098,45 @@ def _preserve_file_string(value: Any, handler: ValidatorFunctionWrapHandler) -> 
     return handler(value)
 
 
+def _require_step_type_in_schema(schema: dict[str, Any]) -> None:
+    """Tighten the published JSON Schema so non-LLM steps require an explicit ``type``.
+
+    Runtime parsing supplies each variant's discriminator default itself (and
+    routes untagged mappings to ``AgentDef`` via the union's before-validator),
+    but a generated ``oneOf`` schema has no such normalization: with every
+    variant's ``type`` defaulted, an untagged agent mapping matches several
+    branches at once and ``oneOf`` rejects it. Requiring the discriminator on
+    every non-LLM branch restores exactly-one-match for those payloads. This is
+    a schema-only tightening — runtime types and constructor defaults are
+    unchanged, so programmatic construction without an explicit ``type`` keeps
+    working.
+    """
+    required = schema.setdefault("required", [])
+    if "type" not in required:
+        required.append("type")
+
+
+def _agent_step_type_in_schema(schema: dict[str, Any]) -> None:
+    """Widen the LLM branch's ``type`` to the three forms the loader accepts.
+
+    ``_normalize_step_type`` maps an omitted or explicit ``null`` ``type`` to
+    ``"agent"`` at runtime; the published schema must admit the same inputs or
+    schema-aware tooling (editors, external linters) rejects workflows that
+    Conductor runs without complaint.
+    """
+    properties = schema.get("properties")
+    if isinstance(properties, dict) and "type" in properties:
+        properties["type"] = {
+            "anyOf": [{"const": "agent"}, {"type": "null"}],
+            "default": "agent",
+            "title": "Type",
+        }
+
+
 class AgentDef(RoutableStepBase):
     """Provider-backed LLM agent definition."""
+
+    model_config = ConfigDict(extra="forbid", json_schema_extra=_agent_step_type_in_schema)
 
     type: Literal["agent"] = "agent"
     provider: ProviderName | None = None
@@ -1191,6 +1228,8 @@ class AgentDef(RoutableStepBase):
 class HumanGateStepDef(RoutableStepBase):
     """Human decision gate definition."""
 
+    model_config = ConfigDict(extra="forbid", json_schema_extra=_require_step_type_in_schema)
+
     type: Literal["human_gate"] = "human_gate"
     prompt: str
     options: list[GateOption]
@@ -1211,6 +1250,8 @@ class HumanGateStepDef(RoutableStepBase):
 
 class QuestionsStepDef(RoutableStepBase):
     """Interactive questions step definition."""
+
+    model_config = ConfigDict(extra="forbid", json_schema_extra=_require_step_type_in_schema)
 
     type: Literal["questions"] = "questions"
     prompt: str = ""
@@ -1247,6 +1288,8 @@ class QuestionsStepDef(RoutableStepBase):
 class ScriptStepDef(RoutableStepBase):
     """Subprocess-backed script step definition."""
 
+    model_config = ConfigDict(extra="forbid", json_schema_extra=_require_step_type_in_schema)
+
     type: Literal["script"] = "script"
     output: dict[str, OutputField] | None = None
     command: str
@@ -1273,6 +1316,8 @@ class ScriptStepDef(RoutableStepBase):
 
 class MCPStepDef(RoutableStepBase):
     """Direct MCP tool-call step definition."""
+
+    model_config = ConfigDict(extra="forbid", json_schema_extra=_require_step_type_in_schema)
 
     type: Literal["mcp"] = "mcp"
     output: dict[str, OutputField] | None = None
@@ -1308,6 +1353,8 @@ class MCPStepDef(RoutableStepBase):
 class WaitStepDef(RoutableStepBase):
     """Cancellable delay step definition."""
 
+    model_config = ConfigDict(extra="forbid", json_schema_extra=_require_step_type_in_schema)
+
     type: Literal["wait"] = "wait"
     duration: str | int | float
     reason: str | None = None
@@ -1339,6 +1386,8 @@ class WaitStepDef(RoutableStepBase):
 class SetStepDef(RoutableStepBase):
     """Context-binding step definition."""
 
+    model_config = ConfigDict(extra="forbid", json_schema_extra=_require_step_type_in_schema)
+
     type: Literal["set"] = "set"
     output: dict[str, OutputField] | None = None
     value: str | None = None
@@ -1362,6 +1411,8 @@ class SetStepDef(RoutableStepBase):
 class TerminateStepDef(StepBase):
     """Explicit terminal outcome step definition."""
 
+    model_config = ConfigDict(extra="forbid", json_schema_extra=_require_step_type_in_schema)
+
     type: Literal["terminate"] = "terminate"
     status: Literal["success", "failed"]
     reason: str
@@ -1377,6 +1428,8 @@ class TerminateStepDef(StepBase):
 
 class WorkflowStepDef(RoutableStepBase):
     """Nested workflow step definition."""
+
+    model_config = ConfigDict(extra="forbid", json_schema_extra=_require_step_type_in_schema)
 
     type: Literal["workflow"] = "workflow"
     output: dict[str, OutputField] | None = None

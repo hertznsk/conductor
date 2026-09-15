@@ -7,6 +7,7 @@ and legacy ``type`` shorthand canonicalization.
 
 from __future__ import annotations
 
+import jsonschema
 import pytest
 from pydantic import TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
@@ -248,3 +249,91 @@ class TestSerializationRoundTrip:
         dumped = AgentDef(name="write", prompt="Write").model_dump(exclude_none=True)
 
         assert dumped["type"] == "agent"
+
+
+class TestPublishedSchemaAcceptsLoaderForms:
+    """The generated JSON Schema must accept exactly what the loader accepts.
+
+    ``_normalize_step_type`` maps an omitted or explicit-null ``type`` to
+    ``agent`` at runtime, but ``model_json_schema()`` output reaches editors and
+    external linters without that normalization: with every variant's ``type``
+    defaulted, an untagged agent mapping matched several ``oneOf`` branches and
+    was rejected, and an explicit ``type: null`` matched none. The schema is
+    customized so non-LLM branches require their explicit discriminator while
+    the LLM branch keeps accepting all three forms.
+    """
+
+    @pytest.mark.parametrize("type_form", ["omitted", "null", "agent"])
+    def test_llm_agent_type_forms_validate(self, type_form: str) -> None:
+        # Requirement: all three accepted LLM ``type`` forms pass the published schema.
+        agent: dict[str, object] = {"name": "a", "prompt": "Do the task"}
+        if type_form != "omitted":
+            agent["type"] = None if type_form == "null" else "agent"
+        payload = _workflow_payload([agent])
+
+        jsonschema.validate(payload, WorkflowConfig.model_json_schema())
+        # Runtime parity: the loader must keep accepting the same payload.
+        config = WorkflowConfig.model_validate(payload)
+        assert type(config.agents[0]) is AgentDef
+
+    @pytest.mark.parametrize("type_form", ["omitted", "null", "agent"])
+    def test_inline_for_each_agent_type_forms_validate(self, type_form: str) -> None:
+        # Requirement: inline for-each agents get the same three-form compatibility.
+        agent: dict[str, object] = {"name": "w", "prompt": "Do {{ item }}"}
+        if type_form != "omitted":
+            agent["type"] = None if type_form == "null" else "agent"
+        payload = {
+            "workflow": {"name": "typed", "entry_point": "loop"},
+            "agents": [],
+            "for_each": [
+                {
+                    "name": "loop",
+                    "type": "for_each",
+                    "source": "workflow.input.items",
+                    "as": "item",
+                    "agent": agent,
+                }
+            ],
+        }
+
+        jsonschema.validate(payload, WorkflowConfig.model_json_schema())
+        config = WorkflowConfig.model_validate(payload)
+        assert type(config.for_each[0].agent) is AgentDef
+
+    @pytest.mark.parametrize(
+        "agent_payload",
+        [
+            {"name": "s", "type": "script", "command": "echo hi"},
+            {"name": "w", "type": "wait", "duration": "5s"},
+            {"name": "b", "type": "set", "value": "1"},
+        ],
+        ids=["script", "wait", "set"],
+    )
+    def test_tagged_non_llm_variants_validate(self, agent_payload: dict) -> None:
+        # Requirement: requiring the discriminator does not break tagged workflows.
+        payload = _workflow_payload([agent_payload])
+
+        jsonschema.validate(payload, WorkflowConfig.model_json_schema())
+
+    def test_untagged_mapping_with_foreign_fields_rejected(self) -> None:
+        # Requirement: schema and loader agree that an untagged script-looking
+        # mapping is not a script step — it routes to the LLM branch and fails
+        # there on the foreign field.
+        payload = _workflow_payload([{"name": "s", "command": "echo hi"}])
+
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(payload, WorkflowConfig.model_json_schema())
+        with pytest.raises(PydanticValidationError):
+            WorkflowConfig.model_validate(payload)
+
+    def test_non_llm_variant_defs_require_type(self) -> None:
+        # Requirement: the oneOf ambiguity fix is a required discriminator on
+        # every non-LLM branch, not a dropped default anywhere else.
+        schema = WorkflowConfig.model_json_schema()
+
+        for tag, ref in schema["properties"]["agents"]["items"]["discriminator"]["mapping"].items():
+            variant_schema = schema["$defs"][ref.removeprefix("#/$defs/")]
+            if tag == "agent":
+                assert "type" not in variant_schema["required"]
+            else:
+                assert "type" in variant_schema["required"]
