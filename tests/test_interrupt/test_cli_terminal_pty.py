@@ -2,19 +2,26 @@
 
 from __future__ import annotations
 
-import contextlib
-import os
-import pty
-import signal
 import sys
-import termios
-import time
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from tests.test_interrupt.test_listener_pty import _replace_stdin_with_pty
+if sys.platform == "win32":
+    # Module-level skip must run BEFORE importing pty/termios (and the PTY
+    # helper module), which do not exist on Windows — otherwise collection
+    # fails instead of skipping.
+    pytest.skip("PTY tests are Unix-only", allow_module_level=True)
+
+import contextlib  # noqa: E402
+import os  # noqa: E402
+import pty  # noqa: E402
+import signal  # noqa: E402
+import termios  # noqa: E402
+import time  # noqa: E402
+from pathlib import Path  # noqa: E402
+from unittest.mock import AsyncMock, MagicMock, patch  # noqa: E402
+
+from tests.test_interrupt.test_listener_pty import _replace_stdin_with_pty  # noqa: E402
 
 
 def _write_wait_workflow(path: Path) -> Path:

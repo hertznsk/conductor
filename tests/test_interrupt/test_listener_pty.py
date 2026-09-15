@@ -16,20 +16,27 @@ Expected state on unfixed code (TDD red):
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
-import io
-import os
-import pty
 import sys
-import termios
-from collections.abc import Iterator
 
 import pytest
 
-from conductor.interrupt.listener import KeyboardListener, restore_terminal_baseline
+if sys.platform == "win32":
+    # Module-level skip must run BEFORE importing pty/termios, which do not
+    # exist on Windows — otherwise collection fails instead of skipping.
+    pytest.skip("PTY tests are Unix-only", allow_module_level=True)
 
-pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="termios/pty is Unix-only")
+import asyncio  # noqa: E402
+import contextlib  # noqa: E402
+import io  # noqa: E402
+import os  # noqa: E402
+import pty  # noqa: E402
+import termios  # noqa: E402
+from collections.abc import Iterator  # noqa: E402
+
+from conductor.interrupt.listener import (  # noqa: E402
+    KeyboardListener,
+    restore_terminal_baseline,
+)
 
 
 class _PtyStdinShim:
