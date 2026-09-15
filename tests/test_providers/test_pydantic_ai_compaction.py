@@ -679,6 +679,97 @@ class TestTierFallback:
         assert len(result.messages) < len(messages)
 
 
+class TestSummarizerUsageLimits:
+    """Requirement: the summarizer's nested run lives under the parent run's limits."""
+
+    @pytest.mark.asyncio
+    async def test_summarizer_runs_after_fifty_parent_requests(self) -> None:
+        # Requirement: a summarizer invoked after 50 parent requests must
+        # inherit the parent's request limit instead of applying Pydantic AI's
+        # default of 50. pydantic-ai-harness 0.24.0 passed no usage_limits to
+        # the nested run, so the default limit was checked against the shared
+        # usage and the summarizing tier always degraded on long runs.
+        from pydantic_ai._run_context import RunContext
+        from pydantic_ai.models import ModelRequestContext, ModelRequestParameters
+        from pydantic_ai.usage import RunUsage, UsageLimits
+
+        cfg = _make_config(trigger_tokens=10, target_tokens=5)
+        capability = build_tiered_compaction(cfg)
+        summarize_wrapper = capability._tier_wrappers[1]
+
+        model = TestModel(custom_output_text="compacted summary")
+        usage = RunUsage(requests=50)
+        ctx = RunContext(
+            deps=None,
+            model=model,
+            usage=usage,
+            usage_limits=UsageLimits(request_limit=200),
+            messages=[],
+        )
+        messages: list[Any] = []
+        for i in range(50):
+            messages.append(ModelRequest(parts=[UserPromptPart(content=f"old {i:03d}")]))
+        messages.append(ModelRequest(parts=[UserPromptPart(content="x" * 80_000)]))
+        request_context = ModelRequestContext(
+            model=model,
+            model_settings=None,
+            messages=messages,
+            model_request_parameters=ModelRequestParameters(),
+        )
+
+        result = await capability.before_model_request(ctx, request_context)  # type: ignore[arg-type]
+
+        assert summarize_wrapper.failed is False, (
+            "summarizing tier must not degrade while the parent run still has budget"
+        )
+        assert usage.requests == 51, "the summary call must consume one shared request slot"
+        assert len(result.messages) < len(messages)
+
+    @pytest.mark.asyncio
+    async def test_summarizer_refused_when_parent_budget_is_exhausted(self) -> None:
+        # Requirement: with usage already at the parent's request limit, the
+        # summarizer must be refused by that same inherited limit and degrade
+        # to the sliding-window fallback — the fix inherits the parent's
+        # budget, it does not grant the summarizer an uncapped one.
+        from pydantic_ai._run_context import RunContext
+        from pydantic_ai.models import ModelRequestContext, ModelRequestParameters
+        from pydantic_ai.usage import RunUsage, UsageLimits
+
+        cfg = _make_config(trigger_tokens=10, target_tokens=5)
+        capability = build_tiered_compaction(cfg)
+        summarize_wrapper = capability._tier_wrappers[1]
+
+        model = TestModel(custom_output_text="compacted summary")
+        usage = RunUsage(requests=200)
+        ctx = RunContext(
+            deps=None,
+            model=model,
+            usage=usage,
+            usage_limits=UsageLimits(request_limit=200),
+            messages=[],
+        )
+        messages: list[Any] = []
+        for i in range(50):
+            messages.append(ModelRequest(parts=[UserPromptPart(content=f"old {i:03d}")]))
+        messages.append(ModelRequest(parts=[UserPromptPart(content="x" * 80_000)]))
+        request_context = ModelRequestContext(
+            model=model,
+            model_settings=None,
+            messages=messages,
+            model_request_parameters=ModelRequestParameters(),
+        )
+
+        result = await capability.before_model_request(ctx, request_context)  # type: ignore[arg-type]
+
+        assert summarize_wrapper.failed is True, (
+            "summarizing tier must degrade once the parent run's own limit is reached"
+        )
+        assert usage.requests == 200, "a refused summary must not consume a request slot"
+        assert len(result.messages) < len(messages), (
+            "the sliding-window fallback must still compact the history"
+        )
+
+
 class TestFailOpen:
     """Requirement: an unexpected outer compaction error returns original context."""
 
