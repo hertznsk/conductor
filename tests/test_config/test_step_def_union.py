@@ -337,3 +337,84 @@ class TestPublishedSchemaAcceptsLoaderForms:
                 assert "type" not in variant_schema["required"]
             else:
                 assert "type" in variant_schema["required"]
+
+
+class TestInstanceRevalidation:
+    """Invalid ``model_copy`` results must not slip past config validation.
+
+    Pydantic skips field and before-model validators when an existing instance
+    is revalidated as a nested value (e.g. inside ``WorkflowConfig.agents``);
+    the per-variant after-model validators are what keep a mutated copy from
+    pushing invalid execution config through that boundary.
+    """
+
+    @pytest.mark.parametrize(
+        ("step", "update", "match"),
+        [
+            (
+                ScriptStepDef(name="s", command="echo ok"),
+                {"command": ""},
+                "command",
+            ),
+            (WaitStepDef(name="w", duration="5s"), {"duration": "25h"}, "duration"),
+            (
+                TerminateStepDef(name="t", status="success", reason="done"),
+                {"reason": "   "},
+                "reason",
+            ),
+            (
+                WorkflowStepDef(name="wf", workflow="./sub.yaml"),
+                {"workflow": ""},
+                "workflow",
+            ),
+            (MCPStepDef(name="m", server="srv", tool="search"), {"server": ""}, "server"),
+            (MCPStepDef(name="m", server="srv", tool="search"), {"tool": ""}, "tool"),
+        ],
+        ids=[
+            "script-empty-command",
+            "wait-over-cap-duration",
+            "terminate-blank-reason",
+            "workflow-empty-path",
+            "mcp-empty-server",
+            "mcp-empty-tool",
+        ],
+    )
+    def test_invalid_copy_rejected_by_workflow_config(
+        self, step: StepDef, update: dict, match: str
+    ) -> None:
+        # Requirement: a mutated copy fails WorkflowConfig validation exactly as
+        # the equivalent mapping input does.
+        copied = step.model_copy(update=update)
+
+        with pytest.raises(PydanticValidationError, match=match):
+            WorkflowConfig.model_validate(
+                {"workflow": {"name": "t", "entry_point": step.name}, "agents": [copied]}
+            )
+
+    def test_invalid_copy_rejected_by_for_each_def(self) -> None:
+        # Requirement: the same boundary holds for inline for-each agents.
+        copied = ScriptStepDef(name="s", command="echo ok").model_copy(update={"command": ""})
+
+        with pytest.raises(PydanticValidationError, match="command"):
+            ForEachDef.model_validate(
+                {
+                    "name": "loop",
+                    "type": "for_each",
+                    "source": "workflow.input.items",
+                    "as": "item",
+                    "agent": copied,
+                }
+            )
+
+    def test_valid_copy_accepted(self) -> None:
+        # Requirement: revalidation re-checks invariants without rejecting
+        # legitimate copies — programmatic workflow building keeps working.
+        copied = ScriptStepDef(name="s", command="echo ok").model_copy(
+            update={"command": "echo ok2"}
+        )
+
+        config = WorkflowConfig.model_validate(
+            {"workflow": {"name": "t", "entry_point": "s"}, "agents": [copied]}
+        )
+
+        assert type(config.agents[0]) is ScriptStepDef

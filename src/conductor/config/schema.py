@@ -1313,6 +1313,20 @@ class ScriptStepDef(RoutableStepBase):
             raise ValueError("script agents require 'command'")
         return value
 
+    @model_validator(mode="after")
+    def validate_command_present(self) -> ScriptStepDef:
+        """Re-assert the command invariant when an existing instance is revalidated.
+
+        Pydantic skips field and before-model validators for an already-built
+        instance (e.g. a ``model_copy`` result nested inside ``WorkflowConfig``),
+        so the checks above never fire on that path; this after-model validator
+        does, keeping a mutated copy from pushing an empty command past
+        ``WorkflowConfig.model_validate``.
+        """
+        if not self.command:
+            raise ValueError("script agents require 'command'")
+        return self
+
 
 class MCPStepDef(RoutableStepBase):
     """Direct MCP tool-call step definition."""
@@ -1349,6 +1363,47 @@ class MCPStepDef(RoutableStepBase):
             )
         return value
 
+    @model_validator(mode="after")
+    def validate_target_present(self) -> MCPStepDef:
+        """Re-assert the required-target invariant on instance revalidation.
+
+        Pydantic skips field and before-model validators for an already-built
+        instance (e.g. a ``model_copy`` result nested inside ``WorkflowConfig``),
+        so the checks above never fire on that path; this after-model validator
+        does.
+        """
+        if not self.server:
+            raise ValueError("mcp agents require 'server'")
+        if not self.tool:
+            raise ValueError("mcp agents require 'tool'")
+        return self
+
+
+def _check_wait_duration(value: Any) -> None:
+    """Parse ``value`` as a wait duration and enforce ``0 < d <= 24h``.
+
+    Shared by ``WaitStepDef``'s field validator (first-pass, mapping input) and
+    its after-model validator (revalidation of an existing instance) so both
+    paths enforce the same rule. Templated durations (containing ``{{``) defer
+    all literal validation to runtime.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"duration must be a number or duration string, not boolean: {value!r}")
+    if isinstance(value, str) and "{{" in value:
+        return
+    try:
+        seconds = parse_duration(value)
+    except ValueError as exc:
+        raise ValueError(f"wait duration is invalid: {exc}") from exc
+    if seconds <= 0:
+        raise ValueError(f"wait duration must be > 0 seconds (got {seconds!r})")
+    if seconds > MAX_WAIT_DURATION_SECONDS:
+        raise ValueError(
+            f"wait duration {seconds!r}s exceeds the 24h cap "
+            f"({MAX_WAIT_DURATION_SECONDS}s); reconsider using "
+            "'limits.timeout_seconds' instead"
+        )
+
 
 class WaitStepDef(RoutableStepBase):
     """Cancellable delay step definition."""
@@ -1362,25 +1417,20 @@ class WaitStepDef(RoutableStepBase):
     @field_validator("duration", mode="before")
     @classmethod
     def validate_duration(cls, value: Any) -> Any:
-        if isinstance(value, bool):
-            raise ValueError(
-                f"duration must be a number or duration string, not boolean: {value!r}"
-            )
-        if isinstance(value, str) and "{{" in value:
-            return value
-        try:
-            seconds = parse_duration(value)
-        except ValueError as exc:
-            raise ValueError(f"wait duration is invalid: {exc}") from exc
-        if seconds <= 0:
-            raise ValueError(f"wait duration must be > 0 seconds (got {seconds!r})")
-        if seconds > MAX_WAIT_DURATION_SECONDS:
-            raise ValueError(
-                f"wait duration {seconds!r}s exceeds the 24h cap "
-                f"({MAX_WAIT_DURATION_SECONDS}s); reconsider using "
-                "'limits.timeout_seconds' instead"
-            )
+        _check_wait_duration(value)
         return value
+
+    @model_validator(mode="after")
+    def validate_duration_value(self) -> WaitStepDef:
+        """Re-assert the duration bounds on instance revalidation.
+
+        Pydantic skips field validators for an already-built instance (e.g. a
+        ``model_copy`` result nested inside ``WorkflowConfig``), so a mutated
+        copy carrying an out-of-bounds duration would otherwise sail through
+        config validation.
+        """
+        _check_wait_duration(self.duration)
+        return self
 
 
 class SetStepDef(RoutableStepBase):
@@ -1425,6 +1475,18 @@ class TerminateStepDef(StepBase):
             raise ValueError("terminate agents require a non-empty 'reason'")
         return value
 
+    @model_validator(mode="after")
+    def validate_reason_present(self) -> TerminateStepDef:
+        """Re-assert the reason invariant on instance revalidation.
+
+        Pydantic skips field validators for an already-built instance (e.g. a
+        ``model_copy`` result nested inside ``WorkflowConfig``), so the check
+        above never fires on that path; this after-model validator does.
+        """
+        if not self.reason.strip():
+            raise ValueError("terminate agents require a non-empty 'reason'")
+        return self
+
 
 class WorkflowStepDef(RoutableStepBase):
     """Nested workflow step definition."""
@@ -1450,6 +1512,19 @@ class WorkflowStepDef(RoutableStepBase):
         if not value:
             raise ValueError("workflow agents require 'workflow' path")
         return value
+
+    @model_validator(mode="after")
+    def validate_workflow_path(self) -> WorkflowStepDef:
+        """Re-assert the workflow-path invariant on instance revalidation.
+
+        Pydantic skips field and before-model validators for an already-built
+        instance (e.g. a ``model_copy`` result nested inside ``WorkflowConfig``),
+        so the checks above never fire on that path; this after-model validator
+        does.
+        """
+        if not self.workflow:
+            raise ValueError("workflow agents require 'workflow' path")
+        return self
 
 
 StepDef = Annotated[
