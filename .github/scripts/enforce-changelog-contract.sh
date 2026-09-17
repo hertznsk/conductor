@@ -25,6 +25,13 @@
 #   (b) `towncrier build` silently ignores broken names (exit 0). Only
 #       `towncrier check` protects the contract; release compilation alone
 #       can never be relied on to surface a bad name.
+#   (c) `towncrier check` exits 1 with "No new newsfragments found on this
+#       branch" whenever the branch ADDS no fragment — even for a perfectly
+#       valid deletion-only change — and exits 0 early ("Checks SKIPPED")
+#       when CHANGELOG.md itself changed. It therefore runs only when the
+#       PR adds a fragment, and fragment-name validation is owned by this
+#       script's own scan of the resulting changelog.d/ tree, not by
+#       towncrier.
 #
 # This script is executed by .github/workflows/changelog.yml and by
 # tests/test_integration/test_changelog_gate.py, which runs it against
@@ -162,27 +169,39 @@ else
     fail "No changelog fragment found. Add one, e.g.: changelog.d/+describe-your-change.added.md — or <issue>.added.md if you have an issue number (categories: added|fixed|changed|removed). Contract: changelog.d/README.md"
   fi
 
-  # 3. Names of NEW fragments must satisfy the towncrier naming
-  #    contract. This runs even under the label: a bad name that
-  #    reaches main breaks 'towncrier check' for every later PR
-  #    until removed (see the header comment, fact (a)).
-  while IFS= read -r fragment; do
-    [ -n "$fragment" ] || continue
-    name=$(basename "$fragment")
-    if ! grep -qE '^(\+[^/]+|[0-9]+)\.(added|fixed|changed|removed)(\.[0-9]+)?\.md$' <<< "$name"; then
-      fail "Invalid fragment name '$name'. Expected '+<slug>.<category>.md' (mandatory '+' prefix for non-numeric slugs) or '<issue>.<category>.md' with category added|fixed|changed|removed (optional .<seq> suffix). Towncrier syntax is validated by 'towncrier check'. Fix, e.g.: git mv \"$fragment\" changelog.d/+describe-your-change.added.md — contract: changelog.d/README.md"
-    fi
-  done < "$NEW_FRAGMENTS_FILE"
-
-  # 4. towncrier validates the whole fragments directory against
-  #    the base branch. `towncrier check` validates the whole
-  #    resulting directory (including rename destinations).
-  #    Skipped when changelog.d/ is completely untouched, or when
-  #    the only change under changelog.d/ is the contract README.
+  # 3. Whenever the PR changed anything under changelog.d/, every fragment
+  #    name in the RESULTING tree must satisfy the naming contract — added
+  #    files, rename destinations, and names inherited from the base branch
+  #    alike (see the header comment, fact (a)). This scan replaces the
+  #    whole-directory half of `towncrier check`, which cannot run on a
+  #    change that adds no fragment (it exits "No new newsfragments found"
+  #    even though the directory is fine — reintroducing the very fragment
+  #    requirement the exemption label waives for a deletion-only PR).
+  #    The ignore list mirrors towncrier's own (find_fragments skips these
+  #    basenames), so this check never rejects a file towncrier accepts.
   if ! git diff --quiet "$BASE"...HEAD -- changelog.d/ ':(exclude)changelog.d/README.md'; then
-    uvx --from towncrier==25.8.0 towncrier check --compare-with "$BASE"
+    while IFS= read -r fragment; do
+      [ -n "$fragment" ] || continue
+      name=$(basename "$fragment")
+      case "$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')" in
+        .gitignore | .gitkeep | .keep | readme | readme.md | readme.rst) continue ;;
+      esac
+      if ! grep -qE '^(\+[^/]+|[0-9]+)\.(added|fixed|changed|removed)(\.[0-9]+)?\.md$' <<< "$name"; then
+        fail "Invalid fragment name '$name'. Expected '+<slug>.<category>.md' (mandatory '+' prefix for non-numeric slugs) or '<issue>.<category>.md' with category added|fixed|changed|removed (optional .<seq> suffix). Fix, e.g.: git mv \"$fragment\" changelog.d/+describe-your-change.added.md — contract: changelog.d/README.md"
+      fi
+    done < <(git ls-tree -r --name-only HEAD -- changelog.d/)
+
+    # 4. `towncrier check` remains the ground-truth validation (it parses
+    #    the directory with towncrier's own strict finder against the real
+    #    [tool.towncrier] config), but only when the PR ADDS at least one
+    #    fragment — otherwise it fails spuriously per the header comment.
+    if [ -n "$new_fragments" ]; then
+      uvx --from towncrier==25.8.0 towncrier check --compare-with "$BASE"
+    else
+      echo "No new fragments; skipping 'towncrier check' (it requires one)."
+    fi
   else
-    echo "No changes under changelog.d/; skipping towncrier check."
+    echo "No changes under changelog.d/; skipping fragment validation."
   fi
 
   echo "Feature mode: changelog contract satisfied."
