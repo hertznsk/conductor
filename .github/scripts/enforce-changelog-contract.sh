@@ -15,7 +15,9 @@
 #   RUNNER_TEMP     scratch directory for intermediate files (defaults to a
 #                   private mktemp directory).
 #
-# Metis-verified towncrier 25.8.0 facts that shape this script:
+# Towncrier 25.8.0 behaviors that shape this script (verified against its
+# source and pinned by tests/test_integration/test_changelog_gate.py and
+# test_extract_release_notes.py):
 #   (a) `towncrier check` validates the WHOLE fragments directory, not just
 #       the new files (find_fragments runs with strict=True). A broken
 #       fragment name that reaches main (e.g. merged via the
@@ -99,7 +101,7 @@ if [ "$BASE_VERSION" != "$VERSION" ]; then
 
   # 4. The merge result must not retain any fragment: towncrier
   #    consumes them; README.md is the only permanent resident.
-  leftovers=$(git ls-tree -r --name-only HEAD changelog.d/ | grep -v '^changelog.d/README.md$' || true)
+  leftovers=$(git ls-tree -r --name-only HEAD -- changelog.d/ | grep -v '^changelog.d/README.md$' || true)
   if [ -n "$leftovers" ]; then
     fail "Release mode: fragments must be consumed by 'make changelog-build VERSION=$VERSION' but these remain in the merge result: $(echo "$leftovers" | tr '\n' ' ') Most often another PR merged a new fragment after this branch was built. Do not just re-run the build — towncrier refuses a version whose header already exists. Restore the pre-compile state and compile the full set in one pass: git rebase $BASE && git checkout $BASE -- CHANGELOG.md changelog.d/ && make changelog-build VERSION=$VERSION && uv lock — then commit and push. Contract: changelog.d/README.md"
   fi
@@ -128,11 +130,16 @@ import tomllib
 
 from packaging.version import Version
 
-authored = Version(sys.argv[1])
-with open("uv.lock", "rb") as f:
-    lock = tomllib.load(f)
-for package in lock["package"]:
-    if package["name"] == "conductor-cli":
+try:
+    authored = Version(sys.argv[1])
+    with open("uv.lock", "rb") as f:
+        lock = tomllib.load(f)
+except Exception as exc:
+    print(f"version-parse error: {exc}", file=sys.stderr)
+    sys.exit(3)
+
+for package in lock.get("package", []):
+    if package.get("name") == "conductor-cli" and package.get("version"):
         print(package["version"])
         sys.exit(0 if Version(package["version"]) == authored else 1)
 sys.exit(2)
@@ -141,7 +148,7 @@ PY
   case "$lock_rc" in
     0) ;;
     1) fail "Release mode: uv.lock pins conductor-cli at $lock_version, which does not match pyproject.toml's $VERSION under PEP 440 normalization. Re-lock with: uv lock — then commit uv.lock. Contract: changelog.d/README.md" ;;
-    2) fail "Release mode: uv.lock contains no conductor-cli package entry. Re-lock with: uv lock — then commit uv.lock. Contract: changelog.d/README.md" ;;
+    2) fail "Release mode: uv.lock contains no usable conductor-cli package entry. Re-lock with: uv lock — then commit uv.lock. Contract: changelog.d/README.md" ;;
     *) fail "Release mode: could not verify the uv.lock pin for conductor-cli (version-parser exit $lock_rc): ${lock_version:-no output}. Re-lock with: uv lock — then commit uv.lock. Contract: changelog.d/README.md" ;;
   esac
 
@@ -152,8 +159,10 @@ else
 
   # A maintainer exemption waives both feature-mode requirements,
   # but any fragments that are present must still be valid.
+  # GitHub label names are unique case-insensitively; match the same way so
+  # a label created as e.g. 'Changelog-Not-Required' still waives.
   label_waived=0
-  if grep -q '"changelog-not-required"' <<< "$PR_LABELS"; then
+  if grep -qi '"changelog-not-required"' <<< "$PR_LABELS"; then
     label_waived=1
     echo "Feature-mode requirements waived by the 'changelog-not-required' label."
   fi
@@ -183,10 +192,17 @@ else
   #    even though the directory is fine — reintroducing the very fragment
   #    requirement the exemption label waives for a deletion-only PR).
   #    The ignore list mirrors towncrier's own (find_fragments skips these
-  #    basenames), so this check never rejects a file towncrier accepts.
+  #    basenames, case-insensitively). The scan is deliberately stricter
+  #    than towncrier for names — the contract requires '+' for non-numeric
+  #    slugs, towncrier does not — but the load-bearing direction holds: any
+  #    name the scan accepts, towncrier also accepts, so nothing it
+  #    green-lights can break a later 'towncrier check' on main.
   if ! git diff --quiet "$BASE"...HEAD -- changelog.d/ ':(exclude)changelog.d/README.md'; then
     while IFS= read -r fragment; do
       [ -n "$fragment" ] || continue
+      if [ "$(dirname "$fragment")" != "changelog.d" ]; then
+        fail "Fragment '$fragment' is not directly under changelog.d/. Towncrier reads a flat directory: a nested entry makes 'towncrier check' fail for every later PR (towncrier tries to parse the subdirectory's name as a fragment). Move it: git mv \"$fragment\" changelog.d/ — contract: changelog.d/README.md"
+      fi
       name=$(basename "$fragment")
       case "$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')" in
         .gitignore | .gitkeep | .keep | readme | readme.md | readme.rst) continue ;;
@@ -201,7 +217,9 @@ else
     #    [tool.towncrier] config), but only when the PR ADDS at least one
     #    fragment — otherwise it fails spuriously per the header comment.
     if [ -n "$new_fragments" ]; then
-      uvx --from towncrier==25.8.0 towncrier check --compare-with "$BASE"
+      if ! uvx --from towncrier==25.8.0 towncrier check --compare-with "$BASE"; then
+        fail "towncrier check rejected the fragments under changelog.d/ (see its output above). Contract: changelog.d/README.md"
+      fi
     else
       echo "No new fragments; skipping 'towncrier check' (it requires one)."
     fi

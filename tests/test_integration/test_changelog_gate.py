@@ -69,10 +69,24 @@ and compiled into this file at release time.
 
 def _towncrier_config() -> str:
     """The repo's real [tool.towncrier] block, so fixtures validate with the
-    same categories and naming rules the gate protects in production."""
-    text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    start = text.index("[tool.towncrier]")
-    return text[start:].rstrip() + "\n"
+    same categories and naming rules the gate protects in production.
+
+    Sliced from its header to the next top-level TOML section (not to EOF),
+    so a later [tool.*] section appended after towncrier's does not silently
+    leak into the fixture.
+    """
+    lines = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8").splitlines(keepends=True)
+    start = next(i for i, line in enumerate(lines) if line.rstrip() == "[tool.towncrier]")
+    end = next(
+        (
+            i
+            for i in range(start + 1, len(lines))
+            if lines[i].startswith("[")
+            and not lines[i].startswith(("[tool.towncrier]", "[[tool.towncrier."))
+        ),
+        len(lines),
+    )
+    return "".join(lines[start:end]).rstrip() + "\n"
 
 
 def _pyproject_text(version: str) -> str:
@@ -257,6 +271,36 @@ class TestFeatureMode:
         repo.commit_all()
         proc = run_gate(repo, labels=(EXEMPTION_LABEL,))
         assert_failed(proc, "Invalid fragment name 'no-prefix.added.md'")
+
+    def test_exemption_label_matches_case_insensitively(self, repo: GateRepo) -> None:
+        # Requirement: GitHub label names are unique case-insensitively, so a
+        # label stored with different case still waives.
+        repo.write("CHANGELOG.md", CHANGELOG_TEMPLATE + "\nBootstrap edit.\n")
+        repo.commit_all()
+        assert_passed(run_gate(repo, labels=("Changelog-Not-Required",)))
+
+    def test_nested_fragment_path_fails(self, repo: GateRepo) -> None:
+        # Requirement: fragments must live directly in changelog.d/ — towncrier
+        # reads a flat directory and a nested entry breaks 'towncrier check'
+        # for every later PR, even though a rename-only change never triggers
+        # towncrier itself.
+        (repo.root / "changelog.d" / "sub").mkdir()
+        repo.rename("changelog.d/100.added.md", "changelog.d/sub/100.fixed.md")
+        repo.commit_all()
+        proc = run_gate(repo, labels=(EXEMPTION_LABEL,))
+        assert_failed(proc, "not directly under changelog.d/")
+
+    def test_duplicate_issue_category_pair_fails_via_towncrier(
+        self, repo: GateRepo, uv_tools: None
+    ) -> None:
+        # Requirement: towncrier check is load-bearing, not decorative —
+        # `100.added.0.md` collides with the existing `100.added.md` (both are
+        # counter 0 for issue 100/added), which the name scan accepts but
+        # towncrier rejects with "multiple files". Proves towncrier actually
+        # runs on the fragment-adding path.
+        repo.write("changelog.d/100.added.0.md", "Duplicate counter (#100).\n")
+        repo.commit_all()
+        assert_failed(run_gate(repo), "towncrier check rejected")
 
     def test_exemption_with_new_fragment_and_changelog_edit_passes(
         self, repo: GateRepo, uv_tools: None
