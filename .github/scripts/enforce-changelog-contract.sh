@@ -103,11 +103,35 @@ if [ "$BASE_VERSION" != "$VERSION" ]; then
     fail "Release mode: the base-branch release-notes extractor could not extract the '## [$VERSION] - YYYY-MM-DD' section from CHANGELOG.md. Run: make changelog-build VERSION=$VERSION and commit the result. Contract: changelog.d/README.md"
   fi
 
-  # 6. uv.lock must pin OUR package at the bumped version.
-  lock_version=$(awk '/^name = "conductor-cli"$/{f=1} f && /^version = /{print; exit}' uv.lock)
-  if ! grep -q "\"$VERSION\"" <<< "$lock_version"; then
-    fail "Release mode: uv.lock does not pin conductor-cli at $VERSION (found: ${lock_version:-none}). Re-lock with: uv lock — then commit uv.lock. Contract: changelog.d/README.md"
-  fi
+  # 6. uv.lock must pin OUR package at the bumped version. uv normalizes
+  #    PEP 440 prerelease spellings when locking (pyproject's 0.2.0-beta.1
+  #    becomes 0.2.0b1 in uv.lock), so compare both sides as parsed versions,
+  #    not raw strings — a string compare rejects a correctly-synced lockfile
+  #    and re-running `uv lock` cannot change the outcome. The authored
+  #    spelling stays authoritative for the tag and the CHANGELOG.md header.
+  lock_rc=0
+  lock_version=$(uv run --no-project --with packaging python - "$VERSION" <<'PY'
+import sys
+import tomllib
+
+from packaging.version import Version
+
+authored = Version(sys.argv[1])
+with open("uv.lock", "rb") as f:
+    lock = tomllib.load(f)
+for package in lock["package"]:
+    if package["name"] == "conductor-cli":
+        print(package["version"])
+        sys.exit(0 if Version(package["version"]) == authored else 1)
+sys.exit(2)
+PY
+  ) || lock_rc=$?
+  case "$lock_rc" in
+    0) ;;
+    1) fail "Release mode: uv.lock pins conductor-cli at $lock_version, which does not match pyproject.toml's $VERSION under PEP 440 normalization. Re-lock with: uv lock — then commit uv.lock. Contract: changelog.d/README.md" ;;
+    2) fail "Release mode: uv.lock contains no conductor-cli package entry. Re-lock with: uv lock — then commit uv.lock. Contract: changelog.d/README.md" ;;
+    *) fail "Release mode: could not verify the uv.lock pin for conductor-cli (version-parser exit $lock_rc): ${lock_version:-no output}. Re-lock with: uv lock — then commit uv.lock. Contract: changelog.d/README.md" ;;
+  esac
 
   echo "Release mode: changelog contract satisfied for $VERSION."
 else
