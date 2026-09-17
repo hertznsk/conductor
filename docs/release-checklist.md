@@ -80,10 +80,10 @@ Pending changes are kept as fragment files in [`changelog.d/`](../changelog.d/RE
 - [ ] Review the diff:
 
   ```bash
-  git diff CHANGELOG.md changelog.d/
+  git diff HEAD -- CHANGELOG.md changelog.d/
   ```
 
-  Confirm the newly compiled version section is accurate and that the consumed fragment files under `changelog.d/` are deleted (leaving only `changelog.d/README.md`).
+  Confirm the newly compiled version section is accurate and that the consumed fragment files under `changelog.d/` are deleted (leaving only `changelog.d/README.md`). Towncrier *stages* its own changes (the compiled `CHANGELOG.md` and the fragment deletions), so a plain `git diff` shows nothing at all right after compilation — `git diff HEAD` shows staged and unstaged changes alike.
 
 ### 3. Bump the version in `pyproject.toml`
 
@@ -209,7 +209,7 @@ The `Changelog` workflow ([`.github/workflows/changelog.yml`](../.github/workflo
 
 - **Advisory Rollout Phase**: Run the workflow in advisory mode first. Merge it into `main` without adding it to required status checks in branch protection settings. Observe its behavior across subsequent pull requests, especially from forks and external contributors. During this advisory period, a failing `Changelog` check on an external PR is a signal for maintainers to help the contributor add a fragment or apply the exemption label, not a blocker. Use the runbook below to convert existing open PRs.
 - **Required Check Activation**: After existing open PRs are converted and the workflow is verified stable across forks, add the job name `Changelog` to the repository's required status checks in GitHub branch protection settings. Branch protection rules key off the **JOB** name (`Changelog`), not the workflow file name. If the repository ever enables a merge queue, this check must be excluded from merge-queue required checks (or the workflow extended with a separate `merge_group` job).
-- **Maintainer Exemption Label**: For PRs that make no user-facing changes (such as CI tweaks, test fixes, documentation, internal refactoring, or bootstrap changes), maintainers can apply the `changelog-not-required` label. This label provides a full maintainer exemption, waiving both the fragment requirement (zero fragments allowed) and the `CHANGELOG.md` direct-edit prohibition. If any fragments are included, their filenames and syntax are still validated with `towncrier check`.
+- **Maintainer Exemption Label**: For PRs that make no user-facing changes (such as CI tweaks, test fixes, documentation, internal refactoring, or bootstrap changes), maintainers can apply the `changelog-not-required` label. This label provides a full maintainer exemption, waiving both the fragment requirement (zero fragments allowed) and the `CHANGELOG.md` direct-edit prohibition. Fragments present in the PR are still validated: the gate checks every surviving fragment filename in the resulting tree, and additionally runs `towncrier check` whenever the PR adds a fragment (a deletion-only change skips it — towncrier exits "No new newsfragments found" when a branch adds no fragment, which would reintroduce the very requirement the label waives).
 - **External PRs**: If an external contributor submits a PR without a fragment, maintainers can either request one, add a `+slug` fragment on the contributor's behalf, or apply the `changelog-not-required` label.
 - **Global Kill-Switch**: If the changelog CI check ever needs to be bypassed during an incident, maintainers can temporarily remove `Changelog` from the required status checks list in repository branch protection settings.
 
@@ -241,7 +241,19 @@ Pull requests opened before the fragment workflow migration may still edit `CHAN
 - **Release-prep PR blocked by the `Changelog` workflow**:
   If CI rejects the release-prep PR in release mode, check the job's log message:
   - Cause: Leftover fragments remain under `changelog.d/` (for instance, if another PR merged after `make changelog-build` ran), or the version in `uv.lock` does not match `pyproject.toml`.
-  - Remedy: Re-run `make changelog-build VERSION=X.Y.Z` on the branch to consume the new fragments, run `uv lock`, commit the changes, and update the PR.
+  - Remedy (lockfile-only mismatch): run `uv lock`, commit `uv.lock`, and push. Nothing else is needed.
+  - Remedy (leftover fragments): do **not** just re-run `make changelog-build` — towncrier refuses to compile a version whose `## [X.Y.Z] - <date>` header already exists in `CHANGELOG.md` (same-day re-run fails with "already produced newsfiles for this version"; a later re-run appends a *duplicate* version section, which CI also rejects). Revert the previous compilation, restore every fragment it consumed, pull in whatever landed on the base branch since, and compile the full set in one pass:
+
+    ```bash
+    git fetch origin && git rebase origin/main
+    git checkout origin/main -- CHANGELOG.md changelog.d/
+    make changelog-build VERSION=X.Y.Z
+    uv lock
+    git add -A && git commit -m "chore(release): recompile changelog for X.Y.Z"
+    git push
+    ```
+
+    `git checkout origin/main -- CHANGELOG.md changelog.d/` restores the pre-compilation `CHANGELOG.md` and every fragment present on the base branch (including ones merged after your first build), while leaving any fragment that exists only on your branch in place — so the single re-run compiles the complete pending set.
 
 - **Release workflow failed before creating the Release**: fix the cause on
   `main` via a normal PR, then delete and re-push the tag:

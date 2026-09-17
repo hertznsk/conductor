@@ -80,10 +80,15 @@ if [ "$BASE_VERSION" != "$VERSION" ]; then
     fail "Release mode: pyproject.toml was bumped to $VERSION but CHANGELOG.md is not changed in this PR. Compile the fragments with: make changelog-build VERSION=$VERSION — then commit CHANGELOG.md and the emptied changelog.d/. Contract: changelog.d/README.md"
   fi
 
-  # 2. Exactly one new section for the bumped version.
+  # 2. Exactly one new section for the bumped version. A duplicate section
+  #    means the branch was compiled twice — towncrier refuses an existing
+  #    same-day header and duplicates it on a later date — so the remedy is
+  #    the restore-then-recompile runbook, not another build on top.
   section_count=$(grep -cE "^## \[${VERSION_RE}\] - " CHANGELOG.md || true)
-  if [ "$section_count" -ne 1 ]; then
-    fail "Release mode: expected exactly one '## [$VERSION] - <date>' section in CHANGELOG.md (found $section_count). Generate it with: make changelog-build VERSION=$VERSION. Contract: changelog.d/README.md"
+  if [ "$section_count" -eq 0 ]; then
+    fail "Release mode: expected exactly one '## [$VERSION] - <date>' section in CHANGELOG.md (found none). Generate it with: make changelog-build VERSION=$VERSION. Contract: changelog.d/README.md"
+  elif [ "$section_count" -gt 1 ]; then
+    fail "Release mode: found $section_count '## [$VERSION] - <date>' sections in CHANGELOG.md — the branch was compiled more than once. Do not re-run the build on top (towncrier refuses an existing header); restore the pre-compile state and compile the full fragment set in one pass per docs/release-checklist.md ('Release-prep PR blocked by the Changelog workflow'). Contract: changelog.d/README.md"
   fi
 
   # 3. The towncrier insertion marker must survive compilation.
@@ -96,7 +101,7 @@ if [ "$BASE_VERSION" != "$VERSION" ]; then
   #    consumes them; README.md is the only permanent resident.
   leftovers=$(git ls-tree -r --name-only HEAD changelog.d/ | grep -v '^changelog.d/README.md$' || true)
   if [ -n "$leftovers" ]; then
-    fail "Release mode: fragments must be consumed by 'make changelog-build VERSION=$VERSION' but these remain in the merge result: $(echo "$leftovers" | tr '\n' ' ') Most often another PR merged a new fragment after this branch was built — rebase, re-run the build, and push. Contract: changelog.d/README.md"
+    fail "Release mode: fragments must be consumed by 'make changelog-build VERSION=$VERSION' but these remain in the merge result: $(echo "$leftovers" | tr '\n' ' ') Most often another PR merged a new fragment after this branch was built. Do not just re-run the build — towncrier refuses a version whose header already exists. Restore the pre-compile state and compile the full set in one pass: git rebase $BASE && git checkout $BASE -- CHANGELOG.md changelog.d/ && make changelog-build VERSION=$VERSION && uv lock — then commit and push. Contract: changelog.d/README.md"
   fi
 
   # 5. Rehearse the release-notes extraction with the trusted base

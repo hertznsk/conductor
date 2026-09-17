@@ -114,8 +114,8 @@ dashboard when context usage exceeds 80%.
 The [`Changelog` workflow](../.github/workflows/changelog.yml) validates pull requests in CI:
 - Rejects PRs that modify `CHANGELOG.md` unless exempted by the maintainer-applied `changelog-not-required` label.
 - Requires at least one valid fragment in `changelog.d/` unless exempted by the same label.
-- The maintainer-applied `changelog-not-required` label provides a full exemption that waives both the fragment requirement and the `CHANGELOG.md` edit prohibition; fragments that are added must still have valid names and pass `towncrier check`.
-- Validates fragment filenames with `towncrier check`.
+- Validates the filename of every fragment present in the resulting tree, and additionally runs `towncrier check` whenever the PR adds at least one fragment (towncrier exits "No new newsfragments found" when a branch adds none, so a deletion-only change is covered by the filename scan alone).
+- The maintainer-applied `changelog-not-required` label provides a full exemption that waives both the fragment requirement and the `CHANGELOG.md` edit prohibition; any fragments present are still validated as above.
 - Note that the check is designed for `pull_request` triggers and is not merge-queue-compatible (if a merge queue is ever enabled, this check must be excluded from merge-queue required checks or extended with a separate `merge_group` job).
 
 ---
@@ -128,5 +128,5 @@ Release-prep pull requests bump `pyproject.toml` and compile all pending fragmen
 - **Release notes extraction rehearsal:** CI rehearses notes extraction using the base branch's `extract-release-notes.sh`, which requires the new section to sit below the single towncrier marker and contain non-heading content; the release-prep PR passes only if this rehearsal succeeds.
 - **Towncrier marker:** The `<!-- towncrier release notes start -->` marker must survive compilation exactly once.
 - **No leftover fragments:** No fragment files may remain under `changelog.d/` except `README.md`.
-- **Lockfile update:** `uv.lock` must pin `conductor-cli` at the bumped version (run `uv lock`).
+- **Lockfile update:** `uv.lock` must pin `conductor-cli` at the bumped version (run `uv lock`). The comparison is PEP 440-normalized: `0.2.0-beta.1` in `pyproject.toml` is locked as `0.2.0b1` and matches.
 - See [`docs/release-checklist.md`](../docs/release-checklist.md) for the complete step-by-step release process.
