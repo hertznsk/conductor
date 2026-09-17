@@ -6,9 +6,11 @@
 # changelog.d/README.md for the naming contract this job enforces.
 #
 # Fork-safe by construction: `pull_request` (never `pull_request_target`),
-# `contents: read` only, no secrets, and code introduced by the PR is never
-# executed — the job runs trusted bash over the git diff, a pinned `towncrier
-# check`, and the BASE-branch release-notes extraction script.
+# `contents: read` only, no secrets. This workflow requests read-only
+# permissions and avoids invoking checked-out application code. The
+# release-notes extractor is loaded from the base branch rather than the PR's
+# checkout. The workflow definition itself is still under PR control, though —
+# a modified workflow file could still run arbitrary steps.
 #
 # Metis-verified towncrier 25.8.0 facts that shape this workflow:
 #   (a) `towncrier check` validates the WHOLE fragments directory, not just
@@ -43,7 +45,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410b181273ba90b1 # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
