@@ -56,6 +56,13 @@ from conductor.exceptions import (
 from conductor.exceptions import (
     TimeoutError as ConductorTimeoutError,
 )
+from conductor.execution import (
+    LocalRunnerBackend,
+    RunnerBackend,
+    RunOutcome,
+    RunSpec,
+    WorkspaceLease,
+)
 from conductor.executor import questions as questions_mod
 from conductor.executor.agent import AgentExecutor
 from conductor.executor.linkify import linkify_markdown
@@ -505,6 +512,8 @@ class WorkflowEngine:
         plugin_marketplaces: Mapping[str, Marketplace] | None = None,
         _guidance_channel: GuidanceChannel | None = None,
         _inherited_bg_mode: bool = False,
+        execution_backend: RunnerBackend | None = None,
+        _workspace_lease: WorkspaceLease | None = None,
     ) -> None:
         """Initialize the WorkflowEngine.
 
@@ -561,6 +570,16 @@ class WorkflowEngine:
                 engines inherit the parent's channel so a paused sub-workflow
                 agent can be corrected too. Callers should not set this
                 directly.
+            execution_backend: Optional :class:`RunnerBackend` the engine runs
+                script steps through. When None, a
+                :class:`LocalRunnerBackend` is created — the default covers
+                ``run``, ``resume``, and mock construction sites without any
+                CLI wiring.
+            _workspace_lease: Workspace lease prepared by an outer owner
+                (e.g. the parent engine of a sub-workflow). Supplied from
+                outside, like ``_guidance_channel``, so a sub-workflow shares
+                the root run's lease instead of preparing its own. Callers
+                should not set this directly.
 
         Note:
             If both provider and registry are provided, registry takes precedence.
@@ -588,7 +607,15 @@ class WorkflowEngine:
         )
         self.gate_handler = HumanGateHandler(skip_gates=skip_gates)
         self.max_iterations_handler = MaxIterationsHandler(skip_gates=skip_gates)
-        self.script_executor = ScriptExecutor()
+        # Execution backend owned at run scope: the root engine prepares a
+        # workspace lease in run()/resume() and finalizes it in the matching
+        # finally; sub-workflow engines inherit both (like _guidance_channel)
+        # so every step of one run shares one backend and one lease.
+        self._execution_backend: RunnerBackend = execution_backend or LocalRunnerBackend()
+        self.script_executor = ScriptExecutor(backend=self._execution_backend)
+        # One lease per run is a DELIBERATE step-1 simplification — the
+        # profiles step replaces it with a backend/realm -> lease mapping.
+        self._workspace_lease: WorkspaceLease | None = _workspace_lease
         self.set_executor = SetExecutor()
         self.mcp_step_executor = McpStepExecutor()
         self.wait_executor = WaitExecutor()
@@ -1752,7 +1779,7 @@ class WorkflowEngine:
             ExecutionError: If script fails or times out.
         """
         return await self.limits.wait_for_with_timeout(
-            self.script_executor.execute(agent, context),
+            self.script_executor.execute(agent, context, lease=self._workspace_lease),
             operation_name=f"script '{agent.name}'",
         )
 
@@ -2671,6 +2698,10 @@ class WorkflowEngine:
             plugin_marketplaces=child_marketplaces,
             _guidance_channel=self._guidance,
             _inherited_bg_mode=self._bg_mode,
+            # One backend and one lease per run: the child shares the root's
+            # instead of preparing its own.
+            execution_backend=self._execution_backend,
+            _workspace_lease=self._workspace_lease,
         )
 
         output = await self._run_child_engine(child_engine, sub_inputs, agent)
@@ -2759,6 +2790,12 @@ class WorkflowEngine:
             "_subworkflow_depth": self._subworkflow_depth + 1,
             "_guidance_channel": self._guidance,
             "_inherited_bg_mode": self._bg_mode,
+            # Inherit backend + lease here too — this dict path historically
+            # missed threaded kwargs (see the _dashboard_context_path comment
+            # below); a child preparing its own lease would break the
+            # one-prepare-per-run invariant.
+            "execution_backend": self._execution_backend,
+            "_workspace_lease": self._workspace_lease,
         }
         # Thread the dashboard context path into the child engine when the
         # field exists on this engine (added by the breadcrumb-navigation PR).
@@ -3306,8 +3343,33 @@ class WorkflowEngine:
         self.limits.start()
         current_agent_name = self.config.workflow.entry_point
 
+        # Terminal outcome of this run, handed to the execution backend's
+        # finalize_run so realm cleanup can distinguish success from failure
+        # from cancellation. Defaults to "failed": anything reaching the
+        # finally without setting it died on an unexpected path.
+        outcome: RunOutcome = "failed"
         try:
+            if self._subworkflow_depth == 0:
+                # Root engine only (mirrors _periodic_checkpoints_active): a
+                # sub-workflow inherits the parent's lease, so exactly one
+                # prepare/finalize pair runs per run.
+                self._workspace_lease = self._workspace_lease or (
+                    await self._execution_backend.prepare_run(
+                        RunSpec(
+                            run_id=self._run_id,
+                            workflow_name=self.config.workflow.name,
+                        )
+                    )
+                )
             result = await self._execute_loop(current_agent_name)
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        except BaseException:
+            outcome = "failed"
+            raise
+        else:
+            outcome = "succeeded"
         finally:
             # Best-effort shutdown of MCP step connections; each close runs
             # in its own guard so a failing manager cannot mask the run outcome.
@@ -3318,6 +3380,8 @@ class WorkflowEngine:
             # table" matters most, and the one a summary-time call can never
             # reach, because the CLI re-raises before it asks.
             self._warn_if_pricing_hook_silent()
+            if self._subworkflow_depth == 0:
+                await self._finalize_execution_backend(outcome)
         # Successful completion: this run's periodic checkpoints are now stale.
         self._cleanup_run_periodic_checkpoints()
         return result
@@ -3351,13 +3415,36 @@ class WorkflowEngine:
         # Fresh timeout window for resumed execution
         self.limits.start_time = _time.monotonic()
 
+        # Same outcome tracking as :meth:`run` — resume must lifecycle the
+        # execution backend identically, or resumed runs would silently skip
+        # prepare/finalize (run/resume parity).
+        outcome: RunOutcome = "failed"
         try:
+            if self._subworkflow_depth == 0:
+                self._workspace_lease = self._workspace_lease or (
+                    await self._execution_backend.prepare_run(
+                        RunSpec(
+                            run_id=self._run_id,
+                            workflow_name=self.config.workflow.name,
+                        )
+                    )
+                )
             result = await self._execute_loop(current_agent_name)
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        except BaseException:
+            outcome = "failed"
+            raise
+        else:
+            outcome = "succeeded"
         finally:
             await self._close_mcp_step_managers()
             # Same reasoning as :meth:`run` -- a resumed run that dies part way
             # is still a run that priced nothing.
             self._warn_if_pricing_hook_silent()
+            if self._subworkflow_depth == 0:
+                await self._finalize_execution_backend(outcome)
         # Successful completion: this run's periodic checkpoints are now stale.
         self._cleanup_run_periodic_checkpoints()
         return result
@@ -3512,6 +3599,26 @@ class WorkflowEngine:
                     "error_type": type(error).__name__,
                     "trigger": "failure",
                 },
+            )
+
+    async def _finalize_execution_backend(self, outcome: RunOutcome) -> None:
+        """Best-effort ``finalize_run`` for the run-scoped workspace lease.
+
+        A no-op unless a lease was actually prepared: a ``prepare_run`` that
+        raised leaves no lease to finalize, and ``finalize_run`` must never be
+        handed ``None``. Failures are logged, never raised — realm cleanup
+        cannot mask the run's own outcome.
+        """
+        if self._workspace_lease is None:
+            return
+        try:
+            await self._execution_backend.finalize_run(self._workspace_lease, outcome)
+        except Exception:
+            logger.warning(
+                "Execution backend finalize_run failed (outcome=%s); "
+                "the run outcome is unaffected.",
+                outcome,
+                exc_info=True,
             )
 
     @property
