@@ -8,6 +8,7 @@ on it.
 """
 
 from conductor.execution.backend import RunnerBackend
+from conductor.execution.local import LocalRunnerBackend
 from conductor.execution.types import (
     CommandOutcome,
     CommandResult,
@@ -24,6 +25,7 @@ __all__ = [
     "CommandOutcome",
     "CommandResult",
     "CommandSpec",
+    "LocalRunnerBackend",
     "RunOutcome",
     "RunSpec",
     "RunnerBackend",
