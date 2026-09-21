@@ -20,7 +20,7 @@ import asyncio
 import sys
 import textwrap
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -427,3 +427,130 @@ class TestScriptExecutorBackwardCompat:
         output: ScriptOutput = await executor.execute(agent, {})
         assert "standalone ok" in output.stdout
         assert output.exit_code == 0
+
+
+class GuardedLeaseBackend(RecordingBackend):
+    """RecordingBackend that mints a fresh lease per prepare and rejects
+    already-finalized handles, so a reused lease fails loudly (PR #541
+    review: a finalized lease must never be handed to another command)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.leases: list[WorkspaceLease] = []
+        self._finalized: set[WorkspaceLease] = set()
+
+    async def prepare_run(self, run: RunSpec) -> WorkspaceLease:
+        self.prepare_calls.append(run)
+        lease = WorkspaceLease(run.run_id, "guarded", f"incarnation-{len(self.leases)}")
+        self.leases.append(lease)
+        return lease
+
+    async def run_command(
+        self,
+        spec: CommandSpec,
+        lease: WorkspaceLease | None,
+        *,
+        diagnostics: Any = None,
+    ) -> CommandResult:
+        assert lease not in self._finalized, "run_command received a finalized lease"
+        return await super().run_command(spec, lease, diagnostics=diagnostics)
+
+    async def finalize_run(self, lease: WorkspaceLease, outcome: RunOutcome) -> None:
+        assert lease not in self._finalized, "lease finalized twice"
+        self._finalized.add(lease)
+        self.finalize_calls.append((lease, outcome))
+
+
+class TestRepeatedRunLeaseLifecycle:
+    """A reused engine instance must prepare a fresh lease per run."""
+
+    @pytest.mark.asyncio
+    async def test_second_run_prepares_a_fresh_lease(self) -> None:
+        """Requirement: finalization detaches the lease from engine state, so
+        a repeated run() on the SAME engine instance calls prepare_run again
+        and neither reuses nor re-finalizes the first run's handle (PR #541
+        review)."""
+        backend = GuardedLeaseBackend()
+        engine = WorkflowEngine(_script_config(), MagicMock(), execution_backend=backend)
+
+        await engine.run({})
+        assert engine._workspace_lease is None
+        await engine.run({})
+        assert engine._workspace_lease is None
+
+        assert len(backend.prepare_calls) == 2
+        assert backend.leases[0] is not backend.leases[1]
+        assert backend.finalize_calls == [
+            (backend.leases[0], "succeeded"),
+            (backend.leases[1], "succeeded"),
+        ]
+
+
+class TestFinalizationUnderCancellation:
+    """Backend cleanup completes even when cancellation races it."""
+
+    @pytest.mark.asyncio
+    async def test_cancellation_during_finalize_completes_cleanup(self) -> None:
+        """Requirement: a cancellation arriving while finalize_run is
+        mid-cleanup is held back by the shield until the backend's teardown
+        completes, then re-raised -- an interrupted async finalize would leak
+        the backend's realm resources (PR #541 review). The outcome was
+        already determined by the finished loop, so it stays "succeeded"."""
+        backend = RecordingBackend()
+        finalize_started = asyncio.Event()
+        finalize_release = asyncio.Event()
+        completed: list[tuple[WorkspaceLease, RunOutcome]] = []
+
+        async def blocking_finalize(lease: WorkspaceLease, outcome: RunOutcome) -> None:
+            finalize_started.set()
+            await finalize_release.wait()
+            completed.append((lease, outcome))
+
+        backend.finalize_run = blocking_finalize  # type: ignore[method-assign]
+        engine = WorkflowEngine(_script_config(), MagicMock(), execution_backend=backend)
+
+        task = asyncio.create_task(engine.run({}))
+        await finalize_started.wait()
+        task.cancel()
+        await asyncio.sleep(0.05)  # let the cancellation land in the shield
+        assert not task.done(), "cancellation must not interrupt finalization"
+        finalize_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert completed == [(backend.lease, "succeeded")]
+
+    @pytest.mark.asyncio
+    async def test_cancellation_during_mcp_close_still_finalizes(self) -> None:
+        """Requirement: a cancellation landing in the finally's MCP-manager
+        close must not skip backend finalization -- the finalize runs from an
+        inner finally so realm cleanup is unconditional (PR #541 review)."""
+        backend = RecordingBackend()
+        engine = WorkflowEngine(_script_config(), MagicMock(), execution_backend=backend)
+
+        step_started = asyncio.Event()
+        step_release = asyncio.Event()
+        close_started = asyncio.Event()
+
+        async def blocking_command(
+            spec: CommandSpec, lease: WorkspaceLease | None
+        ) -> CommandResult:
+            step_started.set()
+            await step_release.wait()
+            return backend.command_result
+
+        backend.run_command_impl = blocking_command
+
+        class BlockingCloseManager:
+            async def close(self) -> None:
+                close_started.set()
+                await asyncio.Event().wait()  # never released by design
+
+        task = asyncio.create_task(engine.run({}))
+        await step_started.wait()
+        engine._mcp_step_managers[("server", "cwd")] = cast("Any", BlockingCloseManager())
+        step_release.set()
+        await close_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert backend.finalize_calls == [(backend.lease, "succeeded")]

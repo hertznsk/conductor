@@ -3373,15 +3373,19 @@ class WorkflowEngine:
         finally:
             # Best-effort shutdown of MCP step connections; each close runs
             # in its own guard so a failing manager cannot mask the run outcome.
-            await self._close_mcp_step_managers()
-            # The pricing verdict belongs to the run ending, not to anyone
-            # asking for a summary. Drawing it here covers the run that dies
-            # part way -- the case where "these numbers came from the static
-            # table" matters most, and the one a summary-time call can never
-            # reach, because the CLI re-raises before it asks.
-            self._warn_if_pricing_hook_silent()
-            if self._subworkflow_depth == 0:
-                await self._finalize_execution_backend(outcome)
+            # The backend finalization sits in an inner finally: a cancellation
+            # landing mid-close must not skip the realm cleanup below.
+            try:
+                await self._close_mcp_step_managers()
+                # The pricing verdict belongs to the run ending, not to anyone
+                # asking for a summary. Drawing it here covers the run that dies
+                # part way -- the case where "these numbers came from the static
+                # table" matters most, and the one a summary-time call can never
+                # reach, because the CLI re-raises before it asks.
+                self._warn_if_pricing_hook_silent()
+            finally:
+                if self._subworkflow_depth == 0:
+                    await self._finalize_execution_backend(outcome)
         # Successful completion: this run's periodic checkpoints are now stale.
         self._cleanup_run_periodic_checkpoints()
         return result
@@ -3439,12 +3443,16 @@ class WorkflowEngine:
         else:
             outcome = "succeeded"
         finally:
-            await self._close_mcp_step_managers()
-            # Same reasoning as :meth:`run` -- a resumed run that dies part way
-            # is still a run that priced nothing.
-            self._warn_if_pricing_hook_silent()
-            if self._subworkflow_depth == 0:
-                await self._finalize_execution_backend(outcome)
+            # Same inner-finally reasoning as :meth:`run` -- a cancellation
+            # landing mid-close must not skip the backend finalization.
+            try:
+                await self._close_mcp_step_managers()
+                # Same reasoning as :meth:`run` -- a resumed run that dies part way
+                # is still a run that priced nothing.
+                self._warn_if_pricing_hook_silent()
+            finally:
+                if self._subworkflow_depth == 0:
+                    await self._finalize_execution_backend(outcome)
         # Successful completion: this run's periodic checkpoints are now stale.
         self._cleanup_run_periodic_checkpoints()
         return result
@@ -3608,18 +3616,55 @@ class WorkflowEngine:
         raised leaves no lease to finalize, and ``finalize_run`` must never be
         handed ``None``. Failures are logged, never raised — realm cleanup
         cannot mask the run's own outcome.
+
+        The lease is detached from engine state BEFORE finalization begins: a
+        lease whose finalization has started is never handed to another
+        command and never finalized twice, and a repeated root
+        ``run()``/``resume()`` on this same engine instance prepares a fresh
+        lease (PR #541 review).
+
+        The backend's cleanup runs as a shielded task, mirroring
+        :meth:`_close_evicted_mcp_step_manager`: a cancellation racing
+        finalization is absorbed until teardown completes, then re-raised —
+        an ``except Exception`` guard alone would let the cancellation
+        interrupt an async ``finalize_run`` mid-cleanup and leak the backend's
+        realm resources.
         """
-        if self._workspace_lease is None:
+        # Detach before finalizing, not after: a reused engine must not skip
+        # prepare_run on its next run because a finalized lease is still here.
+        lease = self._workspace_lease
+        self._workspace_lease = None
+        if lease is None:
             return
-        try:
-            await self._execution_backend.finalize_run(self._workspace_lease, outcome)
-        except Exception:
+        finalize_task = asyncio.ensure_future(self._execution_backend.finalize_run(lease, outcome))
+        cancelled = False
+        while True:
+            try:
+                await asyncio.shield(finalize_task)
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+                if finalize_task.done():
+                    break
+            except Exception:
+                # Backend failure surfaces through the log below; it must not
+                # escape the shield and mask the run outcome.
+                break
+        # ``exception()`` itself raises CancelledError on a cancelled task.
+        exc = (
+            finalize_task.exception()
+            if finalize_task.done() and not finalize_task.cancelled()
+            else None
+        )
+        if isinstance(exc, Exception):
             logger.warning(
                 "Execution backend finalize_run failed (outcome=%s); "
                 "the run outcome is unaffected.",
                 outcome,
-                exc_info=True,
+                exc_info=exc,
             )
+        if cancelled:
+            raise asyncio.CancelledError
 
     @property
     def _periodic_checkpoints_active(self) -> bool:
