@@ -895,6 +895,69 @@ default_model: claude-3.5-sonnet  # Wrong: dot instead of dash
 
 The Claude provider only supports `stdio` MCP servers. If you are using `http` or `sse` servers, switch to the Copilot provider or use a stdio-based server instead. See the [MCP Tools guide](mcp-tools.md) for provider-specific details.
 
+## Execution Environments
+
+Execution environment documents define the execution backends available for a workflow. They map logical profile names (such as `shell` or `isolated`) to concrete runner backends.
+
+### Locations and Discovery
+
+Conductor resolves environment documents from four sources:
+
+1. **CLI Path:** An explicit filesystem path passed to `--environment` (for example, `--environment ./custom-env.yaml`).
+2. **Project Level:** Files named `.conductor/environments/<name>.yaml` located in the workflow file's directory or any ancestor up to the repository root (`.git` marker). Closer ancestors take precedence over further ones.
+3. **User Level:** Files named `$CONDUCTOR_HOME/environments/<name>.yaml` (defaults to `~/.conductor/environments/<name>.yaml`).
+4. **Built-in Fallback:** The default built-in environment (`local/default`), which routes all execution profiles to the local subprocess backend.
+
+### Precedence and Whole-Document Shadowing
+
+Resolution order follows a strict hierarchy:
+
+```
+CLI Path > Project-Level Document > User-Level Document > Built-in Default
+```
+
+Resolution uses **whole-document shadowing**. There is no merging or property inheritance across tiers. When a project-level `prod.yaml` exists, it completely replaces any user-level `prod.yaml`. Any profile key present only in the user document is discarded rather than merged.
+
+This rule keeps execution deterministic. Partial merges introduce hidden machine-dependent state. Whole-document shadowing guarantees that every run resolves against exactly one file on disk with a single SHA-256 digest.
+
+### Document Schema
+
+Environment documents are written in YAML:
+
+```yaml
+# Optional: default profile for steps that do not specify one
+default: shell
+
+# Required: mapping of profile names to backend configurations
+profiles:
+  shell:
+    backend: local
+  isolated:
+    backend: local
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `default` | string (optional) | Profile assigned to executable steps without an explicit `execution.profile`. When set, it must match one of the keys in `profiles`. |
+| `profiles` | mapping (required) | Non-empty dictionary of profile names. Each profile specifies a `backend` name from available runners (such as `local`). |
+
+### Plain YAML Loading (No Variable Expansion)
+
+Environment documents are loaded as plain data without `${VAR}` environment variable expansion or `!file` tags. Variable expansion is intentionally omitted so environment documents remain hermetic. Expanding ambient environment variables would cause the same file to resolve differently on different machines without an audit trail.
+
+### Environment Variable Policy
+
+Conductor deliberately does not provide a `CONDUCTOR_ENVIRONMENT` environment variable. Ambient environment variables can silently divert workflow execution across different shells. To select a specific environment, pass `--environment <name|PATH>` explicitly on the command line.
+
+### Command Support
+
+In this release, `--environment` is supported on:
+- `conductor run`
+- `conductor resume`
+- `conductor validate`
+
+The Fleet Manager TUI and `conductor mcp serve` do not expose `--environment` flags in this release.
+
 ## Machine-Wide Settings (`~/.conductor/config.toml`)
 
 Unlike everything above — which lives in a workflow's own YAML — some

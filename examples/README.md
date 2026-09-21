@@ -91,6 +91,24 @@ Call an MCP server tool directly without an LLM. Demonstrates:
 conductor run examples/mcp-step.yaml
 ```
 
+## Execution Profiles
+
+### execution-profiles.yaml
+
+Demonstrates execution profile defaults and per-step overrides with an execution environment document. Demonstrates:
+- Setting a workflow-wide default execution profile via `workflow.defaults.execution.profile`
+- Overriding the profile on individual steps via `execution.profile`
+- Resolving logical profile names against an execution environment document (`examples/.conductor/environments/demo.yaml`)
+- Provider-free script steps executing on the resolved runner backend
+
+```bash
+# Validate against the demo environment
+conductor validate examples/execution-profiles.yaml --environment demo
+
+# Run with the demo environment
+conductor run examples/execution-profiles.yaml --environment demo
+```
+
 ## Human-in-the-Loop Examples
 
 ### design-review.yaml

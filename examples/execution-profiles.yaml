@@ -1,0 +1,67 @@
+# Execution Profiles Example
+#
+# This example demonstrates execution profile configuration in a workflow.
+# Execution profiles decouple what a step needs (e.g. a "shell" execution
+# environment) from where it runs (a local subprocess, a container, or a
+# remote sandbox).
+#
+# Workflows declare profile references via `workflow.defaults.execution.profile`
+# and optional per-step `execution.profile` overrides. An execution environment
+# document (such as `examples/.conductor/environments/demo.yaml`) maps each
+# logical profile name to a concrete runner backend.
+#
+# Usage:
+#   # Run with the demo environment
+#   conductor run examples/execution-profiles.yaml --environment demo
+#
+#   # Validate against the demo environment (shows the execution resolution table)
+#   conductor validate examples/execution-profiles.yaml --environment demo
+#
+#   # Running without --environment fails when required profiles are not
+#   # defined in the built-in environment:
+#   # conductor run examples/execution-profiles.yaml
+
+workflow:
+  name: execution-profiles-demo
+  description: Demonstrates execution profile defaults and per-step overrides
+  version: "1.0.0"
+  entry_point: check_env
+
+  defaults:
+    execution:
+      profile: shell
+
+  limits:
+    max_iterations: 10
+
+agents:
+  - name: check_env
+    type: script
+    description: Inspect environment using the workflow-default shell profile
+    command: echo
+    args: ["Environment check: starting execution profile demo"]
+    routes:
+      - to: run_step
+        when: "exit_code == 0"
+      - to: handle_error
+
+  - name: run_step
+    type: script
+    description: Execute a script step with an explicit execution profile
+    execution:
+      profile: shell
+    command: echo
+    args: ["Execution profile active: shell on local backend"]
+    routes:
+      - to: $end
+
+  - name: handle_error
+    type: script
+    description: Handle environment check failure
+    command: echo
+    args: ["Environment check failed"]
+    routes:
+      - to: $end
+
+output:
+  result: "{% if run_step is defined %}{{ run_step.output.stdout }}{% elif handle_error is defined %}{{ handle_error.output.stdout }}{% endif %}"
