@@ -100,7 +100,10 @@ class TestLocalRunnerBackend:
     @pytest.mark.asyncio
     async def test_environment_and_path_override_reach_child(self, tmp_path: Path) -> None:
         # Requirement: declared env overrides win and their PATH drives command resolution.
-        executable = tmp_path / "backend-python"
+        # On Windows, shutil.which() resolves only names carrying a PATHEXT
+        # extension, so an extensionless file would stay unresolved there.
+        exe_name = "backend-python.exe" if sys.platform == "win32" else "backend-python"
+        executable = tmp_path / exe_name
         executable.symlink_to(sys.executable)
         result = await LocalRunnerBackend().run_command(
             CommandSpec(
@@ -485,8 +488,16 @@ class TestScriptExecutorDelegation:
         assert isinstance(cause, OSError)
         assert cause.errno == original.errno
         assert cause.filename == original.filename
+        # The executor appends the Windows resolution hint only on win32, so
+        # the expected text must branch on the real platform (unlike the
+        # sibling byte-identity test, which patches sys.platform explicitly).
+        hint = (
+            " Hint: on Windows, include the file extension (e.g. .exe) or use an absolute path."
+            if sys.platform == "win32"
+            else ""
+        )
         expected = (
-            "Script 'failure': command not found: 'tool' (working_dir=cwd)\n\n"
+            f"Script 'failure': command not found: 'tool' (working_dir=cwd){hint}\n\n"
             "💡 Suggestion: Ensure 'tool' is installed and on PATH"
             if outcome == "command_not_found"
             else f"Script 'failure' failed to start: {original}"
