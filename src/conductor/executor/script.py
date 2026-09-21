@@ -91,6 +91,7 @@ class ScriptExecutor:
         context: dict[str, Any],
         *,
         lease: WorkspaceLease | None = None,
+        backend: RunnerBackend | None = None,
     ) -> ScriptOutput:
         """Execute a script step.
 
@@ -106,6 +107,8 @@ class ScriptExecutor:
             lease: Optional :class:`~conductor.execution.WorkspaceLease` threaded
                 through to the backend's ``run_command``, or ``None`` when the
                 caller has none (default None).
+            backend: Optional per-call backend override. When omitted, uses the
+                backend supplied at construction.
 
         Returns:
             :class:`ScriptOutput` with stdout, stderr, exit_code, and stdin_bytes.
@@ -153,6 +156,10 @@ class ScriptExecutor:
                     ),
                 ) from exc
 
+        execution_backend = backend or self._backend
+        if not execution_backend.capabilities().batch:
+            raise ExecutionError("Script execution backend does not support batch commands")
+
         spec = CommandSpec(
             command=rendered_command,
             args=tuple(rendered_args),
@@ -161,7 +168,7 @@ class ScriptExecutor:
             stdin=stdin_payload,
             timeout=agent.timeout,
         )
-        result = await self._backend.run_command(
+        result = await execution_backend.run_command(
             spec,
             lease,
             diagnostics=self._make_diagnostics(),
