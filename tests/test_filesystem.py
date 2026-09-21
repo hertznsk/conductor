@@ -25,11 +25,13 @@ from conductor.filesystem import (
     is_file_strict,
     stat_or_none,
 )
+from conductor.plugins.agents import read_plugin_agents
 from conductor.plugins.errors import (
     PluginManifestError,
     PluginNotFoundError,
     PluginSourceError,
 )
+from conductor.plugins.manifest import read_plugin_manifest
 from conductor.plugins.registry import resolve_plugin
 from conductor.plugins.resolution import resolve_plugin_sources
 from conductor.skills.discovery import _has_repo_marker, _scan_root
@@ -251,3 +253,71 @@ class TestCallSiteWiring:
         monkeypatch.setattr(Path, "stat", _stat)
         with pytest.raises(PluginManifestError, match="could not be read"):
             resolve_plugin(str(root))
+
+    def test_plugin_agents_dir_permission_error_reports_could_not_be_read(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # Requirement: an unreadable plugin ``agents/`` directory raises
+        # PluginManifestError, never resolving as a plugin with no agents.
+        root = tmp_path / "p"
+        (root / "agents").mkdir(parents=True)
+        real_stat = Path.stat
+
+        def _stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+            if self.name == "agents":
+                raise PermissionError(errno.EACCES, "Permission denied")
+            return real_stat(self, follow_symlinks=follow_symlinks)
+
+        monkeypatch.setattr(Path, "stat", _stat)
+        with pytest.raises(PluginManifestError, match="could not be read"):
+            read_plugin_agents(root, "p", flavor="copilot")
+
+    def test_agent_candidate_permission_error_reports_could_not_be_read(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # Requirement: an agent candidate that cannot be stat'ed (e.g. a
+        # symlink into an unreadable directory) raises PluginManifestError
+        # rather than being silently skipped.
+        root = tmp_path / "p"
+        agents_dir = root / "agents"
+        agents_dir.mkdir(parents=True)
+        candidate = agents_dir / "review.agent.md"
+        candidate.write_text(
+            "---\nname: review\ndescription: d\n---\nReview code.\n", encoding="utf-8"
+        )
+        real_stat = Path.stat
+
+        def _stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+            if self == candidate:
+                raise PermissionError(errno.EACCES, "Permission denied")
+            return real_stat(self, follow_symlinks=follow_symlinks)
+
+        monkeypatch.setattr(Path, "stat", _stat)
+        with pytest.raises(PluginManifestError, match="could not be read"):
+            read_plugin_agents(root, "p", flavor="copilot")
+
+    def test_conventional_mcp_file_permission_error_reports_could_not_be_read(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # Requirement: an unreadable conventional ``.mcp.json`` — the
+        # fallback path, where the manifest declares no 'mcpServers' key
+        # and the probe's early return would otherwise skip the read that
+        # surfaces the error — raises PluginManifestError, never resolving
+        # as a plugin with no MCP servers.
+        root = tmp_path / "p"
+        (root / ".claude-plugin").mkdir(parents=True)
+        (root / ".claude-plugin" / "plugin.json").write_text('{"name": "p"}', encoding="utf-8")
+        mcp_file = root / ".mcp.json"
+        mcp_file.write_text(
+            '{"mcpServers": {"ado": {"type": "stdio", "command": "ado"}}}', encoding="utf-8"
+        )
+        real_stat = Path.stat
+
+        def _stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+            if self == mcp_file:
+                raise PermissionError(errno.EACCES, "Permission denied")
+            return real_stat(self, follow_symlinks=follow_symlinks)
+
+        monkeypatch.setattr(Path, "stat", _stat)
+        with pytest.raises(PluginManifestError, match="could not be read"):
+            read_plugin_manifest(root)
