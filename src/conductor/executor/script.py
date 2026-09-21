@@ -6,14 +6,24 @@ as workflow steps, capturing stdout/stderr and exit codes.
 
 from __future__ import annotations
 
-import asyncio
-import os
-import shutil
+# These module imports are patch anchors for the existing test suite. The
+# local backend uses the same module singletons, so patches applied here reach
+# the extracted subprocess implementation.
+import os  # noqa: F401
+import shutil  # noqa: F401
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from conductor.exceptions import ExecutionError
+from conductor.execution import (
+    CommandResult,
+    CommandSpec,
+    LocalRunnerBackend,
+    RunnerBackend,
+    WorkspaceLease,
+)
 from conductor.executor.template import TemplateRenderer
 
 
@@ -52,45 +62,57 @@ class ScriptOutput:
 
 
 class ScriptExecutor:
-    """Executes script steps via asyncio subprocess.
+    """Executes script steps via a batch-capable runner backend.
 
-    Handles command/args template rendering, environment merging,
-    working directory, timeout enforcement, and output capture.
+    Renders command and argument fields via the template renderer, validates
+    and counts UTF-8 stdin payloads, delegates process execution to a
+    :class:`~conductor.execution.RunnerBackend` (defaulting to
+    :class:`~conductor.execution.LocalRunnerBackend`), and maps data-shaped
+    outcomes back to the existing :class:`ScriptOutput` /
+    :class:`~conductor.exceptions.ExecutionError` contract.
 
-    Example:
-        >>> executor = ScriptExecutor()
-        >>> output = await executor.execute(agent, context)
-        >>> print(output.stdout, output.exit_code)
+    Example::
+
+        executor = ScriptExecutor()
+        output = await executor.execute(agent, context)
+        print(output.stdout, output.exit_code)
     """
 
-    def __init__(self) -> None:
-        """Initialize the ScriptExecutor with a template renderer."""
+    def __init__(self, backend: RunnerBackend | None = None) -> None:
+        """Initialize the executor with a batch-capable runner backend."""
         self.renderer = TemplateRenderer()
+        self._backend = backend or LocalRunnerBackend()
+        if not self._backend.capabilities().batch:
+            raise ExecutionError("Script execution backend does not support batch commands")
 
     async def execute(
         self,
         agent: ScriptStepDef,
         context: dict[str, Any],
+        *,
+        lease: WorkspaceLease | None = None,
     ) -> ScriptOutput:
         """Execute a script step.
 
-        Renders command/args with Jinja2, spawns the subprocess, and captures
-        output. If ``agent.stdin`` is set, the rendered payload is piped to the
-        child's stdin as UTF-8 via ``communicate`` (which streams stdin while
-        draining stdout/stderr, so large payloads can't deadlock the pipe);
-        routing the payload through stdin also keeps it off the command line
-        and clear of OS argv length limits. Otherwise the child inherits the
-        parent's stdin.
+        Renders command, argument, and working directory fields via the template
+        renderer, validates and encodes any UTF-8 stdin payload, delegates command
+        execution to the runner backend with the optional workspace lease, and
+        maps data-shaped backend outcomes back to :class:`ScriptOutput` or raises
+        :class:`~conductor.exceptions.ExecutionError`.
 
         Args:
-            agent: Agent definition with type="script".
+            agent: Agent definition with ``type="script"``.
             context: Workflow context for template rendering.
+            lease: Optional :class:`~conductor.execution.WorkspaceLease` threaded
+                through to the backend's ``run_command``, or ``None`` when the
+                caller has none (default None).
 
         Returns:
-            ScriptOutput with stdout, stderr, exit_code, and stdin_bytes.
+            :class:`ScriptOutput` with stdout, stderr, exit_code, and stdin_bytes.
 
         Raises:
-            ExecutionError: If the script times out or cannot be started.
+            ExecutionError: If the script times out, cannot be started, or the
+                stdin payload is not valid UTF-8.
         """
         # Render command and args with Jinja2
         # command is guaranteed non-None by the model validator when type="script"
@@ -131,48 +153,22 @@ class ScriptExecutor:
                     ),
                 ) from exc
 
-        # Build environment (merge os.environ + agent.env)
-        # Note: ${VAR:-default} patterns in agent.env are already resolved
-        # by the config loader during YAML parsing.
-        # Always set PYTHONUTF8=1 so child Python processes use UTF-8 encoding
-        # instead of the system default (cp1252 on Windows), preventing garbled
-        # Unicode characters in script output.
-        base_env = {**os.environ, "PYTHONUTF8": "1"}
-        env = {**base_env, **agent.env} if agent.env else base_env
-
-        # Resolve bare command names and absolute paths against PATH so that a
-        # bare name (e.g. "python") finds the executable the shell would, and a
-        # path missing an extension resolves correctly. Resolution uses the
-        # subprocess's own ``PATH`` (``env`` may override it via ``agent.env``),
-        # so the resolved binary matches the one the child would have executed.
-        # Relative paths containing a separator are left untouched so they keep
-        # resolving against ``working_dir``. Resolution is non-destructive: when
-        # ``which`` cannot resolve the command we fall back to the rendered value
-        # and let the FileNotFoundError handler below produce a clear error.
-        has_separator = os.sep in rendered_command or (
-            os.altsep is not None and os.altsep in rendered_command
+        spec = CommandSpec(
+            command=rendered_command,
+            args=tuple(rendered_args),
+            working_dir=rendered_working_dir,
+            env=dict(agent.env),
+            stdin=stdin_payload,
+            timeout=agent.timeout,
         )
-        if os.path.isabs(rendered_command) or not has_separator:
-            rendered_command = (
-                shutil.which(rendered_command, path=env.get("PATH")) or rendered_command
-            )
+        result = await self._backend.run_command(
+            spec,
+            lease,
+            diagnostics=self._make_diagnostics(),
+        )
 
-        _verbose_log(f"  Script: {rendered_command} {' '.join(rendered_args)}")
-        if stdin_payload is not None:
-            _verbose_log(f"  Script stdin: {len(stdin_payload)} bytes")
-
-        # Create subprocess
-        try:
-            process = await asyncio.create_subprocess_exec(
-                rendered_command,
-                *rendered_args,
-                stdin=asyncio.subprocess.PIPE if stdin_payload is not None else None,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=rendered_working_dir,
-                env=env,
-            )
-        except FileNotFoundError as exc:
+        if result.outcome == "command_not_found":
+            cause = self._reconstruct_start_error(result)
             hint = ""
             if sys.platform == "win32":
                 hint = (
@@ -180,43 +176,42 @@ class ScriptExecutor:
                     "or use an absolute path."
                 )
             raise ExecutionError(
-                f"Script '{agent.name}': command not found: '{rendered_command}'"
+                f"Script '{agent.name}': command not found: '{result.resolved_command}'"
                 f" (working_dir={rendered_working_dir or 'cwd'}){hint}",
                 agent_name=agent.name,
-                suggestion=f"Ensure '{rendered_command}' is installed and on PATH",
-            ) from exc
-        except OSError as e:
+                suggestion=f"Ensure '{result.resolved_command}' is installed and on PATH",
+            ) from cause
+        if result.outcome == "start_failed":
+            cause = self._reconstruct_start_error(result)
             raise ExecutionError(
-                f"Script '{agent.name}' failed to start: {e}",
+                f"Script '{agent.name}' failed to start: {cause}",
                 agent_name=agent.name,
-            ) from e
-
-        # Wait with optional per-script timeout
-        timeout = agent.timeout
-        try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(input=stdin_payload), timeout=timeout
-            )
-        except TimeoutError:
-            process.kill()
-            await process.wait()
+            ) from cause
+        if result.outcome == "timed_out":
             raise ExecutionError(
-                f"Script '{agent.name}' timed out after {timeout}s",
+                f"Script '{agent.name}' timed out after {spec.timeout}s",
                 agent_name=agent.name,
             ) from None
 
-        stdout_text = stdout_bytes.decode("utf-8", errors="replace")
-        stderr_text = stderr_bytes.decode("utf-8", errors="replace")
-
-        if stderr_text:
-            _verbose_log(f"  Script stderr: {stderr_text.strip()}")
-
-        # IMPORTANT: process.returncode is guaranteed non-None after communicate().
-        # Do NOT use `process.returncode or 0` — 0 is falsy in Python.
-        assert process.returncode is not None
+        assert result.exit_code is not None
         return ScriptOutput(
-            stdout=stdout_text,
-            stderr=stderr_text,
-            exit_code=process.returncode,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            exit_code=result.exit_code,
             stdin_bytes=len(stdin_payload) if stdin_payload is not None else None,
         )
+
+    @staticmethod
+    def _make_diagnostics() -> Callable[[str], None]:
+        """Adapt backend diagnostics to the existing verbose logger."""
+        return _verbose_log
+
+    @staticmethod
+    def _reconstruct_start_error(result: CommandResult) -> OSError:
+        """Reconstruct the spawn exception used as ``ExecutionError.__cause__``."""
+        start_error = result.start_error
+        assert start_error is not None
+        cause_type = FileNotFoundError if start_error.kind == "file_not_found" else OSError
+        if start_error.errno is not None:
+            return cause_type(start_error.errno, start_error.message, start_error.filename)
+        return cause_type(start_error.message)
