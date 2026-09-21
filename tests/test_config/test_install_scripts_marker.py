@@ -99,12 +99,13 @@ def test_install_scripts_runs_when_explicitly_selected(
 def test_install_scripts_deselected_by_make_test_expression(
     install_scripts_sandbox: pytest.Pytester,
 ) -> None:
-    """``make test``'s ``-m "not install_scripts"`` must still deselect it.
+    """``make test``'s ``-m`` expression must still deselect it.
 
-    This expression explicitly references the marker, so pytest's own
+    ``make test`` runs ``-m "not install_scripts and not performance"``,
+    which explicitly references the marker, so pytest's own
     marker-expression evaluation (not our hook) does the deselecting.
     """
-    result = install_scripts_sandbox.runpytest("-m", "not install_scripts")
+    result = install_scripts_sandbox.runpytest("-m", "not install_scripts and not performance")
     result.assert_outcomes(passed=1, deselected=1)
 
 

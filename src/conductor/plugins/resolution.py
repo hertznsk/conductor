@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from conductor.filesystem import is_dir_strict
 from conductor.plugins.errors import PluginSourceError
 from conductor.plugins.fetch import fetch_sources
 from conductor.plugins.marketplace import Marketplace, read_marketplace
@@ -92,7 +93,10 @@ def _local_root(source: PluginSource, base_dir: Path | None) -> Path:
         expanded = anchor / expanded
     resolved = Path(os.path.normpath(expanded))
     try:
-        if not resolved.is_dir():
+        # The strict probe re-raises EACCES on every interpreter — Python
+        # 3.14's pathlib is_dir() swallows it, which would misreport an
+        # unreadable source as "not a directory" (issue #540).
+        if not is_dir_strict(resolved):
             raise PluginSourceError(
                 f"Source {source.display!r} resolved to {resolved}, which is not a "
                 "directory. Relative plugin sources resolve against the workflow "

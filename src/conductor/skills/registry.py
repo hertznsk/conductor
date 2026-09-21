@@ -24,11 +24,13 @@ from __future__ import annotations
 
 import logging
 import os
+import stat
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+from conductor.filesystem import is_dir_strict, is_file_strict, stat_or_none
 from conductor.plugins.manifest import (
     PLUGIN_SKILLS_DIR,
     SAFE_NAME,
@@ -294,7 +296,11 @@ def expand_skills_root(root: Path) -> tuple[list[Path], list[str], list[str]]:
     unreadable: list[str] = []
     for child in sorted(root.iterdir(), key=lambda path: path.name):
         try:
-            if (child / "SKILL.md").is_file():
+            # The strict probes re-raise EACCES on every interpreter —
+            # Python 3.14's pathlib is_file()/is_dir() swallow it, which
+            # would misfile an unreadable child as a near-miss (or drop
+            # it entirely) instead of reporting it as unreadable.
+            if is_file_strict(child / "SKILL.md"):
                 children.append(child)
             # Files (a README, a LICENSE) are not reported as near-misses —
             # only a directory can plausibly have been *meant* as a skill.
@@ -302,7 +308,7 @@ def expand_skills_root(root: Path) -> tuple[list[Path], list[str], list[str]]:
             # error you would get from naming the directory directly into
             # silence: a mis-cased ``Skill.md`` or a file someone forgot to
             # commit simply yields one fewer skill.
-            elif child.is_dir():
+            elif is_dir_strict(child):
                 skipped.append(child.name)
         except OSError:
             unreadable.append(child.name)
@@ -336,26 +342,30 @@ def _resolve_path_entry(
     resolved = normalize_entry_path(entry, base_dir)
 
     try:
-        if not resolved.exists():
+        # One stat answers both "exists?" and "is a directory?". It must be
+        # the strict probe: Python 3.14's pathlib exists()/is_dir() swallow
+        # PermissionError and report False, which would misreport an
+        # unreadable entry as "does not exist" (issue #540).
+        info = stat_or_none(resolved)
+        if info is None:
             raise SkillNotFoundError(
                 f"Skill path {entry!r} resolved to {resolved!s}, which does not exist. "
                 "Relative skill paths resolve against the workflow file's directory."
             )
-        if not resolved.is_dir():
+        if not stat.S_ISDIR(info.st_mode):
             raise SkillNotFoundError(
                 f"Skill path {entry!r} resolved to {resolved!s}, which is not a "
                 "directory. Point it at a skill directory (one containing SKILL.md) "
                 "or at a directory of them."
             )
-        if (resolved / "SKILL.md").is_file():
+        if is_file_strict(resolved / "SKILL.md"):
             return [resolved]
         children, skipped, unreadable = expand_skills_root(resolved)
     except OSError as exc:
         # A path Conductor can name but not inspect — an unreadable directory,
-        # or one whose parent is unreadable. Python re-raises EACCES from
-        # ``exists``, ``is_dir``, ``is_file`` and ``iterdir`` alike, so without
-        # this the caller sees a bare PermissionError traceback instead of a
-        # message naming the entry.
+        # or one whose parent is unreadable. Without this guard the caller
+        # sees a bare PermissionError traceback instead of a message naming
+        # the entry.
         raise SkillNotFoundError(
             f"Skill path {entry!r} resolved to {resolved!s}, which could not be read: {exc}"
         ) from exc

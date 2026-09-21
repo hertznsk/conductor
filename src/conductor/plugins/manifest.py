@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from conductor.filesystem import is_file_strict
 from conductor.plugins.errors import PluginManifestError
 
 # Which CLI's build of a plugin this is — determined by which manifest
@@ -376,7 +377,11 @@ def _load_mcp_servers(root: Path, parsed: dict[str, Any], manifest: Path) -> dic
 
     fallback = root / DEFAULT_MCP_FILE
     try:
-        if not fallback.is_file():
+        # The strict probe re-raises EACCES on every interpreter — Python
+        # 3.14's pathlib is_file() swallows it, and the early return would
+        # then skip the read_text() that used to surface it, silently
+        # resolving an unreadable declaration as "no servers" (issue #540).
+        if not is_file_strict(fallback):
             return {}
         payload = json.loads(fallback.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:

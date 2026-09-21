@@ -15,17 +15,17 @@ install-cli:
 dev:
 	uv sync --group dev
 
-# Run tests
+# Run tests (excluding performance-threshold tests, like CI)
 test:
-	uv run pytest -m "not install_scripts"
+	uv run pytest -m "not install_scripts and not performance"
 
 # Run install-script integration tests (slow; builds wheels, runs install.ps1/install.sh)
 test-install-scripts:
 	uv run pytest -m install_scripts -v
 
-# Run tests with coverage
+# Run tests with coverage (excluding performance-threshold tests, like CI)
 test-cov:
-	uv run pytest -m "not install_scripts" --cov=conductor --cov-report=term-missing
+	uv run pytest -m "not install_scripts and not performance" --cov=conductor --cov-report=term-missing
 
 # Run linter and formatter check
 lint:

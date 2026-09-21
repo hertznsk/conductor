@@ -40,10 +40,10 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     This hook is load-bearing to different degrees per marker and per
     invocation: a plain ``pytest`` or ``pytest -m "not performance"`` never
     mentions either marker, so both are only caught by this hook. ``make
-    test``'s own ``-m "not install_scripts"`` (see ``Makefile``) already
-    deselects ``install_scripts`` independently via pytest's native
-    marker-expression evaluation — but it never mentions ``real_api``, so
-    that marker still relies on this hook there too.
+    test``'s own ``-m "not install_scripts and not performance"`` (see
+    ``Makefile``) already deselects ``install_scripts`` independently via
+    pytest's native marker-expression evaluation — but it never mentions
+    ``real_api``, so that marker still relies on this hook there too.
 
     For each marker name, if the caller's ``-m`` expression already
     references it (e.g. ``-m real_api`` / ``-m install_scripts`` to opt in,

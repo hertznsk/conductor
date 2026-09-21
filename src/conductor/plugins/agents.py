@@ -51,6 +51,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from conductor.filesystem import is_dir_strict, is_file_strict
 from conductor.frontmatter import (
     BLOCK_SCALAR_HINT,
     FrontmatterError,
@@ -346,7 +347,10 @@ def read_plugin_agents(
     """
     agents_dir = root / PLUGIN_AGENTS_DIR
     try:
-        if not agents_dir.is_dir():
+        # The strict probe re-raises EACCES on every interpreter — Python
+        # 3.14's pathlib is_dir() swallows it, which would silently report
+        # an unreadable agents directory as absent (issue #540).
+        if not is_dir_strict(agents_dir):
             return []
         entries = sorted(agents_dir.iterdir(), key=lambda item: item.name)
     except OSError as exc:
@@ -360,7 +364,9 @@ def read_plugin_agents(
         if not is_agent_candidate(entry.name, flavor):
             continue
         try:
-            if not entry.is_file():
+            # Same reasoning for a candidate that cannot be stat'ed — e.g.
+            # a symlink into an unreadable directory (issue #540).
+            if not is_file_strict(entry):
                 continue
         except OSError as exc:
             raise PluginManifestError(

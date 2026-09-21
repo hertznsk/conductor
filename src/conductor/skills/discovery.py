@@ -43,6 +43,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, get_args
 
+from conductor.filesystem import exists_strict, is_dir_strict
 from conductor.skills.errors import SkillError
 from conductor.skills.registry import (
     ResolvedSkill,
@@ -169,7 +170,9 @@ def _has_repo_marker(directory: Path, on_warning: WarningSink | None = None) -> 
     skills.
     """
     try:
-        return (directory / _REPO_MARKER).exists()
+        # exists_strict keeps the warning below reachable on Python 3.14,
+        # whose pathlib exists() swallows PermissionError into False.
+        return exists_strict(directory / _REPO_MARKER)
     except OSError as exc:
         _warn(
             on_warning,
@@ -364,7 +367,10 @@ def _scan_root(
         permissions error and the remedy is the opposite.
     """
     try:
-        if not root.is_dir():
+        # is_dir_strict keeps the failed=True branch reachable on Python
+        # 3.14, whose pathlib is_dir() swallows PermissionError into False
+        # and would report a permissions problem as "nothing here".
+        if not is_dir_strict(root):
             return [], False
         children, skipped, unreadable = expand_skills_root(root)
     except OSError as exc:

@@ -22,11 +22,13 @@ for why handing the SDK a plugin root instead would not.
 from __future__ import annotations
 
 import logging
+import stat
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from conductor.filesystem import is_dir_strict, stat_or_none
 from conductor.plugins.agents import PluginAgent, is_agent_candidate, read_plugin_agents
 from conductor.plugins.copilot_settings import COPILOT_SETTINGS_RELATIVE, read_copilot_marketplaces
 from conductor.plugins.errors import (
@@ -488,13 +490,17 @@ def _resolve_path_entry(entry: str, base_dir: Path | None) -> Path:
     resolved = normalize_entry_path(entry, base_dir)
 
     try:
-        if not resolved.exists():
+        # One strict stat answers both "exists?" and "is a directory?" —
+        # Python 3.14's pathlib exists()/is_dir() swallow PermissionError
+        # and would misreport an unreadable entry as missing (issue #540).
+        info = stat_or_none(resolved)
+        if info is None:
             raise PluginNotFoundError(
                 f"Plugin path {entry!r} resolved to {resolved!s}, which does not "
                 "exist. Relative plugin paths resolve against the workflow file's "
                 "directory."
             )
-        if not resolved.is_dir():
+        if not stat.S_ISDIR(info.st_mode):
             raise PluginNotFoundError(
                 f"Plugin path {entry!r} resolved to {resolved!s}, which is not a "
                 "directory. Point it at a plugin root."
@@ -531,7 +537,10 @@ def _plugin_skills(root: Path, source: str, on_warning: WarningSink | None) -> l
 
     skills_dir = root / PLUGIN_SKILLS_DIR
     try:
-        if not skills_dir.is_dir():
+        # The strict probe re-raises EACCES on every interpreter — Python
+        # 3.14's pathlib is_dir() swallows it, which would silently report
+        # an unreadable skills directory as absent (issue #540).
+        if not is_dir_strict(skills_dir):
             return []
         children, skipped, unreadable = expand_skills_root(skills_dir)
     except OSError as exc:
