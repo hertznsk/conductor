@@ -1084,6 +1084,47 @@ class RoutableStepBase(StepBase):
     routes: list[RouteDef] = Field(default_factory=list)
 
 
+class StepExecutionConfig(BaseModel):
+    """Execution profile selection for an executable workflow step.
+
+    Backs the ``execution:`` block on executable step types (``AgentDef``,
+    ``ScriptStepDef``, ``MCPStepDef``, ``WorkflowStepDef``) and on
+    ``WorkflowDef.defaults``. The named profile is resolved against an
+    execution environment document at run time; the schema only pins the
+    surface, it does not resolve anything.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    profile: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)] | None = None
+    """Logical execution profile name for the step."""
+
+    @field_validator("profile")
+    @classmethod
+    def validate_profile(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not regex.fullmatch(r"[A-Za-z0-9_.-]+", value):
+            raise ValueError(
+                "execution profile must match [A-Za-z0-9_.-]+ (letters, digits, '_', '.', '-' only)"
+            )
+        return value
+
+
+class ExecutableStepBase(RoutableStepBase):
+    """Common fields for workflow steps that execute on a runner backend.
+
+    ``execution:`` names the logical execution profile of the step; the
+    profile is resolved by an execution environment document into a concrete
+    runner backend at run time. Only executable step types inherit this
+    base; engine-local steps (``set``, ``wait``, ``terminate``,
+    ``human_gate``, ``questions``) never run on a backend and reject the
+    block via their own ``extra="forbid"``.
+    """
+
+    execution: StepExecutionConfig | None = None
+
+
 def _normalize_step_type(value: Any) -> Any:
     if isinstance(value, dict) and value.get("type") is None:
         return {**value, "type": "agent"}
@@ -1135,7 +1176,7 @@ def _agent_step_type_in_schema(schema: dict[str, Any]) -> None:
         }
 
 
-class AgentDef(RoutableStepBase):
+class AgentDef(ExecutableStepBase):
     """Provider-backed LLM agent definition."""
 
     model_config = ConfigDict(extra="forbid", json_schema_extra=_agent_step_type_in_schema)
@@ -1287,7 +1328,7 @@ class QuestionsStepDef(RoutableStepBase):
         return self
 
 
-class ScriptStepDef(RoutableStepBase):
+class ScriptStepDef(ExecutableStepBase):
     """Subprocess-backed script step definition."""
 
     model_config = ConfigDict(extra="forbid", json_schema_extra=_require_step_type_in_schema)
@@ -1330,7 +1371,7 @@ class ScriptStepDef(RoutableStepBase):
         return self
 
 
-class MCPStepDef(RoutableStepBase):
+class MCPStepDef(ExecutableStepBase):
     """Direct MCP tool-call step definition."""
 
     model_config = ConfigDict(extra="forbid", json_schema_extra=_require_step_type_in_schema)
@@ -1495,7 +1536,7 @@ class TerminateStepDef(StepBase):
         return self
 
 
-class WorkflowStepDef(RoutableStepBase):
+class WorkflowStepDef(ExecutableStepBase):
     """Nested workflow step definition."""
 
     model_config = ConfigDict(extra="forbid", json_schema_extra=_require_step_type_in_schema)
@@ -2818,6 +2859,21 @@ _REMOVED_WORKFLOW_FIELDS: dict[str, str] = {
 }
 
 
+class WorkflowDefaults(BaseModel):
+    """Workflow-wide default settings applied to executable steps.
+
+    ``defaults.execution`` supplies the fallback execution profile for every
+    executable step that does not declare its own ``execution:`` block; a
+    step-level ``execution.profile`` outranks the workflow default. Absent
+    from the YAML behaves identically to an explicit empty block.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    execution: StepExecutionConfig | None = None
+    """Default execution profile for executable steps without their own block."""
+
+
 class WorkflowDef(BaseModel):
     """Top-level workflow configuration."""
 
@@ -2873,6 +2929,15 @@ class WorkflowDef(BaseModel):
     Absent from the YAML behaves identically to an explicit default block
     (``expose: true``), so no existing workflow needs editing to keep its
     current behavior once MCP exposure defaults on (DD4).
+    """
+
+    defaults: WorkflowDefaults = Field(default_factory=WorkflowDefaults)
+    """Workflow-wide defaults for executable steps.
+
+    Currently carries only ``execution``: the fallback execution profile
+    applied to executable steps (agent, script, mcp, workflow) that do not
+    declare their own ``execution:`` block. Absent from the YAML behaves
+    identically to an explicit empty block.
     """
 
     metadata: dict[str, Any] = Field(default_factory=dict)
