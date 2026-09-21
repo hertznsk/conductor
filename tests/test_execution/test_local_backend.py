@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import errno
 import os
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -170,6 +171,41 @@ class TestLocalRunnerBackend:
         process.wait.assert_awaited_once_with()
 
     @pytest.mark.asyncio
+    async def test_cancel_during_timeout_cleanup_reraises_cancellation(self) -> None:
+        # Requirement: a run cancellation racing the per-command timeout
+        # cleanup is absorbed by the shielded drain and then re-raised -- it
+        # must never collapse into a data-shaped timed_out result.
+        process = AsyncMock()
+        communicate_started = asyncio.Event()
+        communicate_release = asyncio.Event()
+
+        async def blocking_communicate(input: bytes | None = None) -> tuple[bytes, bytes]:
+            communicate_started.set()
+            await communicate_release.wait()
+            return (b"", b"")
+
+        async def wait_completed() -> int:
+            return -9
+
+        process.communicate = blocking_communicate
+        process.wait = wait_completed
+        process.kill = MagicMock()
+
+        with patch("asyncio.create_subprocess_exec", return_value=process):
+            task = asyncio.create_task(
+                LocalRunnerBackend().run_command(CommandSpec(command="tool", timeout=0.05), None)
+            )
+            await communicate_started.wait()
+            await asyncio.sleep(0.15)  # the 0.05s timeout fires; drain begins
+            task.cancel()
+            await asyncio.sleep(0.05)
+            assert not task.done(), "the shielded drain must hold the cancellation back"
+            communicate_release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        process.kill.assert_called_once_with()
+
+    @pytest.mark.asyncio
     async def test_command_not_found_is_data_shaped(self) -> None:
         # Requirement: missing commands return the resolved name and file-not-found metadata.
         original = FileNotFoundError(errno.ENOENT, "No such file or directory", "missing")
@@ -249,6 +285,66 @@ class TestLocalRunnerBackend:
             await task
         with pytest.raises(ProcessLookupError):
             os.kill(pid, 0)
+
+    @pytest.mark.asyncio
+    async def test_cancel_drains_flooded_pipes_and_reaps_child(self) -> None:
+        # Requirement: cancelling run_command against a continuously writing
+        # child still kills and reaps it promptly (PR #541 review). The
+        # pre-fix handler cancelled communicate() -- pausing the pipe
+        # transports -- and then awaited process.wait(), which can stay
+        # blocked behind flooded pipes even after the child is dead.
+        spawned: list[asyncio.subprocess.Process] = []
+        spawn_completed = asyncio.Event()
+        real_spawn = asyncio.create_subprocess_exec
+
+        async def spy_spawn(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+            process = await real_spawn(*args, **kwargs)
+            spawned.append(process)
+            spawn_completed.set()
+            return process
+
+        with patch("asyncio.create_subprocess_exec", spy_spawn):
+            task = asyncio.create_task(
+                LocalRunnerBackend().run_command(
+                    CommandSpec(
+                        command=sys.executable,
+                        args=(
+                            "-u",
+                            "-c",
+                            "import sys\n"
+                            "while True:\n"
+                            "    sys.stdout.write('x' * 65536)\n"
+                            "    sys.stdout.flush()\n"
+                            "    sys.stderr.write('y' * 65536)\n"
+                            "    sys.stderr.flush()",
+                        ),
+                    ),
+                    None,
+                )
+            )
+            # A loaded CI runner may spawn slowly; cancel only once the child
+            # is genuinely up, or the assertions below would fail for the
+            # wrong reason.
+            await asyncio.wait_for(spawn_completed.wait(), timeout=10)
+            await asyncio.sleep(0.3)  # let the child fill both pipe buffers
+            task.cancel()
+            # asyncio.wait (not wait_for) so a wedged cleanup cannot be
+            # unwedged by a second cancellation at the deadline.
+            done, _pending = await asyncio.wait({task}, timeout=10)
+        if task not in done:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            pytest.fail("cancelling a flooded child wedged the kill/reap path")
+        assert task.cancelled()
+        process = spawned[0]
+        # The child is reaped (not merely signalled) ...
+        assert process.returncode is not None
+        # ... and the shielded drain read both pipes to EOF -- the pre-fix
+        # code left the paused transports unread, so the StreamReaders never
+        # observed EOF.
+        assert process.stdout is not None and process.stdout.at_eof()
+        assert process.stderr is not None and process.stderr.at_eof()
 
     @pytest.mark.asyncio
     async def test_control_environment_can_be_disabled(self) -> None:

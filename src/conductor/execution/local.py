@@ -22,6 +22,56 @@ from conductor.execution.types import (
 )
 
 
+async def _kill_and_reap(
+    process: asyncio.subprocess.Process,
+    communicate_task: asyncio.Task[tuple[bytes, bytes]],
+) -> bool:
+    """Kill the child and finish draining it before returning.
+
+    The shielded ``communicate_task`` is never cancelled here, so the pipe
+    transports keep reading to EOF — a killed child that left full pipe
+    buffers behind cannot wedge the reap. The subsequent ``process.wait()``
+    runs as its own shielded task for the same reason: a second cancellation
+    racing the cleanup is absorbed and reported (return value) instead of
+    interrupting it, and the caller re-raises ``CancelledError`` afterward.
+
+    Args:
+        process: The spawned child process.
+        communicate_task: The still-running ``Process.communicate()`` task.
+
+    Returns:
+        True when a racing cancellation was absorbed during cleanup and must
+        be re-raised by the caller, False otherwise.
+    """
+    with contextlib.suppress(ProcessLookupError):
+        process.kill()
+    absorbed_cancel = False
+    while not communicate_task.done():
+        try:
+            await asyncio.shield(communicate_task)
+        except asyncio.CancelledError:
+            absorbed_cancel = True
+        except Exception:
+            # The drain itself failed; the child is already dead and the
+            # explicit wait below still reaps it.
+            break
+    if communicate_task.done() and not communicate_task.cancelled():
+        # Mark a finished drain's outcome as retrieved -- a failed one would
+        # otherwise surface as "Task exception was never retrieved".
+        communicate_task.exception()
+    wait_task = asyncio.ensure_future(process.wait())
+    while not wait_task.done():
+        try:
+            await asyncio.shield(wait_task)
+        except asyncio.CancelledError:
+            absorbed_cancel = True
+        except Exception:
+            break
+    if wait_task.done() and not wait_task.cancelled():
+        wait_task.exception()
+    return absorbed_cancel
+
+
 class LocalRunnerBackend:
     """Run commands as child processes on the local machine."""
 
@@ -128,23 +178,31 @@ class LocalRunnerBackend:
                 duration_seconds=time.monotonic() - started_at,
             )
 
+        # ``communicate`` runs as its own task, shielded from the wait_for
+        # timeout and from cancellation of this coroutine, so pipe drainage
+        # never stops mid-flight: killing a child whose output filled the
+        # pipe buffers reaps reliably only while the parent keeps reading to
+        # EOF. Cancelling communicate() itself pauses the pipe transports, and
+        # a bare ``process.wait()`` after ``kill()`` can then stay blocked even
+        # though the child is already dead (observed on the Windows CI fleet
+        # with a continuously-writing child, returncode already -9).
+        communicate_task = asyncio.create_task(process.communicate(input=spec.stdin))
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(input=spec.stdin), timeout=spec.timeout
+                asyncio.shield(communicate_task), timeout=spec.timeout
             )
         except TimeoutError:
-            process.kill()
-            await process.wait()
+            if await _kill_and_reap(process, communicate_task):
+                # A run cancellation raced the timeout cleanup; it must not be
+                # swallowed into a data-shaped outcome.
+                raise asyncio.CancelledError from None
             return CommandResult(
                 outcome="timed_out",
                 resolved_command=resolved_command,
                 duration_seconds=time.monotonic() - started_at,
             )
         except asyncio.CancelledError:
-            with contextlib.suppress(ProcessLookupError):
-                process.kill()
-            with contextlib.suppress(BaseException):
-                await process.wait()
+            await _kill_and_reap(process, communicate_task)
             raise
 
         stdout_text = stdout_bytes.decode("utf-8", errors="replace")
