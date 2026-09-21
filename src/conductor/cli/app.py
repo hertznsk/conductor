@@ -124,9 +124,23 @@ def format_error(error: Exception) -> Panel:
     # Build error content
     content = Text()
 
-    # Error message (red)
-    error_message = str(error).split("\n")[0]  # First line only for main message
-    content.append(error_message, style="bold red")
+    # Error message (red). The first line is the headline; continuation
+    # lines are rendered verbatim below it. Messages that carry a list
+    # (e.g. an unresolvable --environment name enumerating every location
+    # searched) would otherwise lose everything past the first line, and a
+    # "was not found. Searched:" headline with no list is a worse lie than
+    # a longer panel. Split the RAW message (``args[0]``): ``ConductorError
+    # .__str__`` appends the location/suggestion trailers, which this
+    # function renders itself with icons below — splitting ``str(error)``
+    # would duplicate them.
+    raw_message = error.args[0] if error.args else str(error)
+    if not isinstance(raw_message, str):
+        raw_message = str(raw_message)
+    message_lines = raw_message.split("\n")
+    content.append(message_lines[0], style="bold red")
+    for continuation in message_lines[1:]:
+        content.append("\n")
+        content.append(continuation)
 
     # Add location info if available
     if isinstance(error, ConductorError):
@@ -550,6 +564,16 @@ def run(
             help="Override the provider specified in the workflow (e.g., 'copilot').",
         ),
     ] = None,
+    environment: Annotated[
+        str | None,
+        typer.Option(
+            "--environment",
+            help=(
+                "Execution environment: a name resolved via .conductor/environments/ "
+                "(project then user level) or a path to an environment document."
+            ),
+        ),
+    ] = None,
     raw_inputs: Annotated[
         list[str] | None,
         typer.Option(
@@ -726,7 +750,7 @@ def run(
     # Handle dry-run mode
     if dry_run:
         try:
-            plan = build_dry_run_plan(workflow_path)
+            plan = build_dry_run_plan(workflow_path, environment=environment)
             display_execution_plan(plan, output_console)
             return
         except Exception as e:
@@ -787,6 +811,7 @@ def run(
                 workspace_instructions=workspace_instructions,
                 cli_instructions=raw_instructions,
                 print_loaded_instructions=print_loaded_instructions,
+                environment=environment,
             )
             if is_verbose():
                 if not launch.still_running:
@@ -832,6 +857,7 @@ def run(
                 workspace_instructions=workspace_instructions,
                 cli_instructions=raw_instructions,
                 print_loaded_instructions=print_loaded_instructions,
+                environment=environment,
             )
         )
 
@@ -882,6 +908,16 @@ def validate(
             help=r"Workflow file path or registry reference (name\[@registry]\[@version]).",
         ),
     ],
+    environment: Annotated[
+        str | None,
+        typer.Option(
+            "--environment",
+            help=(
+                "Execution environment: a name resolved via .conductor/environments/ "
+                "(project then user level) or a path to an environment document."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Validate a workflow YAML file without executing it.
 
@@ -912,7 +948,7 @@ def validate(
         validate_workflow,
     )
 
-    is_valid, config = validate_workflow(workflow_path, output_console)
+    is_valid, config = validate_workflow(workflow_path, output_console, environment=environment)
 
     if is_valid and config is not None:
         display_validation_success(config, workflow_path, output_console)
@@ -1083,6 +1119,16 @@ def resume(
             "--provider",
             "-p",
             help="Override the provider specified in the workflow (e.g., 'copilot').",
+        ),
+    ] = None,
+    environment: Annotated[
+        str | None,
+        typer.Option(
+            "--environment",
+            help=(
+                "Execution environment: a name resolved via .conductor/environments/ "
+                "(project then user level) or a path to an environment document."
+            ),
         ),
     ] = None,
     raw_metadata: Annotated[
@@ -1303,6 +1349,7 @@ def resume(
                 web_port=web_port,
                 metadata=cli_metadata,
                 guidance=guidance,
+                environment=environment,
             )
             if is_verbose():
                 if not launch.still_running:
@@ -1346,6 +1393,7 @@ def resume(
                 web_bg=web_bg,
                 metadata=cli_metadata,
                 guidance=guidance,
+                environment=environment,
             )
         )
 

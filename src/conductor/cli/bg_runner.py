@@ -2049,6 +2049,7 @@ def launch_background(
     workspace_instructions: bool = False,
     cli_instructions: list[str] | None = None,
     print_loaded_instructions: bool = False,
+    environment: str | None = None,
     cwd: Path | None = None,
 ) -> BackgroundLaunch:
     """Fork a detached child process running the workflow with a web dashboard.
@@ -2072,6 +2073,9 @@ def launch_background(
         print_loaded_instructions: Whether to forward ``--print-loaded-instructions``
             to the background child. Output goes to the child's captured stderr
             log, not to the parent's TTY.
+        environment: Optional execution environment name or path, forwarded as
+            ``--environment``. Path references are expanded and absolutized
+            first — see the argv construction below.
         cwd: Working directory for the detached child (issue #477); becomes
             the run's recorded ``system.cwd``. ``None`` (every CLI path)
             preserves the child's inherited cwd.
@@ -2120,6 +2124,8 @@ def launch_background(
 
     if provider_override:
         cmd.extend(["--provider", provider_override])
+
+    _extend_cmd_with_environment(cmd, environment)
 
     if skip_gates:
         cmd.append("--skip-gates")
@@ -2219,6 +2225,7 @@ def launch_background_resume(
     web_port: int = 0,
     metadata: dict[str, str] | None = None,
     guidance: list[str] | None = None,
+    environment: str | None = None,
     cwd: Path | None = None,
 ) -> BackgroundLaunch:
     """Fork a detached child process resuming the workflow with a web dashboard.
@@ -2243,6 +2250,10 @@ def launch_background_resume(
         metadata: Optional CLI metadata key=value pairs.
         guidance: Optional mid-run guidance text(s) to apply before the
             resumed agent runs. Forwarded as repeated ``--guidance`` flags.
+        environment: Optional execution environment name or path, forwarded as
+            ``--environment`` (run/resume parity). Path references are
+            expanded and absolutized first — see
+            :func:`_extend_cmd_with_environment`.
         cwd: Working directory for the detached child (issue #477); becomes
             the run's recorded ``system.cwd``. ``None`` (every CLI path)
             preserves the child's inherited cwd.
@@ -2307,6 +2318,8 @@ def launch_background_resume(
     if provider_override:
         cmd.extend(["--provider", provider_override])
 
+    _extend_cmd_with_environment(cmd, environment)
+
     if skip_gates:
         cmd.append("--skip-gates")
 
@@ -2333,6 +2346,27 @@ def launch_background_resume(
         forced_run_id=forced_run_id,
         cwd=cwd,
     )
+
+
+def _extend_cmd_with_environment(cmd: list[str], environment: str | None) -> None:
+    """Forward ``--environment`` to the detached child's argv.
+
+    Names (the ``[A-Za-z0-9_-]+`` charset) pass through verbatim — the child
+    resolves them against its own workflow directory. Path references must be
+    made absolute first: the child may start in a different working directory,
+    and ``os.path.abspath`` alone does **not** expand ``~``, so a value like
+    ``~/env.yaml`` would reach the child still tilde-prefixed and fail to
+    load. ``Path.expanduser()`` runs first, then ``os.path.abspath`` anchors
+    the result to this (the launching) process's cwd.
+    """
+    if not environment:
+        return
+    from conductor.config.environment import is_path_reference
+
+    forwarded = environment
+    if is_path_reference(forwarded):
+        forwarded = os.path.abspath(Path(forwarded).expanduser())
+    cmd.extend(["--environment", forwarded])
 
 
 def _serialize_value(value: Any) -> str:

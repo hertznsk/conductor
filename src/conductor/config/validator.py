@@ -10,13 +10,14 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeGuard
+from typing import TYPE_CHECKING, Any, NamedTuple, TypedDict, TypeGuard
 
 import jinja2
 from jinja2 import Environment, meta, nodes
 
 from conductor.config.schema import (
     AgentDef,
+    ExecutableStepBase,
     HumanGateStepDef,
     QuestionsStepDef,
     RoutableStepBase,
@@ -45,9 +46,18 @@ from conductor.skills import (
 from conductor.templating import is_jinja_template
 
 if TYPE_CHECKING:
+    from conductor.config.environment import ResolvedEnvironment
     from conductor.config.schema import StepDef, WorkflowConfig
     from conductor.plugins.registry import ResolvedPlugin
     from conductor.skills import ResolvedSkill
+
+
+class _EnvironmentValidationContext(TypedDict):
+    refs_found: bool
+    environments: dict[str, ResolvedEnvironment | None] | None
+    explicit: bool
+    root_workflow_dir: Path | None
+    warned_no_environments: bool
 
 
 # Shared Jinja2 environment used purely for AST parsing of template strings.
@@ -266,6 +276,7 @@ def validate_workflow_config(
     *,
     _visited_subworkflows: frozenset[tuple[int, int]] | None = None,
     _subworkflow_depth: int = 0,
+    _environment_context: _EnvironmentValidationContext | None = None,
 ) -> list[str]:
     """Perform comprehensive validation of a workflow configuration.
 
@@ -282,6 +293,8 @@ def validate_workflow_config(
             External callers should leave this as ``None``.
         _subworkflow_depth: Internal — current recursion depth for
             sub-workflow validation. External callers should leave this as 0.
+        _environment_context: Internal shared cache for lazy environment
+            discovery across recursive sub-workflow validation.
 
     Returns:
         A list of warning messages (non-fatal issues).
@@ -291,6 +304,21 @@ def validate_workflow_config(
     """
     errors: list[str] = []
     warnings: list[str] = []
+    if _environment_context is None:
+        _environment_context = {
+            "refs_found": False,
+            "environments": None,
+            "explicit": False,
+            "root_workflow_dir": workflow_path.parent if workflow_path is not None else None,
+            "warned_no_environments": False,
+        }
+
+    profile_errors, profile_warnings = _validate_profile_references(
+        config,
+        _environment_context,
+    )
+    errors.extend(profile_errors)
+    warnings.extend(profile_warnings)
 
     # Build index of all addressable node names
     agent_names = {agent.name for agent in config.agents}
@@ -420,6 +448,7 @@ def validate_workflow_config(
             workflow_path,
             _visited=_visited_subworkflows,
             _depth=_subworkflow_depth,
+            _environment_context=_environment_context,
         )
         errors.extend(sub_errors)
         warnings.extend(sub_warnings)
@@ -1456,6 +1485,104 @@ def _collect_template_strings(agent: StepDef) -> list[tuple[str, str]]:
     return templates
 
 
+def _profile_references(config: WorkflowConfig) -> set[str]:
+    references: set[str] = set()
+    workflow_execution = config.workflow.defaults.execution
+    if workflow_execution is not None and workflow_execution.profile is not None:
+        references.add(workflow_execution.profile)
+
+    for step in config.agents:
+        if (
+            isinstance(step, ExecutableStepBase)
+            and step.execution is not None
+            and step.execution.profile is not None
+        ):
+            references.add(step.execution.profile)
+    for group in config.for_each:
+        step = group.agent
+        if (
+            isinstance(step, ExecutableStepBase)
+            and step.execution is not None
+            and step.execution.profile is not None
+        ):
+            references.add(step.execution.profile)
+    return references
+
+
+def _validate_profile_references(
+    config: WorkflowConfig,
+    context: _EnvironmentValidationContext,
+) -> tuple[list[str], list[str]]:
+    if context["explicit"]:
+        return [], []
+
+    references = _profile_references(config)
+    if not references:
+        return [], []
+
+    context["refs_found"] = True
+    warnings: list[str] = []
+    if context["environments"] is None:
+        root_workflow_dir = context["root_workflow_dir"]
+        if root_workflow_dir is None:
+            if not context["warned_no_environments"]:
+                warnings.append(
+                    "profile references could not be checked against any environment; "
+                    "run conductor validate --environment <name> for the full cross-check"
+                )
+                context["warned_no_environments"] = True
+            return [], warnings
+
+        from conductor.config.environment import discover_all_environments
+
+        malformed_environment_names: set[str] = set()
+
+        def record_discovery_warning(message: str) -> None:
+            warnings.append(message)
+            match = re.search(r"environment document (.+?\.ya?ml):", message)
+            if match is not None:
+                malformed_environment_names.add(Path(match.group(1)).stem)
+
+        discovered = discover_all_environments(
+            root_workflow_dir,
+            on_warning=record_discovery_warning,
+        )
+        context["environments"] = {
+            **discovered,
+            **dict.fromkeys(malformed_environment_names),
+        }
+
+    environments = context["environments"]
+    if not environments:
+        if not context["warned_no_environments"]:
+            warnings.append(
+                "profile references could not be checked against any environment; "
+                "run conductor validate --environment <name> for the full cross-check"
+            )
+            context["warned_no_environments"] = True
+        return [], warnings
+
+    errors: list[str] = []
+    environment_names = sorted(environments)
+    for reference in sorted(references):
+        missing: list[str] = []
+        for name in environment_names:
+            environment = environments[name]
+            if environment is None or reference not in environment.document.profiles:
+                missing.append(name)
+        if len(missing) == len(environment_names):
+            errors.append(
+                f"execution profile '{reference}' is not defined in any discovered environment "
+                f"({', '.join(environment_names)})"
+            )
+        elif missing:
+            warnings.append(
+                f"execution profile '{reference}' is absent from environment(s): "
+                f"{', '.join(missing)}"
+            )
+    return errors, warnings
+
+
 # Maximum depth for recursive sub-workflow validation to prevent infinite loops.
 _MAX_SUBWORKFLOW_VALIDATION_DEPTH = 10
 
@@ -1465,6 +1592,7 @@ def _validate_subworkflow_refs(
     workflow_path: Path | None,
     _visited: frozenset[tuple[int, int]] | None = None,
     _depth: int = 0,
+    _environment_context: _EnvironmentValidationContext | None = None,
 ) -> tuple[list[str], list[str]]:
     """Validate all ``type: workflow`` agent references in *config*.
 
@@ -1486,6 +1614,8 @@ def _validate_subworkflow_refs(
             :data:`_MAX_SUBWORKFLOW_VALIDATION_DEPTH`, recursion stops and a
             warning is emitted so callers know the validation tree was
             truncated.
+        _environment_context: Shared lazy environment-discovery cache from
+            the root validation call.
 
     Returns:
         Tuple of (error messages, warning messages).
@@ -1564,6 +1694,7 @@ def _validate_subworkflow_refs(
                 workflow_path=sub_path,
                 _visited_subworkflows=_visited | {canonical},
                 _subworkflow_depth=_depth + 1,
+                _environment_context=_environment_context,
             )
             warnings.extend(f"{label} → sub-workflow '{sub_path.name}': {w}" for w in sub_warnings)
         except ConfigurationError as exc:

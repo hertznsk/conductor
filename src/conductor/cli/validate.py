@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from rich.panel import Panel
 from rich.table import Table
@@ -21,12 +21,16 @@ from conductor.install_hint import install_command
 from conductor.telemetry.guards import OTEL_SDK_AVAILABLE
 
 if TYPE_CHECKING:
+    from conductor.config.environment import ResolvedEnvironment
     from conductor.config.schema import WorkflowConfig
+    from conductor.engine.run_manifest import ResolvedRunManifest
 
 
 def validate_workflow(
     workflow_path: Path,
     console: MarkupFreeConsole | None = None,
+    *,
+    environment: str | None = None,
 ) -> tuple[bool, WorkflowConfig | None]:
     """Validate a workflow YAML file.
 
@@ -36,6 +40,10 @@ def validate_workflow(
     Args:
         workflow_path: Path to the workflow YAML file.
         console: Optional Rich console for output.
+        environment: Optional execution environment name or path to an
+            environment document. When set, execution-profile references are
+            cross-checked against the resolved environment and the resolved
+            run manifest is reported after successful validation.
 
     Returns:
         A tuple of (is_valid, config_or_none).
@@ -59,11 +67,44 @@ def validate_workflow(
         )
         return False, None
 
+    resolved_environment = None
+    manifest = None
+    if environment is not None:
+        try:
+            from conductor.config.environment import resolve_environment
+            from conductor.engine.run_manifest import compile_run_manifest
+
+            resolved_environment = resolve_environment(
+                environment,
+                workflow_dir=workflow_path.parent,
+            )
+            manifest = compile_run_manifest(
+                config,
+                workflow_path=workflow_path,
+                environment=resolved_environment,
+            )
+        except ConductorError as e:
+            display_validation_error(e, workflow_path, output_console)
+            return False, None
+
     # Semantic validation: cross-field references, template refs, etc.
     try:
         from conductor.config.validator import validate_workflow_config
 
-        warnings = validate_workflow_config(config, workflow_path=workflow_path)
+        environment_context = None
+        if environment is not None:
+            environment_context = {
+                "refs_found": False,
+                "environments": None,
+                "explicit": True,
+                "root_workflow_dir": workflow_path.parent,
+                "warned_no_environments": False,
+            }
+        warnings = validate_workflow_config(
+            config,
+            workflow_path=workflow_path,
+            _environment_context=cast(Any, environment_context),
+        )
         if warnings:
             for warning in warnings:
                 output_console.print(styled("  [yellow]⚠[/yellow] {}", warning))
@@ -73,10 +114,41 @@ def validate_workflow(
 
     _report_skill_discovery(config, workflow_path, output_console, already_reported=warnings)
     _report_plugins(config, workflow_path, output_console)
+    if manifest is not None and resolved_environment is not None:
+        _report_execution_resolution(manifest, resolved_environment, output_console)
     _report_mcp(config, output_console)
     _report_telemetry_sdk(output_console)
 
     return True, config
+
+
+def _report_execution_resolution(
+    manifest: ResolvedRunManifest,
+    environment: ResolvedEnvironment,
+    console: MarkupFreeConsole,
+) -> None:
+    console.print(Text.from_markup("\n[bold]Execution Resolution[/bold]"))
+
+    details = Table(show_header=False, box=None, padding=(0, 2))
+    details.add_column("Key", style="dim")
+    details.add_column("Value")
+    details.add_row("Environment", manifest.environment.name)
+    details.add_row("Source", manifest.environment.source)
+    details.add_row("Default profile", environment.document.default or "—")
+    console.print(details)
+    console.print(
+        styled("  [dim]Path:[/dim] {}", environment.path if environment.path is not None else "—"),
+        soft_wrap=True,
+    )
+
+    profiles = Table(show_header=True, header_style="bold", box=None)
+    profiles.add_column("Step")
+    profiles.add_column("Profile")
+    profiles.add_column("Backend")
+    for step, resolution in manifest.profiles.items():
+        profiles.add_row(step, resolution.profile, resolution.backend)
+    console.print(profiles)
+    console.print(styled("  [dim]Audit: {}[/dim]", manifest.audit.classification))
 
 
 def _report_telemetry_sdk(console: MarkupFreeConsole) -> None:
