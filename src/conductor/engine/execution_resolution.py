@@ -15,7 +15,11 @@ from pathlib import Path
 
 from conductor.config.environment import ResolvedEnvironment
 from conductor.config.schema import WorkflowConfig
-from conductor.engine.run_manifest import ResolvedRunManifest, compile_run_manifest
+from conductor.engine.run_manifest import (
+    ResolvedRunManifest,
+    compile_run_manifest,
+    executable_step_identity,
+)
 from conductor.execution import (
     LocalRunnerBackend,
     RunnerBackend,
@@ -131,6 +135,6 @@ class ExecutionResolver:
         for_each_group: str | None = None,
     ) -> RunnerBackend:
         """Return the backend resolved for a top-level or inline step."""
-        key = f"for_each.{for_each_group}.agent" if for_each_group is not None else name
+        key = executable_step_identity(name, for_each_group=for_each_group)
         backend_name = self._manifest.profiles[key].backend
         return self._session.backends[backend_name]

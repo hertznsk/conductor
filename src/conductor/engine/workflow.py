@@ -42,6 +42,7 @@ from conductor.engine.guidance import GuidanceChannel
 from conductor.engine.limits import LimitEnforcer
 from conductor.engine.pricing import ModelPricing
 from conductor.engine.router import Router, RouteResult
+from conductor.engine.run_manifest import executable_step_identity
 from conductor.engine.usage import UsageTracker, WorkflowUsage
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.exceptions import (
@@ -1818,7 +1819,7 @@ class WorkflowEngine:
         )
         lease = self._execution_session.lease_for_backend(
             self._execution_resolver.manifest.profiles[
-                f"for_each.{for_each_group}.agent" if for_each_group is not None else agent.name
+                executable_step_identity(agent.name, for_each_group=for_each_group)
             ].backend
         )
         return await self.limits.wait_for_with_timeout(

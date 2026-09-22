@@ -17,10 +17,14 @@ manifest can act as the audit record of *how* a run was set up to execute.
 
 The qualified for-each key keeps two inline agents that share one step name in
 different groups distinct (``for_each.first.agent`` vs
-``for_each.second.agent``). No name-uniqueness validation is performed here:
-duplicate step names silently collapse to one key, matching the engine's
-existing name-resolution semantics — this module records resolution, it does
-not tighten the schema.
+``for_each.second.agent``). The key construction lives in exactly one helper,
+:func:`executable_step_identity`, shared with the runtime resolver so the
+manifest and the run-time backend lookup can never drift apart. A generated
+key that collides with another step's key (e.g. a top-level step literally
+named ``for_each.batch.agent`` alongside a for-each group named ``batch``) is
+a hard :class:`~conductor.exceptions.ConfigurationError` naming both steps —
+one step silently overwriting the other's resolution would defeat the
+manifest's purpose as an audit record.
 
 **Scope boundary.** Only the root configuration is compiled into the manifest.
 Nested sub-workflow steps (the file a ``type: workflow`` step points at) are
@@ -38,10 +42,12 @@ resolution was hermetic.
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_serializer, field_validator
 
 from conductor.config.environment import ResolvedEnvironment
 from conductor.config.schema import (
@@ -119,9 +125,53 @@ class ResolvedRunManifest(BaseModel):
     version: Literal[1]
     workflow: WorkflowIdentity
     environment: EnvironmentIdentity
-    profiles: dict[str, ResolvedStepProfile]
+    profiles: Mapping[str, ResolvedStepProfile]
+    """Resolved profile per executable step, keyed by
+    :func:`executable_step_identity`. Stored as a defensively copied,
+    read-only mapping: the manifest is the run's audit record, so nothing
+    with a handle to it may mutate execution resolution after compilation.
+    Serialization still yields a plain ``dict`` (see the field serializer)."""
     conductor_version: str
     audit: AuditInfo
+
+    @field_validator("profiles", mode="after")
+    @classmethod
+    def _freeze_profiles(
+        cls, value: Mapping[str, ResolvedStepProfile]
+    ) -> Mapping[str, ResolvedStepProfile]:
+        """Copy into a read-only mapping so ``frozen=True`` reaches the data.
+
+        A shallow copy suffices: the values are themselves frozen models.
+        The copy happens even when the caller already passed an immutable
+        mapping — the manifest must never alias storage it does not own.
+        """
+        return MappingProxyType(dict(value))
+
+    @field_serializer("profiles")
+    def _serialize_profiles(
+        self, value: Mapping[str, ResolvedStepProfile]
+    ) -> dict[str, ResolvedStepProfile]:
+        """Serialize the read-only mapping as a plain JSON object.
+
+        ``MappingProxyType`` is otherwise opaque to Pydantic's serializer,
+        which would raise ``PydanticSerializationError`` on
+        ``model_dump(mode="json")``. Insertion order is preserved, keeping
+        the manifest's byte-deterministic dump contract.
+        """
+        return dict(value)
+
+
+def executable_step_identity(name: str, *, for_each_group: str | None = None) -> str:
+    """Manifest key for one executable step: bare name or the qualified
+    for-each form.
+
+    This is the single definition of the key shape, shared between the
+    manifest compiler and the runtime resolver — both must agree, or a run
+    would look up backends under keys the manifest never wrote.
+    """
+    if for_each_group is not None:
+        return f"for_each.{for_each_group}.agent"
+    return name
 
 
 def _conductor_version() -> str:
@@ -143,18 +193,56 @@ def _iter_executable_steps(config: WorkflowConfig) -> list[tuple[str, Executable
     """Collect ``(identity_key, step)`` for every executable step of the root config.
 
     Top-level executable steps key by their bare ``name``; inline for-each
-    agents key by ``for_each.<group_name>.agent`` (see the module docstring).
+    agents key by the qualified form (see :func:`executable_step_identity`).
     Engine-local steps (set, wait, terminate, human_gate, questions) are not
     executable and are skipped.
+
+    A generated key that two distinct steps claim (e.g. a top-level step
+    literally named ``for_each.batch.agent`` alongside a for-each group
+    named ``batch``) is a hard error naming both declarations — the
+    alternative, one step silently overwriting the other's entry, would
+    make the manifest report one step's profile for another step and stop
+    recording the overwritten step as executable at all.
     """
     steps: list[tuple[str, ExecutableStepBase]] = []
+    seen: dict[str, str] = {}
+
+    def _claim(key: str, provenance: str) -> None:
+        prior = seen.get(key)
+        if prior is not None:
+            suggestion = "Rename one of them so every executable step has a unique identity."
+            if (
+                key.startswith("for_each.")
+                and key.endswith(".agent")
+                and ("top-level" in prior or "top-level" in provenance)
+            ):
+                # The generated for-each form is the one collision an author
+                # cannot see from their own step names alone — call it out.
+                suggestion += (
+                    " A top-level step named 'for_each.<group>.agent' always "
+                    "collides with that group's inline agent."
+                )
+            raise ConfigurationError(
+                f"Executable step identity '{key}' is claimed by both {prior} "
+                f"and {provenance}. Rename one of them.",
+                suggestion=suggestion,
+            )
+        seen[key] = provenance
+
     for step in config.agents:
         if isinstance(step, ExecutableStepBase):
-            steps.append((step.name, step))
+            key = executable_step_identity(step.name)
+            _claim(key, f"top-level executable step '{step.name}'")
+            steps.append((key, step))
     for group in config.for_each:
         agent = group.agent
         if isinstance(agent, ExecutableStepBase):
-            steps.append((f"for_each.{group.name}.agent", agent))
+            key = executable_step_identity(agent.name, for_each_group=group.name)
+            _claim(
+                key,
+                f"inline executable step '{agent.name}' in for-each group '{group.name}'",
+            )
+            steps.append((key, agent))
     return steps
 
 

@@ -210,6 +210,109 @@ def test_manifest_is_frozen() -> None:
         WorkflowIdentity.model_validate({"name": "x", "digest": None, "extra": "nope"})
 
 
+def test_generated_identity_collision_is_a_hard_error() -> None:
+    # Requirement (PR #551 review): a top-level step named exactly like a
+    # generated for-each key ('for_each.batch.agent') collides with the
+    # inline agent of group 'batch'. One silently overwriting the other
+    # would report one step's profile for the other step, so compilation
+    # must fail naming the key and both declarations.
+    config = WorkflowConfig(
+        workflow=WorkflowDef(name="collision", entry_point="for_each.batch.agent"),
+        agents=[_agent("for_each.batch.agent")],
+        for_each=[
+            ForEachDef(
+                name="batch",
+                type="for_each",
+                source="workflow.input.items",
+                **{"as": "item"},
+                agent=AgentDef(name="worker", model="gpt-4", prompt="a"),
+            ),
+        ],
+        output={"result": "{{ start.output.value }}"},
+    )
+
+    with pytest.raises(ConfigurationError) as exc_info:
+        compile_run_manifest(config, workflow_path=None, environment=builtin_local_environment())
+
+    message = str(exc_info.value)
+    assert "for_each.batch.agent" in message
+    assert "for_each.batch.agent'" in message  # the top-level step name
+    assert "batch" in message  # the for-each group
+    assert "worker" in message  # the inline agent
+
+
+class TestProfilesImmutability:
+    """Requirement (PR #551 review): the frozen manifest's profiles mapping is
+    itself immutable — frozen=True covers attribute assignment only, not the
+    dict underneath it, and the ExecutionResolver reads that same mapping."""
+
+    def _manifest(self) -> Any:
+        return compile_run_manifest(
+            _single_agent_config(), workflow_path=None, environment=builtin_local_environment()
+        )
+
+    def test_caller_dict_mutation_does_not_leak_into_manifest(self) -> None:
+        # Requirement: the manifest defensively copies the caller's dict, so
+        # mutating the source after construction cannot change the audit record.
+        source = {"start": ResolvedStepProfile(profile="default", backend="local")}
+        manifest = run_manifest.ResolvedRunManifest(
+            version=1,
+            workflow=WorkflowIdentity(name="x", digest=None),
+            environment=EnvironmentIdentity(name="e", source="builtin", digest="sha256:0"),
+            profiles=source,
+            conductor_version="test",
+            audit=AuditInfo(hermetic=False, classification="non-hermetic-compatibility"),
+        )
+        source["start"] = ResolvedStepProfile(profile="tampered", backend="other")
+        source["injected"] = ResolvedStepProfile(profile="default", backend="local")
+
+        assert manifest.profiles["start"] == ResolvedStepProfile(profile="default", backend="local")
+        assert set(manifest.profiles) == {"start"}
+
+    def test_item_assignment_raises_type_error(self) -> None:
+        # Requirement: insertion and replacement via item assignment raise
+        # TypeError on the read-only mapping — not just the model attribute
+        # assignment that frozen=True already covered.
+        manifest = self._manifest()
+        with pytest.raises(TypeError):
+            manifest.profiles["injected"] = ResolvedStepProfile(profile="default", backend="local")
+        with pytest.raises(TypeError):
+            manifest.profiles["start"] = ResolvedStepProfile(profile="tampered", backend="local")
+
+    def test_item_deletion_raises_type_error(self) -> None:
+        # Requirement: deletion via 'del' raises TypeError on the read-only
+        # mapping, so individual entries cannot be removed from the audit record.
+        manifest = self._manifest()
+        with pytest.raises(TypeError):
+            del manifest.profiles["start"]
+
+    def test_mutating_helpers_are_absent(self) -> None:
+        # Requirement: dict mutators (clear/pop/update/setdefault) do not exist
+        # on the read-only mapping at all — attempting to call them raises
+        # AttributeError, so the audit record cannot be emptied or merged into.
+        manifest = self._manifest()
+        for helper in ("clear", "pop", "popitem", "setdefault", "update", "__setitem__"):
+            with pytest.raises(AttributeError):
+                getattr(manifest.profiles, helper)()
+
+    def test_model_dump_serializes_profiles_as_plain_dict(self) -> None:
+        # Requirement: the read-only mapping still serializes to a plain JSON
+        # object — MappingProxyType is opaque to pydantic without an explicit
+        # serializer, and the manifest's byte-deterministic dump contract must
+        # survive immutability.
+        manifest = self._manifest()
+        dumped = manifest.model_dump(mode="json")
+        assert dumped["profiles"] == {"start": {"profile": "default", "backend": "local"}}
+        json.dumps(dumped, sort_keys=True)
+
+    def test_profiles_copy_is_read_only(self) -> None:
+        # Requirement: the stored mapping is a MappingProxyType over a copy —
+        # later mutation of any dict handed in at construction cannot alias
+        # manifest state (complements the leak test above at the type level).
+        manifest = self._manifest()
+        assert type(manifest.profiles).__name__ == "mappingproxy"
+
+
 class TestPrecedence:
     """Requirement: profile resolution follows step > workflow defaults > environment default."""
 
