@@ -2418,7 +2418,12 @@ async def run_workflow_async(
         # reference that misses every document must fail here — before any
         # provider connects — surfacing through the CLI's ``print_error`` path.
         resolved_environment = None
-        if environment:
+        # ``is not None``, not truthiness: an explicitly empty selection
+        # (``--environment ""``, e.g. an unset variable forwarded as
+        # ``--environment "$ENVIRONMENT"``) must reach ``resolve_environment``
+        # and fail clearly, not silently fall back to the built-in
+        # environment — matching ``conductor validate``.
+        if environment is not None:
             from conductor.config.environment import resolve_environment
 
             resolved_environment = resolve_environment(
@@ -2825,7 +2830,10 @@ def build_dry_run_plan(workflow_path: Path, *, environment: str | None = None) -
     # Mirror the real run's up-front resolution so a bad ``--environment``
     # fails the dry run before any plan output is produced.
     resolved_environment = None
-    if environment:
+    # ``is not None``, not truthiness — parity with ``run_workflow_async``:
+    # an explicitly empty selection must fail in ``resolve_environment``
+    # rather than silently resolve against the built-in environment.
+    if environment is not None:
         from conductor.config.environment import resolve_environment
 
         resolved_environment = resolve_environment(environment, workflow_dir=workflow_path.parent)
@@ -3095,7 +3103,10 @@ async def resume_workflow_async(
         # unresolvable name or a profile reference that misses every document
         # must fail before the resumed engine is ever built.
         resolved_environment = None
-        if environment:
+        # ``is not None``, not truthiness — parity with ``run_workflow_async``:
+        # an explicitly empty selection must fail in ``resolve_environment``
+        # rather than silently resolve against the built-in environment.
+        if environment is not None:
             from conductor.config.environment import resolve_environment
 
             resolved_environment = resolve_environment(

@@ -2358,8 +2358,14 @@ def _extend_cmd_with_environment(cmd: list[str], environment: str | None) -> Non
     ``~/env.yaml`` would reach the child still tilde-prefixed and fail to
     load. ``Path.expanduser()`` runs first, then ``os.path.abspath`` anchors
     the result to this (the launching) process's cwd.
+
+    ``None`` means "no flag": nothing is forwarded and the child resolves
+    against its own defaults. An explicitly empty value, by contrast, is
+    forwarded verbatim (``["--environment", ""]``) so the child fails with
+    ``resolve_environment``'s clear non-empty-string error instead of the
+    launcher silently dropping a selection the user thought they made.
     """
-    if not environment:
+    if environment is None:
         return
     from conductor.config.environment import is_path_reference
 
