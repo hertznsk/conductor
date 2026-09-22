@@ -320,7 +320,7 @@ When called with a workflow file (`conductor resume workflow.yaml`) or without a
 
 ### Execution Environment on Resume
 
-When resuming with `--environment`, resume re-resolves execution profiles against the given environment and does not compare with the original run's manifest (manifest comparison is a future step). If `--environment` is omitted on resume, Conductor resolves execution profiles using the standard discovery cascade for the workflow file.
+When resuming with `--environment`, resume re-resolves execution profiles against the given environment and does not compare with the original run's manifest (manifest comparison is a future step). If `--environment` is omitted, resume resolves execution profiles against the built-in `local/default` environment — it does **not** restore or rediscover the environment selected for the original run. Repeat the original `--environment` value when the workflow depends on profiles that are not present in the built-in environment.
 
 ### Examples
 
