@@ -63,7 +63,12 @@ async def test_provider_free_workflow_output_shape_pinned() -> None:
 
     result = await WorkflowEngine(config, MagicMock(), event_emitter=emitter).run({})
 
-    assert result == {"greeting": "hello", "said": "hello\n", "code": 42}
+    # The child emits the platform-native text newline (\r\n on Windows);
+    # the parity requirement concerns the output shape and value, not LF
+    # versus CRLF — compare line content, matching the test_script.py
+    # precedent for cross-platform newline handling.
+    normalized_result = {**result, "said": result["said"].splitlines()}
+    assert normalized_result == {"greeting": "hello", "said": ["hello"], "code": 42}
     assert [event.type for event in events] == [
         "workflow_started",
         "agent_started",

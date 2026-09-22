@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -26,6 +27,16 @@ from conductor.cli.app import app
 from conductor.engine.checkpoint import CheckpointManager
 
 runner = CliRunner()
+
+# GitHub Actions exports GITHUB_ACTIONS, which typer reads at import time to
+# force terminal styling — the highlighter then renders "--environment" as
+# ANSI-styled fragments, so the literal substring never appears. Strip ANSI
+# before asserting on help text.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+# Pinned width so rich does not wrap or ellipsis the options table on narrow
+# CI terminals (same pattern as test_help_panels.py / test_mcp_serve.py).
+_WIDE = {"COLUMNS": "200"}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -441,8 +452,11 @@ def test_tilde_environment_path_expanded_before_forwarding(
     argv — in BOTH builders. `abspath("~/x.yaml")` does not expand home."""
     from conductor.cli import bg_runner
 
-    # Anchor `~` at tmp_path and place the document there.
+    # Anchor `~` at tmp_path and place the document there. Windows resolves
+    # `~` from USERPROFILE rather than HOME, so both must be pinned (the
+    # repo-wide pattern for expanduser tests).
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     (tmp_path / "env.yaml").write_text(_ENV_YAML, encoding="utf-8")
     expected = os.path.abspath(str(tmp_path / "env.yaml"))
     assert expected == str(tmp_path / "env.yaml")  # tmp_path is already absolute
@@ -570,8 +584,11 @@ def test_run_with_missing_environment_exits_1_and_lists_searched_paths(
     error output lists every location that was searched."""
     wf_path = _write_workflow(tmp_path)
     # A short user-level root keeps the searched-path lines inside the
-    # error panel's width, so the list is assertable verbatim.
-    monkeypatch.setenv("CONDUCTOR_HOME", "/tmp/ce")
+    # error panel's width, so the list is assertable verbatim. The expected
+    # path is built with Path so platform separators match the resolver's
+    # own construction on Windows.
+    conductor_home = Path("/tmp/ce")
+    monkeypatch.setenv("CONDUCTOR_HOME", str(conductor_home))
 
     result = runner.invoke(app, ["run", str(wf_path), "--environment", "definitely-missing"])
 
@@ -580,7 +597,8 @@ def test_run_with_missing_environment_exits_1_and_lists_searched_paths(
     assert "Searched:" in result.output
     # The user-level candidate must be enumerated in the output, proving
     # the searched list is rendered and not truncated to the headline.
-    assert "/tmp/ce/environments/definitely-missing.yaml" in result.output
+    expected = str(conductor_home / "environments" / "definitely-missing.yaml")
+    assert expected in result.output
 
 
 def test_run_with_environment_name_outside_charset_exits_1(tmp_path: Path) -> None:
@@ -616,7 +634,8 @@ def test_run_command_empty_environment_exits_1(tmp_path: Path) -> None:
 def test_environment_help_rendered(command: str) -> None:
     """Requirement: --environment shows up in each command's --help and the
     help string survives rich markup parsing (no unescaped brackets)."""
-    result = runner.invoke(app, [command, "--help"])
+    result = runner.invoke(app, [command, "--help"], env=_WIDE)
     assert result.exit_code == 0
-    assert "--environment" in result.output
-    assert "Execution environment" in result.output
+    rendered = _ANSI_RE.sub("", result.output)
+    assert "--environment" in rendered
+    assert "Execution environment" in rendered
