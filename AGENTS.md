@@ -476,10 +476,13 @@ loop to a remote sandbox**: `AcaRuntimeProvider` is a thin host-side
 transport shim that derives a session identifier, authenticates via
 `DefaultAzureCredential`, and relays NDJSON event frames from an
 in-container `conductor-agent-runner` (which itself wraps a real
-`CopilotProvider`) verbatim to `event_callback`. Because the runner
-re-emits Conductor's own event vocabulary and forwards a real
-`CopilotProvider`'s output, this achieves **full event and output
-parity** (`mcp_tools`, `streaming_events`, `agent_reasoning_events`, and
+`CopilotProvider`) verbatim to `event_callback`. The wire contract lives
+in `conductor.runner.protocol` (issue #527), with
+`conductor.providers.aca_protocol` retained as a deprecated re-export shim
+(emits `DeprecationWarning` on import; will be removed in a future major
+release). Because the runner re-emits Conductor's own event vocabulary and
+forwards a real `CopilotProvider`'s output, this achieves **full event and
+output parity** (`mcp_tools`, `streaming_events`, `agent_reasoning_events`, and
 `reasoning_effort` are all declared `True`) — with the following carve-outs:
 
 **Inner Copilot credential (DD4).** The sandbox's Copilot session can't do
@@ -584,8 +587,10 @@ it will pick up the developer's real token (see
   see `docs/projects/aca/aca-provider.design.md`'s *Identifier as a
   capability* bullet and `docs/providers/aca.md#security`.
 
-Full architecture, the runner `/execute`/`/health` contract, the NDJSON
-frame schema, and the credential/security model are documented in
+Full architecture, the runner `/execute`/`/health` contract, the wire
+protocol (`conductor.runner.protocol` design at `docs/design/runner-protocol.md`;
+`conductor.providers.aca_protocol` is a deprecated shim), the NDJSON frame
+schema, and the credential/security model are documented in
 `docs/providers/aca.md` and the source design at
 `docs/projects/aca/aca-provider.design.md`.
 

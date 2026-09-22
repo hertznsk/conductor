@@ -121,3 +121,25 @@ of the token gate can never drift apart. It is checked on `/execute` only;
 - **Bump `RUNNER_PROTOCOL_VERSION` only on an incompatible change** — a
   removed or retyped field, never an addition. A version mismatch is a
   compatibility warning (warn-only), never a hard failure.
+
+## Deprecation
+
+`conductor.providers.aca_protocol` is now a deprecated re-export shim over
+`conductor.runner.protocol`. Importing it emits a `DeprecationWarning`, and the
+module will be removed in a future major release.
+
+Legacy name mapping:
+
+- `AcaAgentPayload` re-exports `RunnerAgentPayload`
+- `AcaExecuteRequest` re-exports `RunnerAgentRequest`
+- `AcaEventFrame` re-exports `RunnerEventFrame`
+- `AcaResultData` re-exports `RunnerAgentResult`
+- `AcaErrorData` re-exports `AcaGatewayErrorData` (the ACA error adapter subclass
+  defined in `conductor.providers.aca`, while the backend-neutral base is
+  `RunnerErrorData`)
+- `RUNNER_TOKEN_HEADER` is re-exported unchanged
+
+Importing the legacy shim pulls in `conductor.providers.aca` due to the
+`AcaGatewayErrorData` binding, adding import overhead. In-tree modules and runner
+images import only `conductor.runner.protocol`. All external callers should
+update their imports to `conductor.runner.protocol`.
