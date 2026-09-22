@@ -184,6 +184,13 @@ def load_environment_document(path: Path) -> EnvironmentDocument:
     path = Path(path)
     try:
         content = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise ConfigurationError(
+            f"Environment document '{path}' is not valid UTF-8: {exc}",
+            suggestion="Save the document as UTF-8 (re-export or re-encode the "
+            "file); environment documents are read strictly as UTF-8.",
+            file_path=str(path),
+        ) from exc
     except OSError as exc:
         raise ConfigurationError(
             f"Failed to read environment document '{path}': {exc}",
@@ -243,7 +250,17 @@ def _project_environment_dirs(workflow_dir: Path) -> list[Path]:
     ``workflow_dir`` alone: climbing an unversioned tree to the filesystem
     root would sweep in unrelated directories, the same collapse
     ``skills.discovery._project_roots`` performs.
+
+    The anchor is first made absolute and normalized with
+    ``os.path.abspath``: a *relative* workflow directory (e.g. ``Path('.')``
+    when the CLI was invoked from a subdirectory) has no ``.parents``, so
+    the ancestor walk would never reach the repository root and a real
+    root-level environment document would be silently missed. ``abspath``
+    rather than ``Path.resolve()`` deliberately preserves symlink aliases,
+    matching the repo-wide "normpath, not resolve" convention for
+    user-typed paths.
     """
+    workflow_dir = Path(os.path.abspath(workflow_dir))
     ancestors: list[Path] = []
     for directory in (workflow_dir, *workflow_dir.parents):
         ancestors.append(directory)

@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from typer.testing import CliRunner
 
 from conductor.cli.app import app
@@ -192,6 +193,48 @@ def test_malformed_environment_fatal_with_flag(tmp_path: Path) -> None:
 
     assert exit_code == 1
     assert "Validation Failed" in output
+
+
+def test_validate_from_subdirectory_resolves_root_project_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement (PR #551 review, blocking): invoked from a subdirectory with
+    # a RELATIVE workflow path, validate must still find the repository root's
+    # project document — and a same-named user document must not win.
+    root = _repo(tmp_path)
+    _write_environment(root, "prod", ["shell"])
+    home = tmp_path / "isolated-home"
+    (home / "environments").mkdir(parents=True)
+    (home / "environments" / "prod.yaml").write_text(
+        "default: user_only\nprofiles:\n  user_only:\n    backend: local\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CONDUCTOR_HOME", str(home))
+
+    sub = root / "sub"
+    sub.mkdir()
+    workflow_path = _write_workflow(root)
+    workflow_path.rename(sub / "workflow.yaml")
+
+    monkeypatch.chdir(sub)
+    exit_code, output = _invoke_validate(Path("workflow.yaml"), "--environment", "prod")
+
+    assert exit_code == 0
+    assert "Execution Resolution" in output
+    assert "Source" in output and "project" in output
+
+
+def test_validate_empty_environment_rejected(tmp_path: Path) -> None:
+    # Requirement (PR #551 review): an explicitly empty --environment must
+    # fail clearly instead of silently validating against the built-in
+    # environment — run and validate must agree on what empty means.
+    root = _repo(tmp_path)
+    workflow_path = _write_workflow(root, profile=None)
+
+    exit_code, output = _invoke_validate(workflow_path, "--environment", "")
+
+    assert exit_code == 1
+    assert "non-empty" in output
 
 
 def test_profile_less_workflow_byte_identical_output(tmp_path: Path) -> None:

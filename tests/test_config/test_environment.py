@@ -169,6 +169,18 @@ class TestLoadEnvironmentDocument:
             load_environment_document(path)
         assert exc_info.value.file_path == str(path)
 
+    def test_invalid_utf8_raises_configuration_error_naming_path(self, tmp_path: Path) -> None:
+        # Requirement: a document that is not valid UTF-8 raises
+        # ConfigurationError naming the path and the UTF-8 failure — not a
+        # raw UnicodeDecodeError — with an encoding-specific fix suggestion.
+        path = tmp_path / "latin1.yaml"
+        path.write_bytes(b"default: default\nprofiles:\n  default:\n    backend: local\n\xff\n")
+        with pytest.raises(ConfigurationError) as exc_info:
+            load_environment_document(path)
+        assert exc_info.value.file_path == str(path)
+        assert "UTF-8" in str(exc_info.value)
+        assert str(path) in str(exc_info.value)
+
     def test_no_env_var_expansion(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         # Requirement: ${VAR} is NOT expanded in environment documents — the
         # literal '${EP_ENV_NAME}' reaches the schema and fails validation,
@@ -349,6 +361,42 @@ class TestResolveEnvironment:
         with pytest.raises(ConfigurationError):
             resolve_environment("broken", workflow_dir=workflow_dir)
 
+    def test_explicit_resolution_of_invalid_utf8_document_is_fatal(self, tmp_path: Path) -> None:
+        # Requirement (PR #551 review): explicit resolution of a bad-encoded
+        # document surfaces a contextual ConfigurationError (path + UTF-8),
+        # not a raw UnicodeDecodeError traceback.
+        workflow_dir = _repo_with_marker(tmp_path)
+        (tmp_path / "repo" / ".conductor" / "environments").mkdir(parents=True)
+        (tmp_path / "repo" / ".conductor" / "environments" / "broken.yaml").write_bytes(
+            b"profiles:\n  p:\n    backend: local\n\xff\n"
+        )
+        with pytest.raises(ConfigurationError, match="UTF-8"):
+            resolve_environment("broken", workflow_dir=workflow_dir)
+
+    def test_relative_workflow_dir_from_subdirectory_finds_repo_root_document(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Requirement (PR #551 review, blocking): a RELATIVE workflow
+        # directory (Path('.') when the CLI runs from a subdirectory) has no
+        # .parents, so without normalization the walk would miss the repo
+        # root document entirely. The root project document must win over a
+        # same-named user document — never the silent user fallback.
+        monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path / "isolated-home"))
+        sub = _repo_with_marker(tmp_path)
+        _write(
+            tmp_path / "repo" / ".conductor" / "environments" / "prod.yaml",
+            "profiles:\n  project_only:\n    backend: local\n",
+        )
+        _write(
+            tmp_path / "isolated-home" / "environments" / "prod.yaml",
+            "profiles:\n  user_only:\n    backend: local\n",
+        )
+        monkeypatch.chdir(sub)
+        resolved = resolve_environment("prod", workflow_dir=Path("."))
+        assert resolved.source == "project"
+        assert "project_only" in resolved.document.profiles
+        assert "user_only" not in resolved.document.profiles
+
 
 class TestShadowing:
     """Negative controls for the no-merge policy."""
@@ -429,6 +477,25 @@ class TestDiscoverAll:
         assert set(discovered) == {"good"}
         assert len(warnings) == 1
         assert str(broken) in warnings[0]
+
+    def test_invalid_utf8_document_warns_and_is_skipped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Requirement (PR #551 review): one bad-encoded document must not
+        # abort ambient discovery — it warns naming the file while the other
+        # valid document still resolves.
+        monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path / "isolated-home"))
+        workflow_dir = _repo_with_marker(tmp_path)
+        envs = tmp_path / "repo" / ".conductor" / "environments"
+        envs.mkdir(parents=True)
+        (envs / "broken.yaml").write_bytes(b"profiles:\n  p:\n    backend: local\n\xff\n")
+        _write(envs / "good.yaml", _VALID_DOCUMENT)
+        warnings: list[str] = []
+        discovered = discover_all_environments(workflow_dir, on_warning=warnings.append)
+        assert set(discovered) == {"good"}
+        assert len(warnings) == 1
+        assert "broken.yaml" in warnings[0]
+        assert "UTF-8" in warnings[0]
 
     def test_walk_stops_at_repo_marker(self, tmp_path: Path) -> None:
         # Requirement: discovery never sweeps directories above the repository
