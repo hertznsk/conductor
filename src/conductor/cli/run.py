@@ -26,7 +26,14 @@ from rich.text import Text
 
 from conductor.config.loader import load_config
 from conductor.config.schema import AgentDef
-from conductor.console import MarkupFreeConsole, join, make_console, select_console_glyph, styled
+from conductor.console import (
+    MarkupFreeConsole,
+    clear_nonblocking_fd,
+    join,
+    make_console,
+    select_console_glyph,
+    styled,
+)
 from conductor.engine.workflow import ExecutionPlan, WorkflowEngine
 from conductor.exceptions import WorkflowTerminated
 from conductor.mcp_auth import resolve_mcp_server_config
@@ -73,6 +80,14 @@ class _SilentAwareConsole(MarkupFreeConsole):
         # width, etc.) is caller-tunable.
         kwargs.pop("stderr", None)
         super().__init__(stderr=True, **kwargs)
+        # stderr can be a non-blocking pipe with a slow/absent reader (#543).
+        # Fix the fd up front so a write blocks for the reader instead of
+        # raising: rich only clears its internal render buffer *after* a
+        # successful write, so catching the error post hoc and moving on
+        # would leave that panel's segments queued, and the next print()
+        # would re-render them ahead of its own content, growing without
+        # bound. clear_nonblocking_fd() avoids ever hitting that path.
+        clear_nonblocking_fd(self.file)
 
     def print(self, *args: Any, **kwargs: Any) -> None:
         # Lazy import to avoid the cli.run -> cli.app import cycle at module
@@ -80,7 +95,12 @@ class _SilentAwareConsole(MarkupFreeConsole):
         from conductor.cli.app import is_verbose
 
         if is_verbose():
-            super().print(*args, **kwargs)
+            # Fallback only: __init__ already clears O_NONBLOCK on this
+            # console's stream, so this should not fire in practice. Kept
+            # in case the flag gets reset on us mid-run; a raise here would
+            # replace the real workflow error with an unrelated one.
+            with contextlib.suppress(BlockingIOError):
+                super().print(*args, **kwargs)
 
 
 _verbose_console = _SilentAwareConsole(highlight=False)
@@ -826,6 +846,20 @@ def verbose_log_for_each_summary(
 _PRINTED_EXPERIMENTAL_BANNERS: set[str] = set()
 
 
+def _native_tools_claude_code_warning() -> Text:
+    """The banner line for ``runtime.provider.native_tools: claude_code``.
+
+    A function rather than a module-level ``Text`` because ``Text`` is
+    mutable and the panel body is assembled with ``join``, so a shared
+    instance could carry one render's state into the next.
+    """
+    return Text.from_markup(
+        "[bold yellow]native_tools: claude_code[/bold yellow] — agents that omit "
+        "'tools:' get filesystem read/write, shell, web and editing tools with "
+        "permissions approved automatically. working_dir is not a sandbox."
+    )
+
+
 def _maybe_print_experimental_banner(data: dict[str, Any]) -> None:
     """Print one Rich banner per unique experimental provider in the workflow.
 
@@ -901,6 +935,13 @@ def _maybe_print_experimental_banner(data: dict[str, Any]) -> None:
         body_lines = [styled("⚠ Experimental provider in use: {}", header)]
         if limitations:
             body_lines.append(Text("Limitations: " + ", ".join(limitations) + "."))
+        if meta.get("native_tools") == "claude_code":
+            # One fixed literal, parsed for its own styling only: nothing from
+            # the run is interpolated, so there is no value for the markup
+            # parser to misread. Keyed off the same banner, so it inherits the
+            # banner's run-scoped latch and `--silent` suppression rather than
+            # needing a lifecycle of its own.
+            body_lines.append(_native_tools_claude_code_warning())
         body_lines.append(
             Text.from_markup(
                 "See [link]docs/providers/experimental.md[/link] for stability policy."
@@ -2881,7 +2922,9 @@ def build_dry_run_plan(workflow_path: Path, *, environment: str | None = None) -
             custom_agents: list[dict[str, Any]] | None = None,
             extra_mcp_servers: dict[str, Any] | None = None,
             continuation_state: object | None = None,
+            suppress_mcp_servers: bool = False,
         ) -> AgentOutput:
+            del suppress_mcp_servers  # Dry run: nothing executes, no MCP surface.
             return AgentOutput(content={}, raw_response="")
 
         async def validate_connection(self) -> bool:
