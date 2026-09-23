@@ -2222,6 +2222,7 @@ async def run_workflow_async(
     workspace_instructions: bool = False,
     cli_instructions: list[str] | None = None,
     print_loaded_instructions: bool = False,
+    environment: str | None = None,
 ) -> dict[str, Any]:
     """Execute a workflow asynchronously.
 
@@ -2241,6 +2242,9 @@ async def run_workflow_async(
         print_loaded_instructions: If True, print the resolved instruction file
             list (with scope and inclusion reason) to stderr before running.
             No-op unless ``workspace_instructions`` is also True.
+        environment: Optional execution environment name or path to an
+            environment document, resolved against the workflow file's
+            directory and handed to the engine as ``execution_environment``.
 
     Returns:
         The workflow output as a dictionary.
@@ -2450,6 +2454,23 @@ async def run_workflow_async(
         # cache costs a visible startup step rather than a stalled agent.
         plugin_marketplaces = await _prefetch_plugin_sources(config, workflow_path)
 
+        # Resolve the execution environment up front: the engine compiles the
+        # run manifest at construction, so an unresolvable name or a profile
+        # reference that misses every document must fail here — before any
+        # provider connects — surfacing through the CLI's ``print_error`` path.
+        resolved_environment = None
+        # ``is not None``, not truthiness: an explicitly empty selection
+        # (``--environment ""``, e.g. an unset variable forwarded as
+        # ``--environment "$ENVIRONMENT"``) must reach ``resolve_environment``
+        # and fail clearly, not silently fall back to the built-in
+        # environment — matching ``conductor validate``.
+        if environment is not None:
+            from conductor.config.environment import resolve_environment
+
+            resolved_environment = resolve_environment(
+                environment, workflow_dir=workflow_path.parent
+            )
+
         # Check if workflow uses multiple providers (has per-agent provider overrides)
         uses_multi_provider = any(
             isinstance(agent, AgentDef) and agent.provider is not None for agent in config.agents
@@ -2494,6 +2515,7 @@ async def run_workflow_async(
                 web_dashboard=dashboard,
                 instructions_preamble=instructions_preamble,
                 plugin_marketplaces=plugin_marketplaces,
+                execution_environment=resolved_environment,
                 run_context=RunContext(
                     run_id=event_log_subscriber.run_id if event_log_subscriber else "",
                     log_file=str(event_log_subscriber.path) if event_log_subscriber else "",
@@ -2826,7 +2848,7 @@ def display_execution_plan(plan: ExecutionPlan, console: Console | None = None) 
     output_console.print(join(" | ", summary_parts))
 
 
-def build_dry_run_plan(workflow_path: Path) -> ExecutionPlan:
+def build_dry_run_plan(workflow_path: Path, *, environment: str | None = None) -> ExecutionPlan:
     """Build an execution plan for dry-run mode.
 
     Loads the workflow configuration and builds an execution plan
@@ -2834,12 +2856,28 @@ def build_dry_run_plan(workflow_path: Path) -> ExecutionPlan:
 
     Args:
         workflow_path: Path to the workflow YAML file.
+        environment: Optional execution environment name or path, resolved
+            against the workflow file's directory. When set, the plan's mock
+            engine compiles the run manifest at construction — the same
+            fail-fast preflight as a real run — but the rendered plan output
+            is unchanged.
 
     Returns:
         ExecutionPlan showing the workflow structure.
     """
     # Load configuration
     config = load_config(workflow_path)
+
+    # Mirror the real run's up-front resolution so a bad ``--environment``
+    # fails the dry run before any plan output is produced.
+    resolved_environment = None
+    # ``is not None``, not truthiness — parity with ``run_workflow_async``:
+    # an explicitly empty selection must fail in ``resolve_environment``
+    # rather than silently resolve against the built-in environment.
+    if environment is not None:
+        from conductor.config.environment import resolve_environment
+
+        resolved_environment = resolve_environment(environment, workflow_dir=workflow_path.parent)
 
     # Create engine without provider (we won't execute anything)
     # We need a dummy provider for the constructor, but we won't use it
@@ -2895,7 +2933,12 @@ def build_dry_run_plan(workflow_path: Path) -> ExecutionPlan:
         async def close(self) -> None:
             pass
 
-    engine = WorkflowEngine(config, provider=_MockProvider())
+    engine = WorkflowEngine(
+        config,
+        provider=_MockProvider(),
+        workflow_path=workflow_path,
+        execution_environment=resolved_environment,
+    )
     return engine.build_execution_plan()
 
 
@@ -2948,6 +2991,7 @@ async def resume_workflow_async(
     web_bg: bool = False,
     metadata: dict[str, str] | None = None,
     guidance: list[str] | None = None,
+    environment: str | None = None,
 ) -> dict[str, Any]:
     """Resume a workflow from a checkpoint.
 
@@ -2981,6 +3025,11 @@ async def resume_workflow_async(
             ``engine.add_user_guidance(text, source="cli")`` for each entry,
             in order, before the dashboard's ``workflow_started`` is
             prepended so the seeded history reflects the applied guidance.
+        environment: Optional execution environment name or path to an
+            environment document (run/resume parity), resolved against the
+            resumed workflow file's directory. A resumed run re-resolves the
+            environment from scratch — nothing is compared against the
+            original run's manifest.
 
     Returns:
         The workflow output as a dictionary.
@@ -3091,6 +3140,21 @@ async def resume_workflow_async(
         # Apply provider override if specified (parity with run).
         # See ``run_workflow_async`` for why we re-validate via assignment.
         _apply_provider_override(config, provider_override)
+
+        # Resolve the execution environment up front (parity with run): the
+        # engine compiles the run manifest at construction, so an
+        # unresolvable name or a profile reference that misses every document
+        # must fail before the resumed engine is ever built.
+        resolved_environment = None
+        # ``is not None``, not truthiness — parity with ``run_workflow_async``:
+        # an explicitly empty selection must fail in ``resolve_environment``
+        # rather than silently resolve against the built-in environment.
+        if environment is not None:
+            from conductor.config.environment import resolve_environment
+
+            resolved_environment = resolve_environment(
+                environment, workflow_dir=resolved_workflow_path.parent
+            )
 
         # Verify the current_agent exists in the workflow
         agent_names = {a.name for a in config.agents}
@@ -3240,6 +3304,7 @@ async def resume_workflow_async(
                 web_dashboard=dashboard,
                 instructions_preamble=cp.instructions_preamble,
                 plugin_marketplaces=plugin_marketplaces,
+                execution_environment=resolved_environment,
                 run_context=RunContext(
                     run_id=event_log_subscriber.run_id,
                     log_file=str(event_log_subscriber.path),

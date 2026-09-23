@@ -6,6 +6,7 @@ Complete command-line reference for Conductor.
 
 - [Root-Level Options](#root-level-options)
 - [`conductor run`](#conductor-run)
+- [`conductor resume`](#conductor-resume)
 - [`conductor status`](#conductor-status)
 - [`conductor stop`](#conductor-stop)
 - [`conductor fleet`](#conductor-fleet)
@@ -64,6 +65,7 @@ conductor run <workflow.yaml> [OPTIONS]
 | `--workspace-instructions` | | Auto-discover convention files (`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, and `.github/instructions/**/*.instructions.md`) by walking from CWD up to the git root. Concatenated and prepended to every agent's prompt. See [Workspace Instructions](#workspace-instructions) below for details on the `.github/instructions/` directory convention. |
 | `--instructions PATH` | | Explicit path to an instructions file (repeatable). Combines with auto-discovered files when both flags are used. |
 | `--provider PROVIDER` | `-p` | Override provider (copilot, claude, claude-agent-sdk, hermes) |
+| `--environment <name\|PATH>` | | Execution environment: a name resolved via `.conductor/environments/` (project then user level) or a path to an environment document. |
 | `--dry-run` | | Show execution plan without running |
 | `--skip-gates` | | Auto-select first option at human gates |
 | `--log-file <auto\|PATH>` | `-l` | Write full debug output to a file |
@@ -287,6 +289,53 @@ conductor run workflow.yaml --input config='{"key": "value", "count": 5}'
 conductor run workflow.yaml --input text="Line 1
 Line 2
 Line 3"
+```
+
+## `conductor resume`
+
+Resume a failed or interrupted workflow run from a saved checkpoint.
+
+```bash
+conductor resume [WORKFLOW] [OPTIONS]
+conductor resume --from <CHECKPOINT_PATH> [OPTIONS]
+```
+
+When called with a workflow file (`conductor resume workflow.yaml`) or without arguments, Conductor resolves the latest checkpoint for that workflow. Pass `--from` to resume from a specific checkpoint file path.
+
+### Options
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--from PATH` | | Explicit path to a checkpoint JSON file to resume from |
+| `--provider PROVIDER` | `-p` | Override provider (copilot, claude, claude-agent-sdk, hermes) |
+| `--metadata KEY=VALUE` | `-m` | Workflow metadata (repeatable). Merged on top of checkpoint metadata. |
+| `--environment <name\|PATH>` | | Execution environment: a name resolved via `.conductor/environments/` (project then user level) or a path to an environment document. |
+| `--guidance TEXT` | | Mid-run guidance to apply to the restored context before execution resumes (repeatable) |
+| `--skip-gates` | | Auto-select first option at human gates |
+| `--log-file <auto\|PATH>` | `-l` | Write full debug output to a file |
+| `--web` | | Start a real-time web dashboard |
+| `--web-bg` | | Run in background, print dashboard URL, exit |
+| `--web-port PORT` | | Port for web dashboard (0 = auto-select) |
+| `--no-interactive` | | Disable Esc-to-interrupt capability |
+
+### Execution Environment on Resume
+
+When resuming with `--environment`, resume re-resolves execution profiles against the given environment and does not compare with the original run's manifest (manifest comparison is a future step). If `--environment` is omitted, resume resolves execution profiles against the built-in `local/default` environment — it does **not** restore or rediscover the environment selected for the original run. Repeat the original `--environment` value when the workflow depends on profiles that are not present in the built-in environment.
+
+### Examples
+
+```bash
+# Resume latest checkpoint for a workflow
+conductor resume workflow.yaml
+
+# Resume with a specific execution environment
+conductor resume workflow.yaml --environment demo
+
+# Resume from an explicit checkpoint file
+conductor resume --from ~/.conductor/checkpoints/workflow-20260922-120000.json
+
+# Resume with mid-run guidance
+conductor resume workflow.yaml --guidance "Use Python 3.12 syntax"
 ```
 
 ## `conductor status`
@@ -889,11 +938,17 @@ restored context before the resumed agent runs — see
 
 ## `conductor validate`
 
-Validate a workflow file without executing it. Checks YAML syntax, schema compliance, cross-references (agent names, routes, parallel groups), and Jinja2 template references throughout the workflow.
+Validate a workflow file without executing it. Checks YAML syntax, schema compliance, cross-references (agent names, routes, parallel groups), Jinja2 template references, and execution profile references.
 
 ```bash
-conductor validate <workflow.yaml>
+conductor validate <workflow.yaml> [OPTIONS]
 ```
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `--environment <name\|PATH>` | Execution environment: a name resolved via `.conductor/environments/` (project then user level) or a path to an environment document. |
 
 ### Examples
 
@@ -901,12 +956,28 @@ conductor validate <workflow.yaml>
 # Validate a single workflow
 conductor validate my-workflow.yaml
 
+# Validate against an explicit execution environment and print the resolution table
+conductor validate my-workflow.yaml --environment demo
+
+# Validate with an explicit environment file path
+conductor validate my-workflow.yaml --environment ./custom-env.yaml
+
 # Validate with full path
 conductor validate ./workflows/production/main.yaml
 
 # Validate all examples (using shell expansion)
 for f in examples/*.yaml; do conductor validate "$f"; done
 ```
+
+### Execution Profile Validation Levels
+
+When validating workflow profile references, Conductor applies a three-level check:
+
+| Mode | Workflow Profile Refs | Behavior |
+|------|-----------------------|----------|
+| **Bare validate** (`conductor validate workflow.yaml`) | None present | **Lazy gate:** No environment discovery or I/O is performed. Validation proceeds silently. |
+| **Bare validate** (`conductor validate workflow.yaml`) | One or more present | Discovers available environment documents (`.conductor/environments/` project walk and user level).<br>• If refs resolve in all discovered environments: silence.<br>• If refs resolve in some but not all: warning naming environments where the profile is missing.<br>• If refs do not resolve in any discovered environment: validation error.<br>• If no environments are found: warning to run `conductor validate --environment <name>` for the full cross-check.<br>• If a discovered file is malformed: warning naming the file and treating it as not resolving. |
+| **Explicit validate** (`conductor validate workflow.yaml --environment <name\|PATH>`) | Any | Skips ambient discovery. Loads the specified environment document (fatal error if unreadable or invalid), compiles the full run manifest, and prints the **Execution Resolution** report (environment name, source, path, default profile, step-to-profile-to-backend table, and audit classification). |
 
 ### Validation Checks
 

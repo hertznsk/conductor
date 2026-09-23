@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from conductor.config.environment import ResolvedEnvironment, builtin_local_environment
 from conductor.config.schema import (
     AgentDef,
     HumanGateStepDef,
@@ -36,10 +37,12 @@ from conductor.config.schema import (
 from conductor.duration import parse_duration
 from conductor.engine.checkpoint import CheckpointManager, CheckpointTrigger
 from conductor.engine.context import WorkflowContext
+from conductor.engine.execution_resolution import ExecutionResolver, ExecutionResolverSession
 from conductor.engine.guidance import GuidanceChannel
 from conductor.engine.limits import LimitEnforcer
 from conductor.engine.pricing import ModelPricing
 from conductor.engine.router import Router, RouteResult
+from conductor.engine.run_manifest import executable_step_identity
 from conductor.engine.usage import UsageTracker, WorkflowUsage
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.exceptions import (
@@ -56,13 +59,7 @@ from conductor.exceptions import (
 from conductor.exceptions import (
     TimeoutError as ConductorTimeoutError,
 )
-from conductor.execution import (
-    LocalRunnerBackend,
-    RunnerBackend,
-    RunOutcome,
-    RunSpec,
-    WorkspaceLease,
-)
+from conductor.execution import RunnerBackend, RunOutcome, RunSpec, WorkspaceLease
 from conductor.executor import questions as questions_mod
 from conductor.executor.agent import AgentExecutor
 from conductor.executor.linkify import linkify_markdown
@@ -513,6 +510,8 @@ class WorkflowEngine:
         _guidance_channel: GuidanceChannel | None = None,
         _inherited_bg_mode: bool = False,
         execution_backend: RunnerBackend | None = None,
+        execution_environment: ResolvedEnvironment | None = None,
+        _execution_session: ExecutionResolverSession | None = None,
         _workspace_lease: WorkspaceLease | None = None,
     ) -> None:
         """Initialize the WorkflowEngine.
@@ -575,11 +574,13 @@ class WorkflowEngine:
                 :class:`LocalRunnerBackend` is created — the default covers
                 ``run``, ``resume``, and mock construction sites without any
                 CLI wiring.
-            _workspace_lease: Workspace lease prepared by an outer owner
-                (e.g. the parent engine of a sub-workflow). Supplied from
-                outside, like ``_guidance_channel``, so a sub-workflow shares
-                the root run's lease instead of preparing its own. Callers
-                should not set this directly.
+            execution_environment: Resolved execution environment for a root
+                engine. Mutually exclusive with the compatibility
+                ``execution_backend`` argument.
+            _execution_session: Run-shared execution state inherited by child
+                engines. Each child still compiles its own resolution view.
+            _workspace_lease: Compatibility lease paired with
+                ``execution_backend``. Callers should not set this directly.
 
         Note:
             If both provider and registry are provided, registry takes precedence.
@@ -607,15 +608,41 @@ class WorkflowEngine:
         )
         self.gate_handler = HumanGateHandler(skip_gates=skip_gates)
         self.max_iterations_handler = MaxIterationsHandler(skip_gates=skip_gates)
-        # Execution backend owned at run scope: the root engine prepares a
-        # workspace lease in run()/resume() and finalizes it in the matching
-        # finally; sub-workflow engines inherit both (like _guidance_channel)
-        # so every step of one run shares one backend and one lease.
-        self._execution_backend: RunnerBackend = execution_backend or LocalRunnerBackend()
+        if execution_backend is not None and execution_environment is not None:
+            raise ValueError("execution_backend and execution_environment are mutually exclusive")
+        if _workspace_lease is not None and execution_backend is None:
+            raise ValueError("_workspace_lease requires execution_backend")
+
+        if _execution_session is not None:
+            self._execution_session = _execution_session
+        elif execution_backend is not None:
+            self._execution_session = ExecutionResolverSession(
+                builtin_local_environment(),
+                default_backend=execution_backend,
+            )
+            if _workspace_lease is not None:
+                self._execution_session.leases["local"] = _workspace_lease
+        else:
+            self._execution_session = ExecutionResolverSession(
+                execution_environment or builtin_local_environment()
+            )
+
+        manifest_workflow_path = Path(workflow_path) if workflow_path is not None else None
+        if manifest_workflow_path is not None and not manifest_workflow_path.is_file():
+            manifest_workflow_path = None
+        self._execution_resolver = ExecutionResolver(
+            config,
+            self._execution_session,
+            workflow_path=manifest_workflow_path,
+            publish_manifest=_subworkflow_depth == 0,
+        )
+        self._execution_backend = self._execution_session.backends["local"]
         self.script_executor = ScriptExecutor(backend=self._execution_backend)
-        # One lease per run is a DELIBERATE step-1 simplification — the
-        # profiles step replaces it with a backend/realm -> lease mapping.
-        self._workspace_lease: WorkspaceLease | None = _workspace_lease
+        self._workspace_lease = (
+            None
+            if _execution_session is not None
+            else self._execution_session.lease_for_backend("local")
+        )
         self.set_executor = SetExecutor()
         self.mcp_step_executor = McpStepExecutor()
         self.wait_executor = WaitExecutor()
@@ -1272,6 +1299,8 @@ class WorkflowEngine:
             "log_file": self._log_file,
             "bg_mode": self._bg_mode,
         }
+        if self._execution_resolver.publish_manifest:
+            system["execution_manifest"] = self._execution_resolver.manifest.model_dump(mode="json")
 
         # Conditional fields — only when dashboard is active
         if self._dashboard_port is not None:
@@ -1780,7 +1809,13 @@ class WorkflowEngine:
                 suggestion="Provide either a provider or registry to WorkflowEngine",
             )
 
-    async def _execute_script(self, agent: ScriptStepDef, context: dict[str, Any]) -> ScriptOutput:
+    async def _execute_script(
+        self,
+        agent: ScriptStepDef,
+        context: dict[str, Any],
+        *,
+        for_each_group: str | None = None,
+    ) -> ScriptOutput:
         """Execute a script step with workflow-level timeout enforcement.
 
         Args:
@@ -1793,8 +1828,17 @@ class WorkflowEngine:
         Raises:
             ExecutionError: If script fails or times out.
         """
+        backend = self._execution_resolver.backend_for_step(
+            agent.name,
+            for_each_group=for_each_group,
+        )
+        lease = self._execution_session.lease_for_backend(
+            self._execution_resolver.manifest.profiles[
+                executable_step_identity(agent.name, for_each_group=for_each_group)
+            ].backend
+        )
         return await self.limits.wait_for_with_timeout(
-            self.script_executor.execute(agent, context, lease=self._workspace_lease),
+            self.script_executor.execute(agent, context, lease=lease, backend=backend),
             operation_name=f"script '{agent.name}'",
         )
 
@@ -2713,10 +2757,7 @@ class WorkflowEngine:
             plugin_marketplaces=child_marketplaces,
             _guidance_channel=self._guidance,
             _inherited_bg_mode=self._bg_mode,
-            # One backend and one lease per run: the child shares the root's
-            # instead of preparing its own.
-            execution_backend=self._execution_backend,
-            _workspace_lease=self._workspace_lease,
+            _execution_session=self._execution_session,
         )
 
         output = await self._run_child_engine(child_engine, sub_inputs, agent)
@@ -2805,12 +2846,7 @@ class WorkflowEngine:
             "_subworkflow_depth": self._subworkflow_depth + 1,
             "_guidance_channel": self._guidance,
             "_inherited_bg_mode": self._bg_mode,
-            # Inherit backend + lease here too — this dict path historically
-            # missed threaded kwargs (see the _dashboard_context_path comment
-            # below); a child preparing its own lease would break the
-            # one-prepare-per-run invariant.
-            "execution_backend": self._execution_backend,
-            "_workspace_lease": self._workspace_lease,
+            "_execution_session": self._execution_session,
         }
         # Thread the dashboard context path into the child engine when the
         # field exists on this engine (added by the breadcrumb-navigation PR).
@@ -3365,17 +3401,13 @@ class WorkflowEngine:
         outcome: RunOutcome = "failed"
         try:
             if self._subworkflow_depth == 0:
-                # Root engine only (mirrors _periodic_checkpoints_active): a
-                # sub-workflow inherits the parent's lease, so exactly one
-                # prepare/finalize pair runs per run.
-                self._workspace_lease = self._workspace_lease or (
-                    await self._execution_backend.prepare_run(
-                        RunSpec(
-                            run_id=self._run_id,
-                            workflow_name=self.config.workflow.name,
-                        )
+                await self._execution_session.prepare_leases(
+                    RunSpec(
+                        run_id=self._run_id,
+                        workflow_name=self.config.workflow.name,
                     )
                 )
+                self._workspace_lease = self._execution_session.lease_for_backend("local")
             result = await self._execute_loop(current_agent_name)
         except asyncio.CancelledError:
             outcome = "cancelled"
@@ -3400,7 +3432,8 @@ class WorkflowEngine:
                 self._warn_if_pricing_hook_silent()
             finally:
                 if self._subworkflow_depth == 0:
-                    await self._finalize_execution_backend(outcome)
+                    await self._execution_session.finalize_leases(outcome)
+                    self._workspace_lease = None
         # Successful completion: this run's periodic checkpoints are now stale.
         self._cleanup_run_periodic_checkpoints()
         return result
@@ -3440,14 +3473,13 @@ class WorkflowEngine:
         outcome: RunOutcome = "failed"
         try:
             if self._subworkflow_depth == 0:
-                self._workspace_lease = self._workspace_lease or (
-                    await self._execution_backend.prepare_run(
-                        RunSpec(
-                            run_id=self._run_id,
-                            workflow_name=self.config.workflow.name,
-                        )
+                await self._execution_session.prepare_leases(
+                    RunSpec(
+                        run_id=self._run_id,
+                        workflow_name=self.config.workflow.name,
                     )
                 )
+                self._workspace_lease = self._execution_session.lease_for_backend("local")
             result = await self._execute_loop(current_agent_name)
         except asyncio.CancelledError:
             outcome = "cancelled"
@@ -3467,7 +3499,8 @@ class WorkflowEngine:
                 self._warn_if_pricing_hook_silent()
             finally:
                 if self._subworkflow_depth == 0:
-                    await self._finalize_execution_backend(outcome)
+                    await self._execution_session.finalize_leases(outcome)
+                    self._workspace_lease = None
         # Successful completion: this run's periodic checkpoints are now stale.
         self._cleanup_run_periodic_checkpoints()
         return result
@@ -3623,63 +3656,6 @@ class WorkflowEngine:
                     "trigger": "failure",
                 },
             )
-
-    async def _finalize_execution_backend(self, outcome: RunOutcome) -> None:
-        """Best-effort ``finalize_run`` for the run-scoped workspace lease.
-
-        A no-op unless a lease was actually prepared: a ``prepare_run`` that
-        raised leaves no lease to finalize, and ``finalize_run`` must never be
-        handed ``None``. Failures are logged, never raised — realm cleanup
-        cannot mask the run's own outcome.
-
-        The lease is detached from engine state BEFORE finalization begins: a
-        lease whose finalization has started is never handed to another
-        command and never finalized twice, and a repeated root
-        ``run()``/``resume()`` on this same engine instance prepares a fresh
-        lease (PR #541 review).
-
-        The backend's cleanup runs as a shielded task, mirroring
-        :meth:`_close_evicted_mcp_step_manager`: a cancellation racing
-        finalization is absorbed until teardown completes, then re-raised —
-        an ``except Exception`` guard alone would let the cancellation
-        interrupt an async ``finalize_run`` mid-cleanup and leak the backend's
-        realm resources.
-        """
-        # Detach before finalizing, not after: a reused engine must not skip
-        # prepare_run on its next run because a finalized lease is still here.
-        lease = self._workspace_lease
-        self._workspace_lease = None
-        if lease is None:
-            return
-        finalize_task = asyncio.ensure_future(self._execution_backend.finalize_run(lease, outcome))
-        cancelled = False
-        while True:
-            try:
-                await asyncio.shield(finalize_task)
-                break
-            except asyncio.CancelledError:
-                cancelled = True
-                if finalize_task.done():
-                    break
-            except Exception:
-                # Backend failure surfaces through the log below; it must not
-                # escape the shield and mask the run outcome.
-                break
-        # ``exception()`` itself raises CancelledError on a cancelled task.
-        exc = (
-            finalize_task.exception()
-            if finalize_task.done() and not finalize_task.cancelled()
-            else None
-        )
-        if isinstance(exc, Exception):
-            logger.warning(
-                "Execution backend finalize_run failed (outcome=%s); "
-                "the run outcome is unaffected.",
-                outcome,
-                exc_info=exc,
-            )
-        if cancelled:
-            raise asyncio.CancelledError
 
     @property
     def _periodic_checkpoints_active(self) -> bool:

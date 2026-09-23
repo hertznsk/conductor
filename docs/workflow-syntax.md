@@ -12,6 +12,9 @@ This document provides a comprehensive reference for the Conductor workflow YAML
 - [Limits and Safety](#limits-and-safety)
 - [Tools](#tools)
 - [Skills](#skills)
+- [Plugins](#plugins)
+- [Execution Profiles](#execution-profiles)
+- [Context Compaction](#context-compaction)
 - [External File References](#external-file-references)
 
 ## Workflow Configuration
@@ -2954,6 +2957,78 @@ Conductor emits four event types to track compaction:
 ### Dashboard Caveat
 
 The web dashboard's context remaining bar estimates context size using only provider-supplied model limits. It might disagree with the actual compaction window, especially under proxy configurations. The bar is refreshed only when the agent step completes; a mid-execution compaction shows up in the activity log, not in the bar.
+
+## Execution Profiles
+
+Execution profiles decouple what an executable step needs from where it runs. Workflows declare logical profile names such as `shell` or `isolated`. An execution environment document then maps each logical profile name to a concrete runner backend (for example, the local subprocess runner).
+
+### Workflow-Wide Defaults
+
+Set a default execution profile for all executable steps in the workflow under `workflow.defaults.execution`:
+
+```yaml
+workflow:
+  name: profiled-workflow
+  entry_point: build
+
+  defaults:
+    execution:
+      profile: shell
+
+agents:
+  - name: build
+    type: script
+    command: make
+    args: ["build"]
+    routes:
+      - to: $end
+```
+
+### Step-Level Profile Selection
+
+Override or specify an execution profile on any executable step using the `execution:` block:
+
+```yaml
+agents:
+  - name: run_isolated
+    type: script
+    execution:
+      profile: isolated
+    command: pytest
+    routes:
+      - to: $end
+```
+
+The `execution.profile` field is supported on all executable step types:
+- LLM agents (`type: agent` or default untagged steps)
+- Script steps (`type: script`)
+- Direct MCP tool steps (`type: mcp`)
+- Sub-workflow steps (`type: workflow`)
+
+Profile names must match `[A-Za-z0-9_.-]+` (letters, digits, underscores, dots, and hyphens).
+
+### Precedence Chain
+
+When resolving a step's execution profile, Conductor applies a three-tier precedence chain:
+
+1. **Step-level override:** `step.execution.profile` (highest priority).
+2. **Workflow default:** `workflow.defaults.execution.profile` when declared on the workflow.
+3. **Environment document default:** `default` declared in the resolved environment document.
+
+If none of these three tiers provides a profile, Conductor raises a validation error for that step.
+
+### Engine-Local Steps
+
+Engine-local step types do not execute on a runner backend. They reject the `execution:` block with a schema error:
+- Set steps (`type: set`)
+- Wait steps (`type: wait`)
+- Terminate steps (`type: terminate`)
+- Human gates (`type: human_gate`)
+- Questions steps (`type: questions`)
+
+### Execution Environment Documents
+
+Execution profiles are resolved against environment documents defined in project or user configuration. See [Execution Environments](configuration.md#execution-environments) for details on document format, discovery rules, and resolution precedence.
 
 ## External File References
 
