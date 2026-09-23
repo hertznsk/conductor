@@ -5,6 +5,7 @@ This module defines the main Typer app and global options.
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import logging
 import os
@@ -22,7 +23,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from conductor import __version__
-from conductor.console import make_console, styled
+from conductor.console import clear_nonblocking_fd, make_console, styled
 from conductor.exceptions import WorkflowTerminated
 
 if TYPE_CHECKING:
@@ -67,6 +68,9 @@ app.add_typer(fleet_app, rich_help_panel="Run & Recover")
 
 # Rich console for formatted output
 console = make_console(stderr=True)
+# stderr can be a non-blocking pipe with a slow/absent reader (#543); see
+# clear_nonblocking_fd's docstring and cli/run.py::_SilentAwareConsole.
+clear_nonblocking_fd(console.file)
 output_console = make_console()
 
 # Stop-ladder timings (issue #344). A stop request is only an acknowledgement,
@@ -174,7 +178,7 @@ def print_error(error: Exception) -> None:
     from conductor.exceptions import ConductorError
 
     if isinstance(error, ConductorError):
-        console.print(format_error(error))
+        panel = format_error(error)
     else:
         # For non-Conductor errors, still format nicely
         content = Text()
@@ -185,6 +189,11 @@ def print_error(error: Exception) -> None:
             border_style="red",
             padding=(1, 2),
         )
+    # Fallback only: clear_nonblocking_fd() above already fixes this
+    # console's stream. Kept in case the flag gets reset on us mid-run; a
+    # raise here would replace the real error with an unrelated
+    # BlockingIOError instead (#543).
+    with contextlib.suppress(BlockingIOError):
         console.print(panel)
 
 
