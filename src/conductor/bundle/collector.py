@@ -52,13 +52,10 @@ from conductor.config.schema import (
 )
 from conductor.file_string import FileString
 from conductor.filesystem import is_dir_strict, is_file_strict, stat_or_none
-from conductor.plugins.agents import is_agent_candidate
 from conductor.plugins.errors import PluginFetchError, PluginSourceUnavailableError
 from conductor.plugins.manifest import (
     DEFAULT_MCP_FILE,
-    PLUGIN_AGENTS_DIR,
     PLUGIN_MANIFESTS,
-    PLUGIN_SKILLS_DIR,
     find_manifest,
     manifest_flavor,
 )
@@ -141,6 +138,9 @@ class _Collector:
         self.links: dict[str, str] = {}
         self.host_paths: dict[Path, str] = {}
         self.skills_topology: dict[str, str] = {}
+        self.skill_claims: dict[
+            str, tuple[Literal["declared", "discovered", "plugin"], ResolvedSkill]
+        ] = {}
         self.plugins_topology: dict[str, str] = {}
         self.registry_provenance: dict[str, RegistryProvenance] = {}
         self.plugin_provenance: dict[str, PluginProvenance] = {}
@@ -543,7 +543,24 @@ class _Collector:
             relative = path.relative_to(skill.directory).as_posix()
             self._stage(path, f"{namespace}/{relative}", "skill", detail)
         topology = f"{namespace}/SKILL.md"
+        previous = self.skill_claims.get(skill.name)
+        if previous is not None and previous[0] == "plugin":
+            plugin_skill = previous[1]
+            if plugin_skill.directory != skill.directory:
+                if skill.discovered:
+                    return
+                self.warn(
+                    f"skill {plugin_skill.name!r} from plugin {plugin_skill.source!r} is "
+                    f"shadowed by the declared skill {skill.source!r} and was not enabled."
+                )
+                self.skills_topology[skill.name] = topology
+                self.skill_claims[skill.name] = ("declared", skill)
+                return
         self._set_topology(self.skills_topology, skill.name, topology, "skill")
+        self.skill_claims[skill.name] = (
+            "discovered" if skill.discovered else "declared",
+            skill,
+        )
 
     def _collect_plugin(
         self,
@@ -579,18 +596,11 @@ class _Collector:
             if is_file_strict(candidate):
                 selected.add(candidate)
         mcp = plugin.root / DEFAULT_MCP_FILE
-        if is_file_strict(mcp):
+        if plugin.mcp_servers and is_file_strict(mcp):
             selected.add(mcp)
-        agents = plugin.root / PLUGIN_AGENTS_DIR
-        if is_dir_strict(agents):
-            for candidate in self._iter_tree(agents):
-                if candidate.is_symlink() or (
-                    is_file_strict(candidate) and is_agent_candidate(candidate.name, actual_flavor)
-                ):
-                    selected.add(candidate)
-        skills = plugin.root / PLUGIN_SKILLS_DIR
-        if is_dir_strict(skills):
-            selected.update(self._iter_tree(skills))
+        selected.update(agent.path for agent in plugin.agents)
+        for skill in plugin.skills:
+            selected.update(self._iter_tree(skill.directory))
         for path in sorted(selected, key=lambda item: item.as_posix()):
             relative = path.relative_to(plugin.root).as_posix()
             self._stage(
@@ -602,11 +612,9 @@ class _Collector:
         manifest_logical = f"{namespace}/{manifest.relative_to(plugin.root).as_posix()}"
         self._set_topology(self.plugins_topology, plugin.name, manifest_logical, "plugin")
         for skill in plugin.skills:
-            self._set_topology(
-                self.skills_topology,
-                skill.name,
+            self._set_plugin_skill_topology(
+                skill,
                 f"{namespace}/{skill.directory.relative_to(plugin.root).as_posix()}/SKILL.md",
-                "skill",
             )
 
         self.plugin_provenance.setdefault(
@@ -618,6 +626,31 @@ class _Collector:
                 sha=sha,
             ),
         )
+
+    def _set_plugin_skill_topology(self, skill: ResolvedSkill, path: str) -> None:
+        previous = self.skill_claims.get(skill.name)
+        if previous is None:
+            self.skills_topology[skill.name] = path
+            self.skill_claims[skill.name] = ("plugin", skill)
+            return
+        previous_kind, previous_skill = previous
+        if previous_skill.directory == skill.directory:
+            return
+        if previous_kind == "discovered":
+            self.warn(
+                f"skill {skill.name!r} discovered in {previous_skill.source!r} was superseded "
+                f"by the copy from plugin {skill.source!r}, which this workflow names explicitly."
+            )
+            self.skills_topology[skill.name] = path
+            self.skill_claims[skill.name] = ("plugin", skill)
+            return
+        if previous_kind == "declared":
+            self.warn(
+                f"skill {skill.name!r} from plugin {skill.source!r} is shadowed by the "
+                f"declared skill {previous_skill.source!r} and was not enabled."
+            )
+            return
+        self._set_topology(self.skills_topology, skill.name, path, "skill")
 
     @staticmethod
     def _set_topology(table: dict[str, str], name: str, path: str, kind: str) -> None:

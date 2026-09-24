@@ -21,9 +21,13 @@ from conductor.bundle.errors import (
     BundleSymlinkEscapeError,
 )
 from conductor.bundle.model import compute_bundle_digest
+from conductor.config.schema import PluginDef
 from conductor.config.validator import _MAX_SUBWORKFLOW_VALIDATION_DEPTH
 from conductor.exceptions import ConfigurationError
+from conductor.executor.agent import _merge_skills
+from conductor.plugins.registry import resolve_plugins
 from conductor.registry.cache import CACHE_LAYOUT_VERSION, _readiness_marker_payload, _sentinel_path
+from conductor.skills.discovery import resolve_effective_skills
 
 
 def _workflow(prompt: str, *, extra_workflow: str = "") -> str:
@@ -42,6 +46,40 @@ agents:
 
 def _collect(path: Path) -> CollectedBundle:
     return collect_bundle(path, environment=None, allow_network=False, on_warning=lambda _m: None)
+
+
+def _write_plugin(root: Path, *, skill: str = "plugin-skill") -> None:
+    (root / ".github" / "plugin").mkdir(parents=True)
+    (root / ".github" / "plugin" / "plugin.json").write_text(
+        '{"name":"review","mcpServers":".mcp.json"}', encoding="utf-8"
+    )
+    (root / ".mcp.json").write_text(
+        '{"mcpServers":{"review-tools":{"command":"review"}}}', encoding="utf-8"
+    )
+    skill_dir = root / "skills" / skill
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {skill}\ndescription: Test.\n---\n\nPlugin body.\n", encoding="utf-8"
+    )
+    (root / "agents").mkdir()
+    (root / "agents" / "reviewer.agent.md").write_text(
+        "---\nname: reviewer\ndescription: Reviews.\n---\n\nReview.\n", encoding="utf-8"
+    )
+
+
+def _plugin_workflow(plugin_block: str, *, skills: str = "") -> str:
+    return f"""\
+workflow:
+  name: plugin-components
+  entry_point: agent
+agents:
+  - name: agent
+    prompt: test
+{skills}    plugins:
+{plugin_block}
+    routes:
+      - to: $end
+"""
 
 
 def test_loader_graph_and_payload_are_complete(tmp_path: Path) -> None:
@@ -256,6 +294,107 @@ agents:
     assert "tree/plugins/review/agents/reviewer.md" in paths
     assert all("hooks" not in path for path in paths)
     assert bundle.descriptor.provenance.plugins[0].flavor == "claude"
+
+
+def test_plugin_component_switches_exclude_agents_and_mcp(tmp_path: Path) -> None:
+    # Requirement: disabled agent and MCP components stay out while enabled skills remain.
+    plugin = tmp_path / "plugin"
+    _write_plugin(plugin)
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(
+        _plugin_workflow("      - name: ./plugin\n        agents: false\n        mcp: false\n"),
+        encoding="utf-8",
+    )
+
+    bundle = _collect(workflow)
+    paths = {entry.logical_path for entry in bundle.entries}
+
+    assert "tree/plugins/review/.github/plugin/plugin.json" in paths
+    assert "tree/plugins/review/skills/plugin-skill/SKILL.md" in paths
+    assert "tree/plugins/review/agents/reviewer.agent.md" not in paths
+    assert "tree/plugins/review/.mcp.json" not in paths
+    assert bundle.manifest.skills_topology["plugin-skill"] == (
+        "tree/plugins/review/skills/plugin-skill/SKILL.md"
+    )
+    assert bundle.descriptor.provenance.plugins[0].model_dump() == {
+        "name": "review",
+        "flavor": "copilot",
+        "origin": "path",
+        "sha": None,
+    }
+
+
+def test_plugin_skills_switch_excludes_skill_content_and_topology(tmp_path: Path) -> None:
+    # Requirement: disabling plugin skills removes their files and topology dependency.
+    plugin = tmp_path / "plugin"
+    _write_plugin(plugin)
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(
+        _plugin_workflow("      - name: ./plugin\n        skills: false\n"),
+        encoding="utf-8",
+    )
+
+    bundle = _collect(workflow)
+    paths = {entry.logical_path for entry in bundle.entries}
+
+    assert all(not path.startswith("tree/plugins/review/skills/") for path in paths)
+    assert "plugin-skill" not in bundle.manifest.skills_topology
+    assert "tree/plugins/review/agents/reviewer.agent.md" in paths
+    assert "tree/plugins/review/.mcp.json" in paths
+
+
+def test_declared_skill_shadows_same_named_plugin_skill(tmp_path: Path) -> None:
+    # Requirement: declared skills win plugin collisions in bundle topology as at runtime.
+    name = "shared"
+    declared = tmp_path / "declared" / name
+    declared.mkdir(parents=True)
+    (declared / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: Test.\n---\n\nDeclared body.\n", encoding="utf-8"
+    )
+    plugin = tmp_path / "plugin"
+    _write_plugin(plugin, skill=name)
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(
+        _plugin_workflow(
+            "      - ./plugin\n",
+            skills="    skills: [./declared/shared]\n",
+        ),
+        encoding="utf-8",
+    )
+    collector_warnings: list[str] = []
+
+    bundle = collect_bundle(
+        workflow,
+        environment=None,
+        allow_network=False,
+        on_warning=collector_warnings.append,
+    )
+    runtime_warnings: list[str] = []
+    declared_skills = resolve_effective_skills(
+        ["./declared/shared"],
+        sources=(),
+        exclude=(),
+        base_dir=tmp_path,
+        on_warning=runtime_warnings.append,
+    )
+    plugin_skills = list(
+        resolve_plugins(
+            [PluginDef(name="./plugin")],
+            base_dir=tmp_path,
+            flavor="copilot",
+        )[0].skills
+    )
+    runtime_winner = _merge_skills(
+        declared_skills, plugin_skills, on_warning=runtime_warnings.append
+    )[0]
+    paths = {entry.logical_path for entry in bundle.entries}
+
+    assert runtime_winner.directory == declared
+    assert bundle.manifest.skills_topology[name] == "tree/skills/shared/SKILL.md"
+    assert "tree/skills/shared/SKILL.md" in paths
+    assert "tree/plugins/review/skills/shared/SKILL.md" in paths
+    assert collector_warnings == runtime_warnings
+    assert "shadowed by the declared skill" in collector_warnings[0]
 
 
 def test_assets_hidden_rules_and_additional_root(tmp_path: Path) -> None:
