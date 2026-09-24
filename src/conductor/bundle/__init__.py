@@ -37,7 +37,12 @@ from conductor.bundle.model import (
     compute_bundle_digest,
     serialize_manifest,
 )
-from conductor.bundle.store import bundle_store_base, publish_bundle
+from conductor.bundle.store import (
+    bundle_store_base,
+    bundle_store_key,
+    bundle_store_path,
+    publish_bundle,
+)
 
 __all__ = [
     "BundleDescriptor",
@@ -58,6 +63,8 @@ __all__ = [
     "RegistryProvenance",
     "WarningSink",
     "bundle_store_base",
+    "bundle_store_key",
+    "bundle_store_path",
     "collect_bundle",
     "compute_bundle_digest",
     "publish_bundle",

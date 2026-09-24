@@ -10,7 +10,6 @@ byte-identical to ``bundle.json`` so the archive and the store sentinel agree.
 from __future__ import annotations
 
 import os
-import sys
 import tarfile
 from pathlib import Path
 
@@ -51,8 +50,9 @@ class TestDeterminism:
         tree = _stage_tree(tmp_path)
         first_out = tmp_path / "first.tar.gz"
         second_out = tmp_path / "second.tar.gz"
-        first = write_bundle_archive(tree, first_out)
-        second = write_bundle_archive(tree, second_out)
+        executable_paths = {"tree/main/scripts/run.sh"}
+        first = write_bundle_archive(tree, first_out, executable_paths=executable_paths)
+        second = write_bundle_archive(tree, second_out, executable_paths=executable_paths)
         assert first == second
         assert first_out.read_bytes() == second_out.read_bytes()
         assert first.startswith("sha256:") and len(first) == len("sha256:") + 64
@@ -62,7 +62,7 @@ class TestDeterminism:
         # filename, so nothing host- or clock-dependent enters the bytes.
         tree = _stage_tree(tmp_path)
         out = tmp_path / "bundle.tar.gz"
-        write_bundle_archive(tree, out)
+        write_bundle_archive(tree, out, executable_paths={"tree/main/scripts/run.sh"})
         header = out.read_bytes()[:10]
         assert header[:3] == b"\x1f\x8b\x08"  # magic + deflate
         assert header[4:8] == b"\x00\x00\x00\x00"  # MTIME pinned to 0
@@ -78,7 +78,7 @@ class TestMemberLayout:
         # archived.
         tree = _stage_tree(tmp_path)
         out = tmp_path / "bundle.tar.gz"
-        write_bundle_archive(tree, out)
+        write_bundle_archive(tree, out, executable_paths={"tree/main/scripts/run.sh"})
         with tarfile.open(out, "r:gz") as tar:
             names = [member.name for member in tar.getmembers()]
         assert names == sorted(names)
@@ -92,7 +92,7 @@ class TestMemberLayout:
         # later writes as bundle.json (publish_bundle relies on this).
         tree = _stage_tree(tmp_path)
         out = tmp_path / "bundle.tar.gz"
-        write_bundle_archive(tree, out)
+        write_bundle_archive(tree, out, executable_paths={"tree/main/scripts/run.sh"})
         with tarfile.open(out, "r:gz") as tar:
             member = tar.getmember(".bundle/manifest.json")
             extracted = tar.extractfile(member)
@@ -106,7 +106,7 @@ class TestMemberLayout:
         # uname/gname so no host identity leaks into the archive.
         tree = _stage_tree(tmp_path)
         out = tmp_path / "bundle.tar.gz"
-        write_bundle_archive(tree, out)
+        write_bundle_archive(tree, out, executable_paths={"tree/main/scripts/run.sh"})
         for member in _read_members(out).values():
             assert member.mtime == 0
             assert member.uid == 0 and member.gid == 0
@@ -115,11 +115,11 @@ class TestMemberLayout:
 
 class TestModesAndTypes:
     def test_exec_bit_maps_to_tar_modes(self, tmp_path: Path):
-        # Requirement: a staged file with any exec bit archives as 0o755, a
-        # non-executable one as 0o644 — the mode comes from the staged file.
+        # Requirement: executable paths declared by the manifest archive as
+        # 0o755 and every other regular file as 0o644.
         tree = _stage_tree(tmp_path)
         out = tmp_path / "bundle.tar.gz"
-        write_bundle_archive(tree, out)
+        write_bundle_archive(tree, out, executable_paths={"tree/main/scripts/run.sh"})
         members = _read_members(out)
         assert members["tree/main/scripts/run.sh"].mode == 0o755
         assert members["tree/main/plain.txt"].mode == 0o644
@@ -130,7 +130,7 @@ class TestModesAndTypes:
         # link target as linkname and mode 0o777 (its content is the target).
         tree = _stage_tree(tmp_path)
         out = tmp_path / "bundle.tar.gz"
-        write_bundle_archive(tree, out)
+        write_bundle_archive(tree, out, executable_paths={"tree/main/scripts/run.sh"})
         member = _read_members(out)["tree/main/link.txt"]
         assert member.issym()
         assert member.type == tarfile.SYMTYPE
@@ -138,19 +138,22 @@ class TestModesAndTypes:
         assert member.mode == 0o777
         assert member.size == 0
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
-    def test_staged_exec_bit_comes_from_lstat_not_content(self, tmp_path: Path):
-        # Requirement: identical bytes staged with different exec bits archive
-        # with different modes — the bit is taken from os.lstat, not guessed.
+    def test_archive_mode_ignores_host_filesystem_mode(self, tmp_path: Path):
+        # Requirement: archive modes come only from the manifest-derived path
+        # set, so Windows chmod behavior cannot change the resulting tar mode.
         tree = tmp_path / "staged"
         tree.mkdir()
         exe = tree / "a.bin"
         exe.write_bytes(b"same")
         os.chmod(exe, 0o755)
         out = tmp_path / "bundle.tar.gz"
-        write_bundle_archive(tree, out)
+        write_bundle_archive(tree, out, executable_paths={"a.bin"})
         assert _read_members(out)["a.bin"].mode == 0o755
         os.chmod(exe, 0o644)
         out2 = tmp_path / "bundle2.tar.gz"
-        write_bundle_archive(tree, out2)
-        assert _read_members(out2)["a.bin"].mode == 0o644
+        write_bundle_archive(tree, out2, executable_paths={"a.bin"})
+        assert _read_members(out2)["a.bin"].mode == 0o755
+
+        out3 = tmp_path / "bundle3.tar.gz"
+        write_bundle_archive(tree, out3, executable_paths=set())
+        assert _read_members(out3)["a.bin"].mode == 0o644

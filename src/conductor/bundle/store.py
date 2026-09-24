@@ -1,10 +1,10 @@
 """Content-addressed store for run bundles.
 
-A published bundle lives at ``<base>/<bundle_digest>/`` where
+A published bundle lives at ``<base>/sha256-<hex>/`` where
 ``<base>`` is ``$CONDUCTOR_HOME/cache/bundles/`` (or the ``~/.conductor``
-fallback) and ``<bundle_digest>`` is the full ``sha256:<hex>`` content
-digest from :class:`~conductor.bundle.model.BundleManifest`. The directory
-holds:
+fallback). The filesystem key replaces the colon in the manifest's full
+``sha256:<hex>`` content digest with a hyphen so it is valid on Windows. The
+directory holds:
 
 * the staged entry tree at each entry's full store-relative
   ``logical_path`` (which already carries the ``tree/main/`` prefix — no
@@ -15,14 +15,12 @@ holds:
   readiness sentinel: a reader that sees this file can trust the whole
   directory (mirroring the plugin-fetch sentinel convention).
 
-Publishing is idempotent and self-healing. If the final directory already
-exists it is reused when valid — ``bundle.json`` parses and its
-``bundle_digest`` equals the directory name (a parse-only check, no full
-re-hash, per the ``plugins.fetch.is_cached`` precedent). An invalid
-directory (unparseable or digest-mismatched ``bundle.json``) is reported
-through the warning sink, removed, and rebuilt. Concurrent publishers of
-the same digest race on an atomic rename; the loser validates and returns
-the winner's directory instead of overwriting it.
+Publishing is idempotent and self-healing. A cross-process lock serializes
+validation, repair, and publication for each digest. If the final directory
+already exists it is reused when valid — ``bundle.json`` parses and its
+``bundle_digest`` equals the requested manifest digest (a parse-only check,
+no full re-hash, per the ``plugins.fetch.is_cached`` precedent). An invalid
+directory is reported through the warning sink, removed, and rebuilt.
 
 The ephemeral :class:`~conductor.bundle.model.BundleDescriptor` is
 deliberately **not** stored and not an input here (Oracle R1-O1):
@@ -42,8 +40,11 @@ import re
 import shutil
 import sys
 import tempfile
-from collections.abc import Callable, Mapping
+import time
+from collections.abc import Callable, Generator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
+from typing import IO
 
 from conductor.bundle.archive import write_bundle_archive
 from conductor.bundle.model import BundleEntry, BundleManifest, serialize_manifest
@@ -51,7 +52,7 @@ from conductor.bundle.model import BundleEntry, BundleManifest, serialize_manife
 logger = logging.getLogger(__name__)
 
 _BUNDLE_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
-"""The store key is the full content digest — the CAS contract."""
+"""The manifest keeps the full content digest; filesystem keys replace ``:``."""
 
 _ARCHIVE_NAME = "bundle.tar.gz"
 _STORE_MANIFEST_COPY = Path(".bundle") / "manifest.json"
@@ -78,6 +79,23 @@ def bundle_store_base() -> Path:
     return base / "cache" / "bundles"
 
 
+def bundle_store_key(digest: str) -> str:
+    """Return the portable filesystem key for a full bundle digest."""
+    if not _BUNDLE_DIGEST_RE.fullmatch(digest):
+        raise ValueError(f"bundle_digest must be a full 'sha256:<64 hex>' digest, got {digest!r}")
+    return f"sha256-{digest.removeprefix('sha256:')}"
+
+
+def bundle_store_path(digest: str) -> Path:
+    """Return the store directory for a full bundle digest."""
+    return bundle_store_base() / bundle_store_key(digest)
+
+
+def _manifest_bytes(manifest: BundleManifest) -> bytes:
+    serialized = serialize_manifest(manifest).replace("\r\n", "\n").replace("\r", "\n")
+    return serialized.encode("utf-8")
+
+
 def publish_bundle(
     manifest: BundleManifest,
     files: Mapping[str, bytes],
@@ -87,7 +105,7 @@ def publish_bundle(
 ) -> Path:
     """Publish a bundle into the store and return its final directory.
 
-    The directory is named after ``manifest.bundle_digest`` and is
+    The directory is named after the portable form of ``manifest.bundle_digest`` and is
     considered complete once ``bundle.json`` exists — it is always written
     last, after the entry tree, the archive, and the staged
     ``.bundle/manifest.json`` copy inside it.
@@ -118,44 +136,100 @@ def publish_bundle(
             in the manifest with the matching kind.
     """
     digest = manifest.bundle_digest
-    if not _BUNDLE_DIGEST_RE.fullmatch(digest):
-        raise ValueError(f"bundle_digest must be a full 'sha256:<64 hex>' digest, got {digest!r}")
+    key = bundle_store_key(digest)
     warn = on_warning if on_warning is not None else logger.warning
 
     base = bundle_store_base()
     base.mkdir(parents=True, exist_ok=True)
-    final = base / digest
+    final = base / key
 
-    if final.is_dir():
-        if _is_valid_store_dir(final, digest):
-            return final
-        warn(
-            f"Invalid bundle store directory {final} (unparseable or digest-mismatched "
-            f"bundle.json); removing and rebuilding."
-        )
-        _quarantine_and_remove(final, digest)
+    with _digest_lock(base / f".{key}.lock"):
+        if final.is_dir():
+            if _is_valid_store_dir(final, digest):
+                return final
+            warn(
+                f"Invalid bundle store directory {final} "
+                "(unparseable or digest-mismatched bundle.json); removing and rebuilding."
+            )
+            _quarantine_and_remove(final, key, digest)
 
-    entries_by_path = {entry.logical_path: entry for entry in manifest.entries}
-    staging = Path(tempfile.mkdtemp(dir=base))
-    # The archive is written next to the staging dir, never inside it: the
-    # archive walk must not see the archive being written.
-    archive_tmp = base / f".{staging.name}.tar.gz"
-    try:
-        _stage_tree(staging, manifest, files, links, entries_by_path)
-        write_bundle_archive(staging, archive_tmp)
-        os.replace(archive_tmp, staging / _ARCHIVE_NAME)
-        # Sentinel last: only a directory whose bundle.json parses with the
-        # directory-name digest is ever handed to a caller.
-        (staging / _SENTINEL_NAME).write_text(serialize_manifest(manifest), encoding="utf-8")
-        _publish(staging, final, digest)
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
-        with contextlib.suppress(OSError):
-            archive_tmp.unlink()
+        entries_by_path = {entry.logical_path: entry for entry in manifest.entries}
+        executable_paths = {
+            entry.logical_path
+            for entry in manifest.entries
+            if entry.kind == "file" and entry.executable
+        }
+        staging = Path(tempfile.mkdtemp(dir=base))
+        # The archive is written next to the staging dir, never inside it: the
+        # archive walk must not see the archive being written.
+        archive_tmp = base / f".{staging.name}.tar.gz"
+        try:
+            _stage_tree(staging, manifest, files, links, entries_by_path)
+            _ = write_bundle_archive(staging, archive_tmp, executable_paths=executable_paths)
+            os.replace(archive_tmp, staging / _ARCHIVE_NAME)
+            # Sentinel last: only a directory whose bundle.json carries the
+            # requested digest is ever handed to a caller. Writing bytes avoids
+            # platform newline translation and matches the archived copy.
+            (staging / _SENTINEL_NAME).write_bytes(_manifest_bytes(manifest))
+            _publish(staging, final, digest)
+        finally:
+            _ = shutil.rmtree(staging, ignore_errors=True)
+            with contextlib.suppress(OSError):
+                archive_tmp.unlink()
     return final
 
 
-def _quarantine_and_remove(final: Path, digest: str) -> None:
+@contextmanager
+def _digest_lock(path: Path) -> Generator[None, None, None]:
+    """Hold an exclusive cross-process lock for one bundle digest."""
+    with path.open("a+b") as lock_file:
+        _lock_file(lock_file)
+        try:
+            yield
+        finally:
+            _unlock_file(lock_file)
+
+
+def _lock_file(lock_file: IO[bytes]) -> None:
+    """Acquire a blocking one-byte lock using the host platform API."""
+    if sys.platform == "win32":
+        import msvcrt
+
+        _ = lock_file.seek(0)
+        if lock_file.read(1) == b"":
+            _ = lock_file.write(b"\0")
+            lock_file.flush()
+        _ = lock_file.seek(0)
+        while True:
+            try:
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EDEADLK):
+                    raise
+                time.sleep(0.05)
+        return
+
+    import fcntl
+
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+
+
+def _unlock_file(lock_file: IO[bytes]) -> None:
+    """Release a lock acquired by :func:`_lock_file`."""
+    if sys.platform == "win32":
+        import msvcrt
+
+        _ = lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _quarantine_and_remove(final: Path, key: str, digest: str) -> None:
     """Move an invalid final directory aside, then remove the quarantine.
 
     Rename-aside instead of check-and-delete: another publisher may be
@@ -168,7 +242,7 @@ def _quarantine_and_remove(final: Path, digest: str) -> None:
     tolerated; anything else propagates.
     """
     base = final.parent
-    quarantine = base / f".{digest}.quarantine-{os.getpid()}-{next(_quarantine_counter)}"
+    quarantine = base / f".{key}.quarantine-{os.getpid()}-{next(_quarantine_counter)}"
     try:
         os.rename(final, quarantine)
     except FileNotFoundError:
@@ -177,7 +251,7 @@ def _quarantine_and_remove(final: Path, digest: str) -> None:
         if final.is_dir() and _is_valid_store_dir(final, digest):
             return  # Became valid concurrently — reuse it.
         raise
-    shutil.rmtree(quarantine, ignore_errors=True)
+    _ = shutil.rmtree(quarantine, ignore_errors=True)
 
 
 def _contained_target(staging_root: Path, logical_path: str) -> Path:
@@ -226,12 +300,12 @@ def _stage_tree(
             )
         target = _contained_target(staging_root, logical_path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        os.symlink(link_target, target)
+        _ = os.symlink(link_target, target)
     manifest_copy = staging / _STORE_MANIFEST_COPY
     manifest_copy.parent.mkdir(parents=True, exist_ok=True)
     # Byte-identical to the bundle.json sentinel written after the archive,
     # so the archived .bundle/manifest.json matches the stored manifest.
-    manifest_copy.write_text(serialize_manifest(manifest), encoding="utf-8")
+    manifest_copy.write_bytes(_manifest_bytes(manifest))
 
 
 def _is_valid_store_dir(final: Path, digest: str) -> bool:
@@ -243,10 +317,13 @@ def _is_valid_store_dir(final: Path, digest: str) -> bool:
     is sufficient. Anything unreadable or unparseable reads as invalid.
     """
     try:
-        payload = json.loads((final / _SENTINEL_NAME).read_text(encoding="utf-8"))
+        payload: object = json.loads((final / _SENTINEL_NAME).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
-    return isinstance(payload, dict) and payload.get("bundle_digest") == digest
+    if not isinstance(payload, dict):
+        return False
+    stored_digest = payload.get("bundle_digest")
+    return isinstance(stored_digest, str) and stored_digest == digest
 
 
 def _publish(staging: Path, final: Path, digest: str) -> None:

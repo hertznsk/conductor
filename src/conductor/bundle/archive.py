@@ -9,10 +9,12 @@ guardrail test pins exactly that.
 
 The archive contains only regular files and symlinks; directory entries are
 omitted (a tarball of the file set is sufficient and keeps the member list
-canonical). Symlink members are recorded as ``tarfile.SYMTYPE`` with the
-link target as ``linkname`` and mode ``0o777`` — POSIX-first semantics: on a
-platform where a checkout materialized a symlink as a regular file, it is
-archived as a regular file, exactly as the staged tree presents it.
+canonical). Regular-file modes come from the caller's manifest-derived
+executable path set rather than host filesystem mode bits. Symlink members
+are recorded as ``tarfile.SYMTYPE`` with the link target as ``linkname`` and
+mode ``0o777`` — POSIX-first semantics: on a platform where a checkout
+materialized a symlink as a regular file, it is archived as a regular file,
+exactly as the staged tree presents it.
 
 The bundle manifest travels inside the archive as ``.bundle/manifest.json``.
 This function does **not** add it: the caller (``bundle.store.publish_bundle``)
@@ -28,12 +30,18 @@ import hashlib
 import os
 import stat
 import tarfile
+from collections.abc import Collection
 from pathlib import Path
 
 _READ_CHUNK_SIZE = 64 * 1024
 
 
-def write_bundle_archive(staged_tree: Path, out: Path) -> str:
+def write_bundle_archive(
+    staged_tree: Path,
+    out: Path,
+    *,
+    executable_paths: Collection[str],
+) -> str:
     """Write the staged bundle tree at ``staged_tree`` as a tar.gz at ``out``.
 
     The archive is deterministic: members are ordered by their POSIX arcname,
@@ -49,6 +57,9 @@ def write_bundle_archive(staged_tree: Path, out: Path) -> str:
         out: Destination file. Written atomically-enough for the store's
             purposes: the file is created only by this call, and the store
             renames it into the staged tree afterwards.
+        executable_paths: POSIX relative paths that receive mode ``0o755``.
+            All other regular files receive ``0o644``. The store supplies
+            this from the bundle manifest rather than host filesystem modes.
 
     Returns:
         ``"sha256:<hex>"`` — the digest of the archive bytes as written.
@@ -65,7 +76,7 @@ def write_bundle_archive(staged_tree: Path, out: Path) -> str:
         tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as tar,
     ):
         for path in entries:
-            _add_entry(tar, staged_tree, path)
+            _add_entry(tar, staged_tree, path, executable_paths)
     digest = hashlib.sha256()
     with open(out, "rb") as written:
         for chunk in iter(lambda: written.read(_READ_CHUNK_SIZE), b""):
@@ -73,7 +84,12 @@ def write_bundle_archive(staged_tree: Path, out: Path) -> str:
     return f"sha256:{digest.hexdigest()}"
 
 
-def _add_entry(tar: tarfile.TarFile, staged_tree: Path, path: Path) -> None:
+def _add_entry(
+    tar: tarfile.TarFile,
+    staged_tree: Path,
+    path: Path,
+    executable_paths: Collection[str],
+) -> None:
     """Add one staged path to the archive, files as data and symlinks as links."""
     arcname = path.relative_to(staged_tree).as_posix()
     info = tarfile.TarInfo(arcname)
@@ -90,7 +106,7 @@ def _add_entry(tar: tarfile.TarFile, staged_tree: Path, path: Path) -> None:
         info.size = 0
         tar.addfile(info)
     elif stat.S_ISREG(st.st_mode):
-        info.mode = 0o755 if st.st_mode & 0o111 else 0o644
+        info.mode = 0o755 if arcname in executable_paths else 0o644
         info.size = st.st_size
         with path.open("rb") as source:
             tar.addfile(info, source)

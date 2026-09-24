@@ -76,9 +76,9 @@ def _flattened(output: str) -> str:
 
 
 def _store_dir(digest: str) -> Path:
-    from conductor.bundle.store import bundle_store_base
+    from conductor.bundle.store import bundle_store_path
 
-    return bundle_store_base() / digest
+    return bundle_store_path(digest)
 
 
 class TestBuildSuccess:

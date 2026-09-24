@@ -118,7 +118,7 @@ def _build_impl(
     """Execute the build after the workflow reference has been resolved."""
     from conductor.bundle import collect_bundle, publish_bundle
     from conductor.bundle.errors import BundleError
-    from conductor.bundle.store import bundle_store_base
+    from conductor.bundle.store import bundle_store_path
     from conductor.config.environment import builtin_local_environment, resolve_environment
     from conductor.config.loader import load_config
     from conductor.digest import canonical_json_digest
@@ -179,13 +179,12 @@ def _build_impl(
     # leak provenance into the digest inputs.
     descriptor = descriptor.model_copy(update={"run_manifest_digest": run_manifest_digest})
 
-    # The store directory is named after the full digest, prefix included
-    # (that is the CAS key contract in ``bundle/store.py``). "Reused" is
+    # The store directory uses the portable digest key from ``bundle/store.py``. "Reused" is
     # reported only when the pre-existing directory's readiness sentinel
     # survives publish untouched — an invalid directory that is quarantined
     # and rebuilt gets a fresh sentinel (new inode/mtime) and must not be
     # billed as reused.
-    store_dir = bundle_store_base() / descriptor.bundle_digest
+    store_dir = bundle_store_path(descriptor.bundle_digest)
     sentinel_before = _sentinel_fingerprint(store_dir)
     try:
         final_dir = publish_bundle(
