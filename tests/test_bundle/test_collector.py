@@ -136,6 +136,31 @@ def test_jinja_recursive_closure_and_include_semantics(tmp_path: Path) -> None:
     assert "tree/main/templates/present.md" in paths
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Symlink semantics require POSIX privileges")
+def test_jinja_visited_key_includes_normalized_search_root(tmp_path: Path) -> None:
+    # Requirement: one resolved prompt is rescanned when reached through a distinct search root.
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (shared / "prompt.md").write_text("{% include 'partial.md' %}", encoding="utf-8")
+    (shared / "partial.md").write_text("shared", encoding="utf-8")
+    alternate = tmp_path / "alternate"
+    alternate.mkdir()
+    (alternate / "partial.md").write_text("alternate", encoding="utf-8")
+    (alternate / "prompt.md").symlink_to(shared / "prompt.md")
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(
+        _workflow("!file shared/prompt.md").replace(
+            "routes:\n", "system_prompt: !file alternate/prompt.md\n    routes:\n"
+        ),
+        encoding="utf-8",
+    )
+
+    paths = {entry.logical_path for entry in _collect(workflow).entries}
+
+    assert "tree/main/shared/partial.md" in paths
+    assert "tree/main/alternate/partial.md" in paths
+
+
 def test_local_and_for_each_subworkflows_collect_their_includes(tmp_path: Path) -> None:
     # Requirement: top-level and inline for_each workflow steps recurse with their own graphs.
     for name in ("one", "two"):
@@ -324,6 +349,183 @@ def test_plugin_component_switches_exclude_agents_and_mcp(tmp_path: Path) -> Non
     }
 
 
+def test_plugin_manifest_selected_mcp_file_is_collected_only_when_enabled(tmp_path: Path) -> None:
+    # Requirement: the manifest-selected MCP source, not an assumed default, follows mcp enablement.
+    plugin = tmp_path / "plugin"
+    (plugin / ".github" / "plugin").mkdir(parents=True)
+    (plugin / "config").mkdir()
+    (plugin / ".github" / "plugin" / "plugin.json").write_text(
+        '{"name":"review","mcpServers":"config/servers.json"}', encoding="utf-8"
+    )
+    (plugin / "config" / "servers.json").write_text(
+        '{"mcpServers":{"review-tools":{"command":"review"}}}', encoding="utf-8"
+    )
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(_plugin_workflow("      - ./plugin\n"), encoding="utf-8")
+
+    enabled_paths = {entry.logical_path for entry in _collect(workflow).entries}
+    workflow.write_text(
+        _plugin_workflow("      - name: ./plugin\n        mcp: false\n"), encoding="utf-8"
+    )
+    disabled_paths = {entry.logical_path for entry in _collect(workflow).entries}
+
+    source = "tree/plugins/review/config/servers.json"
+    assert source in enabled_paths
+    assert source not in disabled_paths
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Symlink semantics require POSIX privileges")
+def test_plugin_manifest_symlinked_mcp_file_collects_target(tmp_path: Path) -> None:
+    # Requirement: a manifest-selected MCP symlink includes its target bytes in the bundle.
+    plugin = tmp_path / "plugin"
+    (plugin / ".github" / "plugin").mkdir(parents=True)
+    (plugin / "config").mkdir()
+    (plugin / ".github" / "plugin" / "plugin.json").write_text(
+        '{"name":"review","mcpServers":"config/servers.json"}', encoding="utf-8"
+    )
+    actual = plugin / "config" / "actual-servers.json"
+    actual.write_text('{"mcpServers":{"review-tools":{"command":"review"}}}', encoding="utf-8")
+    (plugin / "config" / "servers.json").symlink_to("actual-servers.json")
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(_plugin_workflow("      - ./plugin\n"), encoding="utf-8")
+
+    bundle = _collect(workflow)
+    entries = {entry.logical_path: entry for entry in bundle.entries}
+
+    link = "tree/plugins/review/config/servers.json"
+    assert entries[link].link_target == "actual-servers.json"
+    assert "tree/plugins/review/config/actual-servers.json" in entries
+
+
+def test_plugin_manifest_mcp_file_outside_plugin_root_keeps_relative_layout(tmp_path: Path) -> None:
+    # Requirement: an authorized manifest MCP path outside the plugin root stays relocatable.
+    plugin = tmp_path / "plugins" / "review"
+    shared = tmp_path / "plugins" / "shared"
+    (plugin / ".github" / "plugin").mkdir(parents=True)
+    shared.mkdir(parents=True)
+    (plugin / ".github" / "plugin" / "plugin.json").write_text(
+        '{"name":"review","mcpServers":"../shared/servers.json"}', encoding="utf-8"
+    )
+    (shared / "servers.json").write_text(
+        '{"mcpServers":{"review-tools":{"command":"review"}}}', encoding="utf-8"
+    )
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(_plugin_workflow("      - ./plugins/review\n"), encoding="utf-8")
+
+    paths = {entry.logical_path for entry in _collect(workflow).entries}
+
+    assert "tree/plugins/shared/servers.json" in paths
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Symlink semantics require POSIX privileges")
+def test_plugin_manifest_external_mcp_symlink_keeps_relative_layout(tmp_path: Path) -> None:
+    # Requirement: an external MCP symlink and its target share the portable sibling namespace.
+    plugin = tmp_path / "plugins" / "review"
+    shared = tmp_path / "plugins" / "shared"
+    (plugin / ".github" / "plugin").mkdir(parents=True)
+    shared.mkdir(parents=True)
+    (plugin / ".github" / "plugin" / "plugin.json").write_text(
+        '{"name":"review","mcpServers":"../shared/servers.json"}', encoding="utf-8"
+    )
+    (shared / "actual-servers.json").write_text(
+        '{"mcpServers":{"review-tools":{"command":"review"}}}', encoding="utf-8"
+    )
+    (shared / "servers.json").symlink_to("actual-servers.json")
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(_plugin_workflow("      - ./plugins/review\n"), encoding="utf-8")
+
+    bundle = _collect(workflow)
+    entries = {entry.logical_path: entry for entry in bundle.entries}
+
+    link = "tree/plugins/shared/servers.json"
+    assert entries[link].link_target == "actual-servers.json"
+    assert "tree/plugins/shared/actual-servers.json" in entries
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Symlink semantics require POSIX privileges")
+def test_plugin_skill_symlink_collects_directory_target(tmp_path: Path) -> None:
+    # Requirement: plugin skill directory links collect their targets into the plugin namespace.
+    plugin = tmp_path / "plugin"
+    _write_plugin(plugin)
+    shared = plugin / "shared-references"
+    shared.mkdir()
+    (shared / "guide.md").write_text("guide", encoding="utf-8")
+    references = plugin / "skills" / "plugin-skill" / "references"
+    references.symlink_to("../../shared-references", target_is_directory=True)
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(_plugin_workflow("      - ./plugin\n"), encoding="utf-8")
+
+    bundle = _collect(workflow)
+    entries = {entry.logical_path: entry for entry in bundle.entries}
+
+    link = "tree/plugins/review/skills/plugin-skill/references"
+    assert entries[link].link_target == "../../shared-references"
+    assert "tree/plugins/review/shared-references/guide.md" in entries
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Symlink semantics require POSIX privileges")
+def test_plugin_skill_symlink_cycle_is_rejected(tmp_path: Path) -> None:
+    # Requirement: plugin skill directory link cycles fail explicitly instead of hanging.
+    plugin = tmp_path / "plugin"
+    _write_plugin(plugin)
+    skill = plugin / "skills" / "plugin-skill"
+    (skill / "loop").symlink_to(skill, target_is_directory=True)
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(_plugin_workflow("      - ./plugin\n"), encoding="utf-8")
+
+    with pytest.raises(BundleCycleError, match="Circular bundle directory traversal"):
+        _collect(workflow)
+
+
+def test_per_agent_provider_override_selects_plugin_flavor(tmp_path: Path) -> None:
+    # Requirement: each agent resolves plugins with its effective provider's flavor.
+    checkout = tmp_path / "checkout"
+    copilot = checkout / "copilot-plugin"
+    claude = checkout / "claude-plugin"
+    (copilot / ".github" / "plugin").mkdir(parents=True)
+    (copilot / ".github" / "plugin" / "plugin.json").write_text(
+        '{"name":"review"}', encoding="utf-8"
+    )
+    (claude / ".claude-plugin").mkdir(parents=True)
+    (claude / ".claude-plugin" / "plugin.json").write_text('{"name":"review"}', encoding="utf-8")
+    (checkout / ".github" / "plugin").mkdir(parents=True)
+    (checkout / ".github" / "plugin" / "marketplace.json").write_text(
+        json.dumps({"name": "acme", "plugins": [{"name": "review", "source": "copilot-plugin"}]}),
+        encoding="utf-8",
+    )
+    (checkout / ".claude-plugin").mkdir(exist_ok=True)
+    (checkout / ".claude-plugin" / "marketplace.json").write_text(
+        json.dumps({"name": "acme", "plugins": [{"name": "review", "source": "claude-plugin"}]}),
+        encoding="utf-8",
+    )
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(
+        """\
+workflow:
+  name: provider-flavor
+  entry_point: agent
+  runtime:
+    provider: copilot
+    plugin_sources:
+      acme:
+        source: ./checkout
+agents:
+  - name: agent
+    provider: claude-agent-sdk
+    prompt: test
+    plugins: [review@acme]
+    routes:
+      - to: $end
+""",
+        encoding="utf-8",
+    )
+
+    bundle = _collect(workflow)
+
+    assert bundle.manifest.plugins_topology["review"].endswith("/.claude-plugin/plugin.json")
+    assert bundle.descriptor.provenance.plugins[0].flavor == "claude"
+
+
 def test_plugin_skills_switch_excludes_skill_content_and_topology(tmp_path: Path) -> None:
     # Requirement: disabling plugin skills removes their files and topology dependency.
     plugin = tmp_path / "plugin"
@@ -398,7 +600,7 @@ def test_declared_skill_shadows_same_named_plugin_skill(tmp_path: Path) -> None:
 
 
 def test_assets_hidden_rules_and_additional_root(tmp_path: Path) -> None:
-    # Requirement: assets honor hidden glob rules and preserve additional-root authorization text.
+    # Requirement: assets honor hidden glob rules and use stable additional-root metadata.
     (tmp_path / "run.sh").write_text("run", encoding="utf-8")
     (tmp_path / ".github").mkdir()
     (tmp_path / ".github" / "ci.sh").write_text("ci", encoding="utf-8")
@@ -427,7 +629,46 @@ def test_assets_hidden_rules_and_additional_root(tmp_path: Path) -> None:
     assert "tree/main/.github/ci.sh" in paths
     assert all("/.git/" not in f"/{path}/" for path in paths)
     root_entry = next(entry for entry in bundle.entries if entry.logical_path.endswith("data.txt"))
-    assert authored in root_entry.origin_detail
+    assert root_entry.origin_detail == "asset:3;additional_root=00"
+    assert str(outside.parent) not in root_entry.origin_detail
+
+
+def test_additional_root_origin_is_independent_of_host_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: different host paths and basenames produce identical manifests and digests.
+    def collect_under(host: Path, root_name: str) -> CollectedBundle:
+        project = host / "project"
+        outside = host / root_name
+        project.mkdir(parents=True)
+        outside.mkdir()
+        (outside / "data.txt").write_text("data", encoding="utf-8")
+        monkeypatch.setenv("BUNDLE_SHARED_ROOT", str(outside))
+        workflow = project / "workflow.yaml"
+        workflow.write_text(
+            _workflow(
+                "inline",
+                extra_workflow=(
+                    "\n    assets: ['../${ROOT_NAME}/data.txt']"
+                    "\n    additional_roots: ['${BUNDLE_SHARED_ROOT}']"
+                ),
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("ROOT_NAME", root_name)
+        return _collect(workflow)
+
+    first = collect_under(tmp_path / "first-host-location", "shared-one")
+    second = collect_under(tmp_path / "different-host-location", "other-assets")
+
+    first_entry = next(entry for entry in first.entries if entry.logical_path.endswith("data.txt"))
+    second_entry = next(
+        entry for entry in second.entries if entry.logical_path.endswith("data.txt")
+    )
+    assert first_entry == second_entry
+    assert first_entry.logical_path == "tree/roots/00/data.txt"
+    assert first_entry.origin_detail == "asset:0;additional_root=00"
+    assert first.manifest.bundle_digest == second.manifest.bundle_digest
 
 
 def test_dynamic_template_and_unset_environment_fail_precisely(
@@ -483,6 +724,53 @@ def test_symlink_payload_and_escape(tmp_path: Path) -> None:
     outside.write_text("outside", encoding="utf-8")
     link.symlink_to(outside)
     with pytest.raises(BundleSymlinkEscapeError):
+        _collect(workflow)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Symlink semantics require POSIX privileges")
+def test_include_and_asset_symlinks_collect_components_and_directory_targets(
+    tmp_path: Path,
+) -> None:
+    # Requirement: include and asset links retain links and recursively collect authorized targets.
+    real_prompts = tmp_path / "real-prompts"
+    real_prompts.mkdir()
+    (real_prompts / "prompt.md").write_text("prompt", encoding="utf-8")
+    (tmp_path / "prompts").symlink_to(real_prompts, target_is_directory=True)
+    real_assets = tmp_path / "real-assets"
+    nested = real_assets / "nested"
+    nested.mkdir(parents=True)
+    (nested / "data.txt").write_text("data", encoding="utf-8")
+    (tmp_path / "assets-link").symlink_to(real_assets, target_is_directory=True)
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(
+        _workflow(
+            "!file prompts/prompt.md",
+            extra_workflow="\n    assets: [assets-link]",
+        ),
+        encoding="utf-8",
+    )
+
+    bundle = _collect(workflow)
+    entries = {entry.logical_path: entry for entry in bundle.entries}
+
+    assert entries["tree/main/prompts"].link_target == "real-prompts"
+    assert "tree/main/real-prompts/prompt.md" in entries
+    assert entries["tree/main/assets-link"].link_target == "real-assets"
+    assert "tree/main/real-assets/nested/data.txt" in entries
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Symlink semantics require POSIX privileges")
+def test_recursive_asset_symlink_cycle_is_rejected(tmp_path: Path) -> None:
+    # Requirement: recursive directory symlink cycles fail explicitly instead of hanging.
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    (assets / "loop").symlink_to(assets, target_is_directory=True)
+    workflow = tmp_path / "workflow.yaml"
+    workflow.write_text(
+        _workflow("inline", extra_workflow="\n    assets: [assets]"), encoding="utf-8"
+    )
+
+    with pytest.raises(BundleCycleError, match="Circular bundle symlink"):
         _collect(workflow)
 
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 import glob
 import hashlib
 import os
+import posixpath
 import stat
 import subprocess
 from collections.abc import Callable, Iterable, Mapping
@@ -54,7 +55,6 @@ from conductor.file_string import FileString
 from conductor.filesystem import is_dir_strict, is_file_strict, stat_or_none
 from conductor.plugins.errors import PluginFetchError, PluginSourceUnavailableError
 from conductor.plugins.manifest import (
-    DEFAULT_MCP_FILE,
     PLUGIN_MANIFESTS,
     find_manifest,
     manifest_flavor,
@@ -107,7 +107,6 @@ class CollectedBundle:
 @dataclass(frozen=True)
 class _AdditionalRoot:
     path: Path
-    authored: str
     index: int
     namespace: str
 
@@ -318,7 +317,6 @@ class _Collector:
         )
 
     def _prepare_additional_roots(self) -> None:
-        seen_basenames: dict[str, str] = {}
         declaration_index = 0
         for node in self.nodes:
             bundle = node.config.workflow.bundle
@@ -332,21 +330,11 @@ class _Collector:
                         f"Declared workflow.bundle.additional_roots entry {authored!r} "
                         f"does not exist or is not a directory: {root}"
                     )
-                basename = root.name
-                previous = seen_basenames.get(basename)
-                if previous is not None and previous != authored:
-                    raise BundleError(
-                        f"Additional roots {previous!r} and {authored!r} share basename "
-                        f"{basename!r}.",
-                        suggestion="Rename or narrow one declared additional root.",
-                    )
-                seen_basenames[basename] = authored
                 self.additional_roots.append(
                     _AdditionalRoot(
                         path=root,
-                        authored=authored,
                         index=declaration_index,
-                        namespace=f"tree/roots/{declaration_index:02d}-{basename}",
+                        namespace=f"tree/roots/{declaration_index:02d}",
                     )
                 )
                 declaration_index += 1
@@ -366,13 +354,31 @@ class _Collector:
             else:
                 kind = "include"
                 detail = f"include:{record.logical_ref}"
-            self._stage_local(record.path, kind, detail)
+            anchored_path = record.anchored_path or record.path
+            if anchored_path != record.path:
+                self._collect_symlink_components(anchored_path, kind, detail)
+                if anchored_path.is_symlink():
+                    self._collect_local_path(anchored_path, kind, detail, recursive=True)
+                else:
+                    self._stage_local(record.path, kind, detail)
+            else:
+                self._stage_local(record.path, kind, detail)
 
     def _collect_jinja(self, node: _WorkflowNode) -> None:
-        visited: set[Path] = set()
+        visited: set[tuple[Path, Path]] = set()
         for value in self._file_strings(node.config):
-            root = Path(os.path.abspath(os.path.normpath(value.source_path.parent)))
-            self._scan_template(value.source_path, root, visited)
+            records = [
+                record
+                for record in node.graph
+                if record.tag == "file" and record.path == value.source_path
+            ]
+            if not records:
+                root = Path(os.path.abspath(os.path.normpath(value.source_path.parent)))
+                self._scan_template(value.source_path, root, visited)
+                continue
+            for record in records:
+                anchored_path = record.anchored_path or record.path
+                self._scan_template(record.path, anchored_path.parent, visited)
 
     @staticmethod
     def _file_strings(config: WorkflowConfig) -> Iterable[FileString]:
@@ -387,9 +393,14 @@ class _Collector:
             ):
                 yield step.prompt
 
-    def _scan_template(self, path: Path, search_root: Path, visited: set[Path]) -> None:
+    def _scan_template(
+        self, path: Path, search_root: Path, visited: set[tuple[Path, Path]]
+    ) -> None:
         normalized = Path(os.path.abspath(os.path.normpath(path)))
-        identity = Path(os.path.realpath(normalized))
+        identity = (
+            Path(os.path.realpath(normalized)),
+            Path(os.path.realpath(Path(os.path.abspath(os.path.normpath(search_root))))),
+        )
         if identity in visited:
             return
         visited.add(identity)
@@ -450,14 +461,19 @@ class _Collector:
         bundle = node.config.workflow.bundle
         if bundle is None:
             return
-        for pattern in bundle.assets:
+        for pattern_index, pattern in enumerate(bundle.assets):
+            detail = f"asset:{pattern_index}"
             expanded = glob.glob(
                 str(node.path.parent / pattern), recursive=True, include_hidden=False
             )
             for raw in sorted(expanded):
                 path = Path(raw)
-                if path.is_symlink() or is_file_strict(path):
-                    self._stage_local(path, "asset", f"asset:{pattern}")
+                if path.is_symlink():
+                    self._collect_local_path(path, "asset", detail, recursive=True)
+                elif is_file_strict(path):
+                    self._stage_local(path, "asset", detail)
+                elif is_dir_strict(path) and not glob.has_magic(pattern):
+                    self._collect_local_path(path, "asset", detail, recursive=True)
 
     def _collect_agent_dependencies(self, node: _WorkflowNode) -> None:
         runtime = node.config.workflow.runtime
@@ -481,11 +497,11 @@ class _Collector:
                 self.warn(f"Plugin source {name!r} is not cached: {exc}")
 
         marketplaces = marketplaces_from(source_results)
-        flavor = plugin_flavor_for(runtime.provider.name)
         steps = [*node.config.agents, *(group.agent for group in node.config.for_each)]
         for step in steps:
             if not isinstance(step, AgentDef):
                 continue
+            flavor = plugin_flavor_for(step.provider or runtime.provider.name)
             if step.skills is None:
                 skill_entries = list(runtime.skills)
                 discovery = runtime.skill_discovery
@@ -539,9 +555,14 @@ class _Collector:
         namespace = f"tree/skills/{skill.name}"
         self.dependency_roots.add(skill.directory)
         detail = f"skill-discovery:{skill.name}" if skill.discovered else f"skill:{skill.name}"
-        for path in self._iter_tree(skill.directory):
-            relative = path.relative_to(skill.directory).as_posix()
-            self._stage(path, f"{namespace}/{relative}", "skill", detail)
+        self._collect_dependency_tree(
+            skill.directory,
+            namespace,
+            mapping_root=skill.directory,
+            mapping_namespace=namespace,
+            kind="skill",
+            detail=detail,
+        )
         topology = f"{namespace}/SKILL.md"
         previous = self.skill_claims.get(skill.name)
         if previous is not None and previous[0] == "plugin":
@@ -595,19 +616,38 @@ class _Collector:
             candidate = plugin.root / relative
             if is_file_strict(candidate):
                 selected.add(candidate)
-        mcp = plugin.root / DEFAULT_MCP_FILE
-        if plugin.mcp_servers and is_file_strict(mcp):
-            selected.add(mcp)
+        if plugin.mcp_servers and plugin.mcp_source is not None:
+            selected.add(plugin.mcp_source)
+            if not plugin.mcp_source.is_relative_to(plugin.root):
+                self.dependency_roots.add(plugin.mcp_source)
         selected.update(agent.path for agent in plugin.agents)
-        for skill in plugin.skills:
-            selected.update(self._iter_tree(skill.directory))
         for path in sorted(selected, key=lambda item: item.as_posix()):
-            relative = path.relative_to(plugin.root).as_posix()
-            self._stage(
+            relative = os.path.relpath(path, plugin.root).replace("\\", "/")
+            logical = PurePosixPath(posixpath.normpath(f"{namespace}/{relative}")).as_posix()
+            if not logical.startswith("tree/"):
+                raise BundleRootEscapeError(
+                    f"Plugin dependency {path} cannot be mapped inside the bundle tree."
+                )
+            mapping_root, mapping_namespace = self._plugin_dependency_mapping(
+                path, plugin.root, namespace, logical
+            )
+            self._collect_dependency_tree(
                 path,
-                f"{namespace}/{relative}",
-                "plugin",
-                origin_detail,
+                logical,
+                mapping_root=mapping_root,
+                mapping_namespace=mapping_namespace,
+                kind="plugin",
+                detail=origin_detail,
+            )
+        for skill in plugin.skills:
+            skill_namespace = f"{namespace}/{skill.directory.relative_to(plugin.root).as_posix()}"
+            self._collect_dependency_tree(
+                skill.directory,
+                skill_namespace,
+                mapping_root=plugin.root,
+                mapping_namespace=namespace,
+                kind="plugin",
+                detail=origin_detail,
             )
         manifest_logical = f"{namespace}/{manifest.relative_to(plugin.root).as_posix()}"
         self._set_topology(self.plugins_topology, plugin.name, manifest_logical, "plugin")
@@ -626,6 +666,25 @@ class _Collector:
                 sha=sha,
             ),
         )
+
+    @staticmethod
+    def _plugin_dependency_mapping(
+        path: Path, plugin_root: Path, plugin_namespace: str, logical_path: str
+    ) -> tuple[Path, str]:
+        normalized = Path(os.path.abspath(os.path.normpath(path)))
+        normalized_root = Path(os.path.abspath(os.path.normpath(plugin_root)))
+        if normalized.is_relative_to(normalized_root):
+            return plugin_root, plugin_namespace
+        relative = PurePosixPath(os.path.relpath(normalized, normalized_root).replace("\\", "/"))
+        parent_steps = sum(1 for part in relative.parts if part == "..")
+        namespace_parts = PurePosixPath(plugin_namespace).parts
+        namespace = PurePosixPath(
+            *namespace_parts[: len(namespace_parts) - parent_steps]
+        ).as_posix()
+        root = plugin_root
+        for _ in range(parent_steps):
+            root = root.parent
+        return root, namespace
 
     def _set_plugin_skill_topology(self, skill: ResolvedSkill, path: str) -> None:
         previous = self.skill_claims.get(skill.name)
@@ -662,17 +721,153 @@ class _Collector:
             )
         table[name] = path
 
-    def _iter_tree(self, root: Path) -> Iterable[Path]:
-        for directory, directories, filenames in os.walk(root, followlinks=False):
-            current = Path(directory)
-            symlink_dirs = [name for name in directories if (current / name).is_symlink()]
-            directories[:] = sorted(name for name in directories if name not in symlink_dirs)
-            for name in sorted(symlink_dirs):
-                yield current / name
-            for name in sorted(filenames):
-                path = current / name
-                if path.is_symlink() or is_file_strict(path):
-                    yield path
+    def _collect_dependency_tree(
+        self,
+        path: Path,
+        logical_path: str,
+        *,
+        mapping_root: Path,
+        mapping_namespace: str,
+        kind: _OriginKind,
+        detail: str,
+        active_directories: tuple[Path, ...] = (),
+    ) -> None:
+        normalized = Path(os.path.abspath(os.path.normpath(path)))
+        if normalized.is_symlink():
+            target = Path(os.path.realpath(normalized))
+            if not self._inside_authorized_root(target):
+                raise BundleSymlinkEscapeError(
+                    f"Symlink {normalized} points outside every authorized root to {target}.",
+                    suggestion="Move the target inside an authorized root or declare its root.",
+                )
+            self._stage(
+                normalized,
+                logical_path,
+                kind,
+                detail,
+                mapping_root=mapping_root,
+                mapping_namespace=mapping_namespace,
+            )
+            try:
+                target_relative = target.relative_to(Path(os.path.realpath(mapping_root)))
+            except ValueError as exc:
+                raise BundleRootEscapeError(
+                    f"Bundle symlink target {target} has no relocatable mapping under "
+                    f"dependency root {mapping_root}.",
+                    file_path=str(target),
+                ) from exc
+            self._collect_dependency_tree(
+                target,
+                f"{mapping_namespace}/{target_relative.as_posix()}",
+                mapping_root=mapping_root,
+                mapping_namespace=mapping_namespace,
+                kind=kind,
+                detail=detail,
+                active_directories=active_directories,
+            )
+            return
+
+        if is_dir_strict(normalized):
+            identity = Path(os.path.realpath(normalized))
+            if identity in active_directories:
+                chain = " -> ".join(str(item) for item in (*active_directories, identity))
+                raise BundleCycleError(f"Circular bundle directory traversal detected: {chain}")
+            active = (*active_directories, identity)
+            try:
+                children = sorted(normalized.iterdir(), key=lambda item: item.name)
+            except OSError as exc:
+                raise BundleError(
+                    f"Bundle directory could not be read: {normalized}: {exc}"
+                ) from exc
+            for child in children:
+                self._collect_dependency_tree(
+                    child,
+                    f"{logical_path}/{child.name}",
+                    mapping_root=mapping_root,
+                    mapping_namespace=mapping_namespace,
+                    kind=kind,
+                    detail=detail,
+                    active_directories=active,
+                )
+            return
+
+        self._stage(normalized, logical_path, kind, detail)
+
+    def _collect_local_path(
+        self,
+        path: Path,
+        kind: _OriginKind,
+        detail: str,
+        *,
+        recursive: bool,
+        active_directories: tuple[Path, ...] = (),
+    ) -> None:
+        """Stage a local dependency and the closure reached through symlinks."""
+        normalized = Path(os.path.abspath(os.path.normpath(path)))
+        if normalized.is_symlink():
+            target = Path(os.path.realpath(normalized))
+            if not self._inside_authorized_root(target):
+                raise BundleSymlinkEscapeError(
+                    f"Symlink {normalized} points outside every authorized root to {target}.",
+                    suggestion="Move the target inside an authorized root or declare its root.",
+                )
+            self._stage_local(normalized, kind, detail)
+            if is_dir_strict(target):
+                if target in active_directories:
+                    chain = " -> ".join(str(item) for item in (*active_directories, target))
+                    raise BundleCycleError(f"Circular bundle symlink detected: {chain}")
+                if recursive:
+                    self._collect_local_path(
+                        target,
+                        kind,
+                        detail,
+                        recursive=True,
+                        active_directories=active_directories,
+                    )
+            elif is_file_strict(target):
+                self._stage_local(target, kind, detail)
+            else:
+                raise BundleError(f"Bundle symlink target does not exist: {target}")
+            return
+
+        if is_dir_strict(normalized):
+            if not recursive:
+                return
+            identity = Path(os.path.realpath(normalized))
+            if identity in active_directories:
+                chain = " -> ".join(str(item) for item in (*active_directories, identity))
+                raise BundleCycleError(f"Circular bundle directory traversal detected: {chain}")
+            active = (*active_directories, identity)
+            try:
+                children = sorted(normalized.iterdir(), key=lambda item: item.name)
+            except OSError as exc:
+                raise BundleError(
+                    f"Bundle directory could not be read: {normalized}: {exc}"
+                ) from exc
+            for child in children:
+                self._collect_local_path(
+                    child,
+                    kind,
+                    detail,
+                    recursive=True,
+                    active_directories=active,
+                )
+            return
+
+        self._stage_local(normalized, kind, detail)
+
+    def _collect_symlink_components(self, path: Path, kind: _OriginKind, detail: str) -> None:
+        normalized = Path(os.path.abspath(os.path.normpath(path)))
+        roots = [self.root_dir, *(root.path for root in self.additional_roots)]
+        containing = [root for root in roots if normalized.is_relative_to(root)]
+        if not containing:
+            return
+        root = max(containing, key=lambda candidate: len(candidate.parts))
+        current = root
+        for part in normalized.relative_to(root).parts[:-1]:
+            current /= part
+            if current.is_symlink():
+                self._collect_local_path(current, kind, detail, recursive=True)
 
     def _stage_local(self, path: Path, kind: _OriginKind, detail: str) -> None:
         logical, root_detail = self._local_logical_path(path)
@@ -694,7 +889,7 @@ class _Collector:
         for root in self.additional_roots:
             try:
                 relative = normalized.relative_to(root.path).as_posix()
-                return f"{root.namespace}/{relative}", root.authored
+                return f"{root.namespace}/{relative}", root.namespace.removeprefix("tree/roots/")
             except ValueError:
                 continue
         raise BundleRootEscapeError(
@@ -709,12 +904,14 @@ class _Collector:
         logical_path: str,
         origin_kind: _OriginKind,
         origin_detail: str,
+        *,
+        mapping_root: Path | None = None,
+        mapping_namespace: str | None = None,
     ) -> None:
         normalized = Path(os.path.abspath(os.path.normpath(path)))
         self._assert_authorized(normalized)
         logical = PurePosixPath(logical_path).as_posix()
         if normalized.is_symlink():
-            target = PurePosixPath(os.readlink(normalized).replace("\\", "/")).as_posix()
             resolved_target = Path(os.path.realpath(normalized))
             if not self._inside_authorized_root(resolved_target):
                 raise BundleSymlinkEscapeError(
@@ -722,6 +919,16 @@ class _Collector:
                     f"{resolved_target}.",
                     suggestion="Move the target inside an authorized root or declare its root.",
                 )
+            target_logical = self._logical_target_for_symlink(
+                normalized,
+                logical,
+                resolved_target,
+                mapping_root=mapping_root,
+                mapping_namespace=mapping_namespace,
+            )
+            target = PurePosixPath(
+                posixpath.relpath(target_logical, PurePosixPath(logical).parent.as_posix())
+            ).as_posix()
             entry = BundleEntry.for_symlink(
                 logical,
                 target,
@@ -763,6 +970,41 @@ class _Collector:
             assert isinstance(payload, str)
             self.links[logical] = payload
         self._check_caps()
+
+    def _logical_target_for_symlink(
+        self,
+        link: Path,
+        logical: str,
+        target: Path,
+        *,
+        mapping_root: Path | None = None,
+        mapping_namespace: str | None = None,
+    ) -> str:
+        if mapping_root is not None and mapping_namespace is not None:
+            try:
+                relative = target.relative_to(Path(os.path.realpath(mapping_root)))
+            except ValueError:
+                pass
+            else:
+                return f"{mapping_namespace}/{relative.as_posix()}"
+        try:
+            return self._local_logical_path(target)[0]
+        except BundleRootEscapeError:
+            pass
+        for root in sorted(self.dependency_roots, key=lambda item: len(item.parts), reverse=True):
+            try:
+                link_relative = link.relative_to(root)
+                target_relative = target.relative_to(Path(os.path.realpath(root)))
+            except ValueError:
+                continue
+            logical_parts = PurePosixPath(logical).parts
+            prefix_length = len(logical_parts) - len(link_relative.parts)
+            prefix = PurePosixPath(*logical_parts[:prefix_length])
+            return (prefix / PurePosixPath(target_relative.as_posix())).as_posix()
+        raise BundleRootEscapeError(
+            f"Bundle symlink target {target} has no relocatable logical mapping.",
+            file_path=str(target),
+        )
 
     def _assert_authorized(self, path: Path) -> None:
         if find_registry_cache_location(path) is not None:
