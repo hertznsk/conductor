@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import stat
 import tarfile
 from concurrent.futures import ThreadPoolExecutor
@@ -156,6 +157,36 @@ class TestPublish:
         with pytest.raises(ValueError, match="not a declared"):
             publish_bundle(manifest, {**files, "tree/main/extra.txt": b"x"}, links)
 
+    def test_publish_rejects_entry_escaping_staging(self):
+        # Requirement: even a hand-built manifest that bypasses the model
+        # validator (model_construct) must not make the store write outside
+        # its temp tree — _stage_tree resolves each target and raises.
+        entry = BundleEntry.model_construct(
+            logical_path="../evil.txt",
+            kind="file",
+            digest=f"sha256:{hashlib.sha256(b'x').hexdigest()}",
+            size=1,
+            executable=False,
+            link_target=None,
+            origin_kind="asset",
+            origin_detail="asset:../evil.txt",
+        )
+        manifest = BundleManifest.model_construct(
+            version=1,
+            bundle_digest=compute_bundle_digest([entry], {}, {}),
+            entries=(entry,),
+            skills_topology={},
+            plugins_topology={},
+        )
+
+        with pytest.raises(ValueError, match="outside"):
+            publish_bundle(manifest, {"../evil.txt": b"x"}, {})
+
+        base = bundle_store_base()
+        assert not (base.parent / "evil.txt").exists()
+        quarantine_leftovers = [item.name for item in base.iterdir() if "quarantine" in item.name]
+        assert quarantine_leftovers == []
+
 
 class TestReuse:
     def test_second_publish_reuses_valid_dir(self):
@@ -191,6 +222,58 @@ class TestReuse:
         parsed = json.loads((final / "bundle.json").read_text(encoding="utf-8"))
         assert parsed["bundle_digest"] == manifest.bundle_digest
         assert (final / "tree/main/workflow.yaml").is_file()
+
+    def test_invalid_dir_is_quarantined_and_removed(self, caplog, monkeypatch):
+        # Requirement: an invalid pre-existing directory is renamed aside to a
+        # quarantine name (never rmtree'd in place, so a concurrent publisher
+        # mid-publish is not deleted) and the quarantine is then removed —
+        # after publish returns the final dir is valid and no quarantine
+        # remains. The spies prove the rename-aside: the final directory must
+        # reach rmtree only via its quarantine name.
+        import conductor.bundle.store as store_module
+
+        manifest, files, links = _payload_manifest()
+        final = bundle_store_base() / manifest.bundle_digest
+        final.mkdir(parents=True)
+        (final / "stale-partial.txt").write_text("partial", encoding="utf-8")
+        (final / "bundle.json").write_text("not json", encoding="utf-8")
+
+        rename_calls: list[tuple[str, str]] = []
+        rmtree_targets: list[str] = []
+        real_rename = os.rename
+        real_rmtree = shutil.rmtree
+
+        def spy_rename(src, dst):
+            rename_calls.append((str(src), str(dst)))
+            return real_rename(src, dst)
+
+        def spy_rmtree(path, *args, **kwargs):
+            rmtree_targets.append(str(path))
+            return real_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(store_module.os, "rename", spy_rename)
+        monkeypatch.setattr(store_module.shutil, "rmtree", spy_rmtree)
+
+        with caplog.at_level(logging.WARNING, logger="conductor.bundle.store"):
+            result = publish_bundle(manifest, files, links)
+
+        assert result == final
+        quarantine_renames = [
+            (src, dst) for src, dst in rename_calls if "quarantine" in Path(dst).name
+        ]
+        rename_dst_dirs = [
+            Path(dst).name.lstrip(".").split(".quarantine")[0] for _, dst in quarantine_renames
+        ]
+        assert rename_dst_dirs == [final.name]
+        assert [src for src, _ in quarantine_renames] == [str(final)]
+        assert str(final) not in rmtree_targets
+        parsed = json.loads((final / "bundle.json").read_text(encoding="utf-8"))
+        assert parsed["bundle_digest"] == manifest.bundle_digest
+        assert not (final / "stale-partial.txt").exists()
+        leftovers = [
+            entry.name for entry in bundle_store_base().iterdir() if "quarantine" in entry.name
+        ]
+        assert leftovers == []
 
     def test_warning_sink_override_receives_message(self):
         # Requirement: the invalid-dir warning is delivered to an explicit

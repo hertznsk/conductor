@@ -180,9 +180,13 @@ def _build_impl(
     descriptor = descriptor.model_copy(update={"run_manifest_digest": run_manifest_digest})
 
     # The store directory is named after the full digest, prefix included
-    # (that is the CAS key contract in ``bundle/store.py``).
+    # (that is the CAS key contract in ``bundle/store.py``). "Reused" is
+    # reported only when the pre-existing directory's readiness sentinel
+    # survives publish untouched — an invalid directory that is quarantined
+    # and rebuilt gets a fresh sentinel (new inode/mtime) and must not be
+    # billed as reused.
     store_dir = bundle_store_base() / descriptor.bundle_digest
-    reused = store_dir.is_dir()
+    sentinel_before = _sentinel_fingerprint(store_dir)
     try:
         final_dir = publish_bundle(
             collected.manifest,
@@ -192,6 +196,7 @@ def _build_impl(
         )
     except OSError as exc:
         _fail(exc)
+    reused = sentinel_before is not None and _sentinel_fingerprint(final_dir) == sentinel_before
 
     _print_report(
         descriptor,
@@ -200,6 +205,21 @@ def _build_impl(
         reused=reused,
         warnings=publish_warnings + warnings,
     )
+
+
+def _sentinel_fingerprint(store_dir: Path) -> tuple[int, int, int] | None:
+    """Fingerprint the readiness sentinel, or ``None`` when there is none.
+
+    ``(st_ino, st_mtime_ns, st_size)`` of ``bundle.json``: a rebuild writes
+    a fresh sentinel, so any change in the triple proves the directory was
+    not reused. ``st_ino`` may be ``0`` on some platforms; the mtime and
+    size still discriminate.
+    """
+    try:
+        stat = (store_dir / "bundle.json").stat()
+    except OSError:
+        return None
+    return (stat.st_ino, stat.st_mtime_ns, stat.st_size)
 
 
 def _with_root_registry_provenance(

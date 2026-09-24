@@ -27,6 +27,7 @@ from conductor.bundle.model import (
     compute_bundle_digest,
     serialize_manifest,
 )
+from conductor.digest import canonical_json, canonical_json_digest
 
 
 def _file_entry(
@@ -296,6 +297,38 @@ class TestFrozenAndForbid:
             _file_entry("/etc/passwd")
 
 
+class TestLogicalPathHardening:
+    """The validator rejects every traversal or absolute path spelling."""
+
+    @pytest.mark.parametrize(
+        "logical_path",
+        [
+            "../x",
+            "a/../../x",
+            "",
+            "a//b",
+            "a/./b",
+            ".",
+            "C:\\x",
+            "C:/x",
+            "\\\\server\\x",
+            "/abs",
+            "a\\b",
+        ],
+    )
+    def test_malicious_logical_path_rejected(self, logical_path: str) -> None:
+        # Requirement: logical_path is a normalized relative POSIX path — the
+        # validator rejects parent traversal, empty/dot segments, backslashes
+        # (POSIX-only notation), and POSIX/Windows absolute spellings.
+        with pytest.raises(ValidationError, match="logical_path"):
+            _file_entry(logical_path)
+
+    def test_normal_logical_path_accepted(self) -> None:
+        # Requirement: ordinary normalized relative paths keep working.
+        entry = _file_entry("tree/main/x")
+        assert entry.logical_path == "tree/main/x"
+
+
 class TestSerializeManifest:
     def test_round_trip(self) -> None:
         # Requirement: serialize_manifest output parses back into an equal
@@ -315,3 +348,24 @@ class TestSerializeManifest:
             plugins_topology={"prs": "tree/plugins/prs/.claude-plugin/plugin.json"},
         )
         assert serialize_manifest(manifest) == serialize_manifest(manifest)
+
+
+class TestCanonicalJson:
+    def test_canonical_json_matches_serialize_manifest_form(self) -> None:
+        # Requirement: conductor.digest.canonical_json is the single canonical
+        # serializer — its output equals serialize_manifest's bytes for the
+        # same payload, so the store sentinel and every digest agree.
+        manifest = _manifest([_file_entry("tree/main/workflow.yaml")])
+        payload = manifest.model_dump(mode="json")
+        assert serialize_manifest(manifest) == canonical_json(payload)
+
+    def test_canonical_json_digest_golden(self) -> None:
+        # Requirement: canonical_json_digest of a fixed payload is
+        # byte-stable — the golden value below was computed with the original
+        # implementation and must survive the canonical_json extraction.
+        payload = {"b": [1, 2, {"k": "v"}], "a": {"x": 1, "nested": {"z": "é中"}}}
+        golden = '{"a":{"nested":{"z":"\\u00e9\\u4e2d"},"x":1},"b":[1,2,{"k":"v"}]}'
+        assert canonical_json(payload) == golden
+        assert canonical_json_digest(payload) == (
+            "sha256:3d9b047d1912e8d0138c15ace5971013a3b50d111ff79b4102b37b65b8aa43aa"
+        )

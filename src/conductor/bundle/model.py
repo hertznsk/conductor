@@ -25,14 +25,13 @@ of serializing silently into the store.
 from __future__ import annotations
 
 import hashlib
-import json
 from collections.abc import Iterable, Mapping
-from pathlib import PurePosixPath
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
-from conductor.digest import canonical_json_digest
+from conductor.digest import canonical_json, canonical_json_digest
 
 _DIGEST_VERSION = 1
 """Schema version of the bundle digest inputs. ``Literal[1]`` on the models."""
@@ -92,12 +91,30 @@ class BundleEntry(BaseModel):
 
     @field_validator("logical_path")
     @classmethod
-    def _logical_path_must_be_relative(cls, value: str) -> str:
-        """Reject host-absolute paths: bundles are relocatable."""
-        if PurePosixPath(value).is_absolute():
+    def _logical_path_must_be_safe_relative(cls, value: str) -> str:
+        """Reject anything but a normalized relative POSIX path.
+
+        Bundles are relocatable, so a logical path must stay inside the
+        bundle root on every host: no POSIX- or Windows-absolute spelling
+        (``/x``, ``C:\\x``, UNC ``\\\\server\\x``), no parent traversal
+        (``..``), and no backslashes (logical paths are POSIX-only
+        notation). Paths are additionally required to be normalized — no
+        empty segments (``a//b``, ``a/``, ``""``) and no dot segments
+        (``a/./b``, ``.``) — matching what
+        :meth:`pathlib.PurePath.as_posix` produces for relative paths.
+        """
+        if PurePosixPath(value).is_absolute() or PureWindowsPath(value).is_absolute():
             raise ValueError(
                 f"bundle logical_path must be relative to the bundle root, "
                 f"got absolute path {value!r}"
+            )
+        if "\\" in value:
+            raise ValueError(
+                f"bundle logical_path must use POSIX notation, got backslash in {value!r}"
+            )
+        if any(segment in ("", ".", "..") for segment in value.split("/")):
+            raise ValueError(
+                f"bundle logical_path must be a normalized relative POSIX path, got {value!r}"
             )
         return value
 
@@ -326,12 +343,9 @@ def compute_bundle_digest(
 def serialize_manifest(manifest: BundleManifest) -> str:
     """Serialize a manifest as canonical JSON — the bytes stored as ``bundle.json``.
 
-    Stable for the same model: sorted keys, tight separators, ASCII-only
-    output, so re-serializing an equal manifest yields byte-identical text.
+    Delegates to :func:`conductor.digest.canonical_json`, the single
+    canonical serializer, so the stored manifest and every digest over it
+    agree byte-for-byte; re-serializing an equal manifest yields identical
+    text on every host.
     """
-    return json.dumps(
-        manifest.model_dump(mode="json"),
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    )
+    return canonical_json(manifest.model_dump(mode="json"))

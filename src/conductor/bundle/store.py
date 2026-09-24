@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import itertools
 import json
 import logging
 import os
@@ -60,6 +61,9 @@ _SENTINEL_NAME = "bundle.json"
 """Readiness sentinel — written last, so its presence certifies the tree."""
 
 _LOST_RACE_ERRNOS = (errno.ENOTEMPTY, errno.EEXIST)
+
+_quarantine_counter = itertools.count()
+"""Uniquifier for quarantine names — one publisher, many self-heals."""
 
 
 def bundle_store_base() -> Path:
@@ -129,7 +133,7 @@ def publish_bundle(
             f"Invalid bundle store directory {final} (unparseable or digest-mismatched "
             f"bundle.json); removing and rebuilding."
         )
-        shutil.rmtree(final, ignore_errors=True)
+        _quarantine_and_remove(final, digest)
 
     entries_by_path = {entry.logical_path: entry for entry in manifest.entries}
     staging = Path(tempfile.mkdtemp(dir=base))
@@ -151,6 +155,50 @@ def publish_bundle(
     return final
 
 
+def _quarantine_and_remove(final: Path, digest: str) -> None:
+    """Move an invalid final directory aside, then remove the quarantine.
+
+    Rename-aside instead of check-and-delete: another publisher may be
+    mid-publish into ``final`` (it always contains *some* directory between
+    its rename and the next), and rmtree-ing that directory in place would
+    delete a healthy, nearly-complete tree. The invalid content is renamed
+    to a unique quarantine name inside the base dir — same filesystem, so
+    the rename is atomic — and removed there. A rename failure because
+    ``final`` vanished or became valid meanwhile is re-validated and
+    tolerated; anything else propagates.
+    """
+    base = final.parent
+    quarantine = base / f".{digest}.quarantine-{os.getpid()}-{next(_quarantine_counter)}"
+    try:
+        os.rename(final, quarantine)
+    except FileNotFoundError:
+        return  # Another publisher removed it; nothing left to quarantine.
+    except OSError:
+        if final.is_dir() and _is_valid_store_dir(final, digest):
+            return  # Became valid concurrently — reuse it.
+        raise
+    shutil.rmtree(quarantine, ignore_errors=True)
+
+
+def _contained_target(staging_root: Path, logical_path: str) -> Path:
+    """Resolve ``staging_root / logical_path`` and refuse to leave the tree.
+
+    Defense in depth behind :class:`~conductor.bundle.model.BundleEntry`'s
+    validator: a manifest built by hand (``model_construct``) or produced by
+    a future schema change could carry a ``..`` or absolute logical path,
+    and a public store API must never write outside its own temp tree —
+    ``target.parent.mkdir`` for such a path would happily create directories
+    outside the staging dir before any write failed.
+    """
+    target = staging_root / logical_path
+    resolved = target.resolve(strict=False)
+    if resolved != staging_root and staging_root not in resolved.parents:
+        raise ValueError(
+            f"logical path {logical_path!r} resolves outside the staging tree ({resolved})"
+        )
+    return target
+
+
 def _stage_tree(
     staging: Path,
     manifest: BundleManifest,
@@ -159,13 +207,14 @@ def _stage_tree(
     entries_by_path: Mapping[str, BundleEntry],
 ) -> None:
     """Materialize the entry tree plus the in-archive manifest copy in staging."""
+    staging_root = staging.resolve()
     for logical_path, data in files.items():
         entry = entries_by_path.get(logical_path)
         if entry is None or entry.kind != "file":
             raise ValueError(
                 f"payload path {logical_path!r} is not a declared file entry of the bundle manifest"
             )
-        target = staging / logical_path
+        target = _contained_target(staging_root, logical_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
         os.chmod(target, 0o755 if entry.executable else 0o644)
@@ -175,7 +224,7 @@ def _stage_tree(
             raise ValueError(
                 f"link path {logical_path!r} is not a declared symlink entry of the bundle manifest"
             )
-        target = staging / logical_path
+        target = _contained_target(staging_root, logical_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         os.symlink(link_target, target)
     manifest_copy = staging / _STORE_MANIFEST_COPY

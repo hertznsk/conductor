@@ -117,6 +117,24 @@ class TestBuildSuccess:
         assert _bundle_digest(second.output) == _bundle_digest(first.output)
         assert "(reused)" in _flattened(second.output)
 
+    def test_rebuild_of_invalid_store_dir_does_not_report_reused(self, tmp_path: Path) -> None:
+        # Requirement: a store directory that exists but is invalid (its
+        # bundle.json unreadable) is rebuilt, and the report must NOT claim
+        # "(reused)" — the previous directory was discarded, not reused.
+        workflow = _write(tmp_path, "w.yaml", _SET_WORKFLOW)
+        first = runner.invoke(app, ["bundle", "build", str(workflow)])
+        assert first.exit_code == 0, first.output
+        store = _store_dir(_bundle_digest(first.output))
+        (store / "bundle.json").write_text("not json", encoding="utf-8")
+
+        second = runner.invoke(app, ["bundle", "build", str(workflow)])
+
+        assert second.exit_code == 0, second.output
+        assert _bundle_digest(second.output) == _bundle_digest(first.output)
+        assert "(reused)" not in _flattened(second.output)
+        parsed = json.loads((store / "bundle.json").read_text(encoding="utf-8"))
+        assert parsed["bundle_digest"] == _bundle_digest(second.output)
+
     def test_build_from_different_cwd_keeps_digest(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
