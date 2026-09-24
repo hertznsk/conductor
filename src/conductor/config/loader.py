@@ -37,6 +37,10 @@ class IncludedFile:
 
     Attributes:
         path: Resolved absolute path of the file that was read.
+        anchored_path: Absolute parent-anchored path before symlink resolution,
+            or ``None`` for records constructed by older integrations.
+            This preserves the authored filesystem route so bundle collection can
+            retain symlink components as well as the file reached through them.
         logical_ref: Raw reference string as written in the including YAML
             (before resolution against the including file's directory). For
             the root workflow file this is the path as passed to ``load()``.
@@ -57,6 +61,7 @@ class IncludedFile:
     parent: Path | None
     digest: str
     size: int
+    anchored_path: Path | None = None
 
 
 class IncludedFilesGraph:
@@ -224,7 +229,8 @@ def _create_file_tag_constructor_class() -> type[RoundTripConstructor]:
             cls = type(self)
 
             # Resolve path relative to the current base directory
-            file_path = (cls._base_dir / path_str).resolve()
+            anchored_path = Path(os.path.abspath(os.path.normpath(cls._base_dir / path_str)))
+            file_path = anchored_path.resolve()
             file_path_str = str(file_path)
 
             # Cycle detection (O(n) membership test, acceptable for small stacks)
@@ -258,6 +264,7 @@ def _create_file_tag_constructor_class() -> type[RoundTripConstructor]:
             cls._included_files.append(
                 IncludedFile(
                     path=file_path,
+                    anchored_path=anchored_path,
                     logical_ref=path_str,
                     tag=tag,
                     parent=parent,
@@ -387,7 +394,8 @@ class ConfigLoader:
 
         # Set !file resolution state before loading, resetting the per-load
         # include recorder at the same point _base_dir/_file_stack are set.
-        resolved = path.resolve()
+        anchored = Path(os.path.abspath(os.path.normpath(path)))
+        resolved = anchored.resolve()
         cls = self._constructor_cls
         cls._base_dir = resolved.parent
         cls._file_stack = [str(resolved)]
@@ -397,6 +405,7 @@ class ConfigLoader:
         cls._included_files.append(
             IncludedFile(
                 path=resolved,
+                anchored_path=anchored,
                 logical_ref=str(path),
                 tag="workflow",
                 parent=None,
@@ -434,7 +443,8 @@ class ConfigLoader:
         if state_needs_reset:
             self._constructor_cls._included_files = []
             if source_path is not None:
-                resolved = Path(source_path).resolve()
+                anchored = Path(os.path.abspath(os.path.normpath(source_path)))
+                resolved = anchored.resolve()
                 self._constructor_cls._base_dir = resolved.parent
                 self._constructor_cls._file_stack = [str(resolved)]
                 # Record the root workflow file first. The raw bytes are not
@@ -445,6 +455,7 @@ class ConfigLoader:
                 self._constructor_cls._included_files.append(
                     IncludedFile(
                         path=resolved,
+                        anchored_path=anchored,
                         logical_ref=str(source_path),
                         tag="workflow",
                         parent=None,

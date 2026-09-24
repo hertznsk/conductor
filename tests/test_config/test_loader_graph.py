@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import builtins
 import hashlib
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -104,6 +105,22 @@ class TestSingleFileInclude:
         assert include.digest != _sha256(b"Greeting: expanded-value\n")
         # The loaded content still has the variable expanded.
         assert "expanded-value" in config.agents[0].prompt
+
+    @pytest.mark.skipif(os.name == "nt", reason="Symlink semantics require POSIX privileges")
+    def test_symlink_include_preserves_anchored_and_resolved_paths(self, tmp_path: Path) -> None:
+        # Requirement: include provenance retains both the authored route and the read target.
+        real = tmp_path / "real"
+        real.mkdir()
+        prompt = real / "review.md"
+        prompt.write_text("review", encoding="utf-8")
+        (tmp_path / "prompts").symlink_to(real, target_is_directory=True)
+        workflow_path = _write_workflow(tmp_path)
+
+        _config, graph = load_config_with_graph(workflow_path)
+
+        include = graph.files[1]
+        assert include.anchored_path == tmp_path / "prompts" / "review.md"
+        assert include.path == prompt.resolve()
 
 
 class TestNestedYamlfileChain:
