@@ -1054,11 +1054,13 @@ If `CONDUCTOR_HOME` is set, the cache path defaults to `$CONDUCTOR_HOME/cache/bu
 
 ### Structure
 
-Each bundle is stored under its full content digest:
+Each bundle is stored under a filesystem-safe encoding of its full content
+digest. The manifest keeps `sha256:<hex>`, while the directory name replaces
+the colon with a hyphen for Windows compatibility:
 
 ```
 $CONDUCTOR_HOME/cache/bundles/
-  sha256:<hex>/
+  sha256-<hex>/
     bundle.json       # Manifest sentinel certifying the staged tree
     bundle.tar.gz     # Deterministic gzip archive of the bundle
     tree/             # Staged file hierarchy under normalized POSIX paths

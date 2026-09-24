@@ -1009,7 +1009,7 @@ When `--environment` is passed, `conductor validate` computes the workflow's com
 
 Build an immutable, content-addressed run bundle for a workflow.
 
-Collects the complete statically knowable file closure of the workflow, including external file references (`!file`, `!yamlfile`), Jinja2 template partials, local and registry sub-workflows, skills, plugins, and declared assets. Publishes the resulting tree and deterministic archive to the content-addressed store at `$CONDUCTOR_HOME/cache/bundles/<bundle_digest>/`.
+Collects the complete statically knowable file closure of the workflow, including external file references (`!file`, `!yamlfile`), Jinja2 template partials, local and registry sub-workflows, skills, plugins, and declared assets. Publishes the resulting tree and deterministic archive to the content-addressed store at `$CONDUCTOR_HOME/cache/bundles/sha256-<hex>/`. The report and manifest retain the canonical `sha256:<hex>` digest spelling; only the directory name uses a hyphen for Windows portability.
 
 ```bash
 conductor bundle build <workflow.yaml | registry-ref> [OPTIONS]
@@ -1047,7 +1047,7 @@ conductor bundle build 'qa-bot@official#v1.2.3'
 
 ### Store Layout
 
-Bundles are stored under `$CONDUCTOR_HOME/cache/bundles/<bundle_digest>/`:
+Bundles are stored under `$CONDUCTOR_HOME/cache/bundles/sha256-<hex>/`:
 
 * `bundle.json`: The serialized `BundleManifest` (readiness sentinel, written last).
 * `bundle.tar.gz`: The reproducible gzip archive containing all files and `.bundle/manifest.json`.

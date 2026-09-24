@@ -12,7 +12,9 @@ assets.
 
 The bundle packages all dependencies into a unified, relocatable POSIX `tree/`
 namespace stored in a content-addressed store (CAS) at
-`$CONDUCTOR_HOME/cache/bundles/<bundle_digest>/`.
+`$CONDUCTOR_HOME/cache/bundles/sha256-<hex>/`. Manifest metadata retains the
+canonical `sha256:<hex>` digest spelling; only the filesystem key uses a hyphen
+so it is portable to Windows.
 
 ## Motivation
 
@@ -124,8 +126,9 @@ to explicitly authorized filesystem roots.
 1. **Workflow Directory (Default):** The directory containing the root workflow
    file. Mapped to `tree/main/`.
 2. **Additional Roots:** Explicitly authorized directories declared in
-   `workflow.bundle.additional_roots`. Each root is assigned an index and mapped
-   to `tree/roots/<NN>-<basename>/`.
+   `workflow.bundle.additional_roots`. Each root is assigned a stable declaration
+   index and mapped to `tree/roots/<NN>/`; host paths and basenames never enter
+   digest-bearing metadata.
 3. **Pre-Authorized Caches:**
    * Registry cache: `$CONDUCTOR_HOME/cache/registries/` mapped to
      `tree/registry/<registry>/<sha12>/`.
@@ -150,7 +153,7 @@ tree/
     scripts/
       check.sh
   roots/
-    00-shared-lib/                    # Additional root 0
+    00/                               # Additional root 0
       helper.py
   registry/
     official/
@@ -176,8 +179,12 @@ A symlink's content is defined as its normalized link target string (`link_targe
 * `size` is always `0`.
 * `executable` is always `False`.
 * `digest` is the SHA-256 of the UTF-8 encoded target string.
-* Target paths must stay within the same authorized root. Escapes trigger
-  `BundleSymlinkEscapeError`.
+* Targets are collected recursively, including directory contents, so staged
+  links are never dangling and target bytes contribute to the bundle digest.
+* Link targets are rewritten relative to their logical bundle locations.
+* Target paths must stay within an authorized root. Escapes trigger
+  `BundleSymlinkEscapeError`, and recursive link cycles trigger
+  `BundleCycleError`.
 
 Conductor follows POSIX-first semantics. If a checkout materializes a symlink
 as a regular file (for example, on Windows without symlink privileges), it is
@@ -259,11 +266,11 @@ code.
 
 ## Storage and Operational Lifecycle
 
-Bundles are published to `$CONDUCTOR_HOME/cache/bundles/<bundle_digest>/`:
+Bundles are published to `$CONDUCTOR_HOME/cache/bundles/sha256-<hex>/`:
 
 ```
 ~/.conductor/cache/bundles/
-  sha256:3a1f4b.../
+  sha256-3a1f4b.../                   # Filesystem-safe form
     bundle.json                       # Manifest sentinel (written last)
     bundle.tar.gz                     # Deterministic archive
     tree/                             # Staged file hierarchy
@@ -274,7 +281,8 @@ Bundles are published to `$CONDUCTOR_HOME/cache/bundles/<bundle_digest>/`:
 1. Files are collected in memory and validated.
 2. The entry hierarchy is staged in a temporary directory.
 3. `bundle.tar.gz` is generated deterministically.
-4. The temporary directory is renamed atomically into the final digest path.
+4. Under a per-digest cross-process lock, the temporary directory is renamed
+   atomically into the final filesystem-safe digest path.
 5. `bundle.json` is written last as the readiness sentinel.
 
 If the target directory already exists and contains a valid `bundle.json`,
