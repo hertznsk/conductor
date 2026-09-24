@@ -1,0 +1,224 @@
+"""Content-addressed store for run bundles.
+
+A published bundle lives at ``<base>/<bundle_digest>/`` where
+``<base>`` is ``$CONDUCTOR_HOME/cache/bundles/`` (or the ``~/.conductor``
+fallback) and ``<bundle_digest>`` is the full ``sha256:<hex>`` content
+digest from :class:`~conductor.bundle.model.BundleManifest`. The directory
+holds:
+
+* the staged entry tree at each entry's full store-relative
+  ``logical_path`` (which already carries the ``tree/main/`` prefix — no
+  additional prefix is added at write time),
+* ``bundle.tar.gz`` — the deterministic archive of the entry tree plus a
+  ``.bundle/manifest.json`` copy of the manifest,
+* ``bundle.json`` — the serialized manifest, written **last** as the
+  readiness sentinel: a reader that sees this file can trust the whole
+  directory (mirroring the plugin-fetch sentinel convention).
+
+Publishing is idempotent and self-healing. If the final directory already
+exists it is reused when valid — ``bundle.json`` parses and its
+``bundle_digest`` equals the directory name (a parse-only check, no full
+re-hash, per the ``plugins.fetch.is_cached`` precedent). An invalid
+directory (unparseable or digest-mismatched ``bundle.json``) is reported
+through the warning sink, removed, and rebuilt. Concurrent publishers of
+the same digest race on an atomic rename; the loser validates and returns
+the winner's directory instead of overwriting it.
+
+The ephemeral :class:`~conductor.bundle.model.BundleDescriptor` is
+deliberately **not** stored and not an input here (Oracle R1-O1):
+``publish_bundle`` takes only the content manifest plus the entry payloads,
+so provenance never leaks into the content-addressed store.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import errno
+import json
+import logging
+import os
+import re
+import shutil
+import sys
+import tempfile
+from collections.abc import Callable, Mapping
+from pathlib import Path
+
+from conductor.bundle.archive import write_bundle_archive
+from conductor.bundle.model import BundleEntry, BundleManifest, serialize_manifest
+
+logger = logging.getLogger(__name__)
+
+_BUNDLE_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+"""The store key is the full content digest — the CAS contract."""
+
+_ARCHIVE_NAME = "bundle.tar.gz"
+_STORE_MANIFEST_COPY = Path(".bundle") / "manifest.json"
+"""In-archive (and staged) copy of the manifest, byte-identical to ``bundle.json``."""
+
+_SENTINEL_NAME = "bundle.json"
+"""Readiness sentinel — written last, so its presence certifies the tree."""
+
+_LOST_RACE_ERRNOS = (errno.ENOTEMPTY, errno.EEXIST)
+
+
+def bundle_store_base() -> Path:
+    """Return the base directory bundle trees are stored under.
+
+    Uses ``$CONDUCTOR_HOME/cache/bundles/`` or ``~/.conductor/cache/bundles/``,
+    following the ``plugins.fetch.get_plugin_cache_base`` idiom deliberately
+    inline (not extracted into a shared helper — two callsites stay two).
+    """
+    home = os.environ.get("CONDUCTOR_HOME")
+    base = Path(home) if home else Path.home() / ".conductor"
+    return base / "cache" / "bundles"
+
+
+def publish_bundle(
+    manifest: BundleManifest,
+    files: Mapping[str, bytes],
+    links: Mapping[str, str],
+    *,
+    on_warning: Callable[[str], None] | None = None,
+) -> Path:
+    """Publish a bundle into the store and return its final directory.
+
+    The directory is named after ``manifest.bundle_digest`` and is
+    considered complete once ``bundle.json`` exists — it is always written
+    last, after the entry tree, the archive, and the staged
+    ``.bundle/manifest.json`` copy inside it.
+
+    Args:
+        manifest: The content manifest. Its ``bundle_digest`` names the
+            store directory; its entries provide the executable-bit flags
+            (a payload path missing from the manifest, or of the wrong
+            ``kind``, is a caller bug and raises ``ValueError``).
+        files: Entry payloads by full store-relative ``logical_path``
+            (already carrying the ``tree/main/`` prefix). Written with mode
+            ``0o755`` when the manifest entry is executable, else ``0o644``.
+        links: Symlink entries by ``logical_path`` → normalized link
+            target, materialized with POSIX-first ``os.symlink`` semantics
+            (no fallback: on platforms where a checkout materialized a
+            symlink as a regular file, it arrives here as a file).
+        on_warning: Optional sink for non-fatal diagnostics (an invalid
+            pre-existing directory being rebuilt). Defaults to the module
+            logger's ``warning``.
+
+    Returns:
+        The final store directory — either the pre-existing valid one or
+        the freshly published one.
+
+    Raises:
+        ValueError: If ``manifest.bundle_digest`` is not a full
+            ``sha256:<64 hex>`` digest, or a payload path is not declared
+            in the manifest with the matching kind.
+    """
+    digest = manifest.bundle_digest
+    if not _BUNDLE_DIGEST_RE.fullmatch(digest):
+        raise ValueError(f"bundle_digest must be a full 'sha256:<64 hex>' digest, got {digest!r}")
+    warn = on_warning if on_warning is not None else logger.warning
+
+    base = bundle_store_base()
+    base.mkdir(parents=True, exist_ok=True)
+    final = base / digest
+
+    if final.is_dir():
+        if _is_valid_store_dir(final, digest):
+            return final
+        warn(
+            f"Invalid bundle store directory {final} (unparseable or digest-mismatched "
+            f"bundle.json); removing and rebuilding."
+        )
+        shutil.rmtree(final, ignore_errors=True)
+
+    entries_by_path = {entry.logical_path: entry for entry in manifest.entries}
+    staging = Path(tempfile.mkdtemp(dir=base))
+    # The archive is written next to the staging dir, never inside it: the
+    # archive walk must not see the archive being written.
+    archive_tmp = base / f".{staging.name}.tar.gz"
+    try:
+        _stage_tree(staging, manifest, files, links, entries_by_path)
+        write_bundle_archive(staging, archive_tmp)
+        os.replace(archive_tmp, staging / _ARCHIVE_NAME)
+        # Sentinel last: only a directory whose bundle.json parses with the
+        # directory-name digest is ever handed to a caller.
+        (staging / _SENTINEL_NAME).write_text(serialize_manifest(manifest), encoding="utf-8")
+        _publish(staging, final, digest)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+        with contextlib.suppress(OSError):
+            archive_tmp.unlink()
+    return final
+
+
+def _stage_tree(
+    staging: Path,
+    manifest: BundleManifest,
+    files: Mapping[str, bytes],
+    links: Mapping[str, str],
+    entries_by_path: Mapping[str, BundleEntry],
+) -> None:
+    """Materialize the entry tree plus the in-archive manifest copy in staging."""
+    for logical_path, data in files.items():
+        entry = entries_by_path.get(logical_path)
+        if entry is None or entry.kind != "file":
+            raise ValueError(
+                f"payload path {logical_path!r} is not a declared file entry of the bundle manifest"
+            )
+        target = staging / logical_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        os.chmod(target, 0o755 if entry.executable else 0o644)
+    for logical_path, link_target in links.items():
+        entry = entries_by_path.get(logical_path)
+        if entry is None or entry.kind != "symlink":
+            raise ValueError(
+                f"link path {logical_path!r} is not a declared symlink entry of the bundle manifest"
+            )
+        target = staging / logical_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(link_target, target)
+    manifest_copy = staging / _STORE_MANIFEST_COPY
+    manifest_copy.parent.mkdir(parents=True, exist_ok=True)
+    # Byte-identical to the bundle.json sentinel written after the archive,
+    # so the archived .bundle/manifest.json matches the stored manifest.
+    manifest_copy.write_text(serialize_manifest(manifest), encoding="utf-8")
+
+
+def _is_valid_store_dir(final: Path, digest: str) -> bool:
+    """Whether an existing store directory is complete and content-matching.
+
+    Parse-only check, deliberately without a full re-hash of the tree (the
+    ``plugins.fetch.is_cached`` precedent): the directory name *is* the
+    content digest, so validating ``bundle.json``'s digest field against it
+    is sufficient. Anything unreadable or unparseable reads as invalid.
+    """
+    try:
+        payload = json.loads((final / _SENTINEL_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(payload, dict) and payload.get("bundle_digest") == digest
+
+
+def _publish(staging: Path, final: Path, digest: str) -> None:
+    """Move the completed staging tree into place, tolerating a lost race.
+
+    Two publishers of the same digest may finish staging concurrently. The
+    loser discards its copy rather than overwriting: the digest names the
+    content, so the winner's tree is already the right one — provided it
+    validates, which is checked here (the sentinel was written before the
+    rename, so a present ``final`` directory is expected to be complete).
+    Only the lost-race errnos are swallowed; EACCES/ENOSPC propagate, since
+    those must not be reported as a successful publish. On Windows,
+    replacing an existing directory raises WinError 5 (surfaced as EACCES)
+    rather than ENOTEMPTY, so it is named explicitly.
+    """
+    try:
+        os.replace(staging, final)
+    except OSError as exc:
+        lost_race = exc.errno in _LOST_RACE_ERRNOS or (
+            sys.platform == "win32" and getattr(exc, "winerror", None) == 5
+        )
+        if lost_race and final.is_dir() and _is_valid_store_dir(final, digest):
+            return
+        raise
