@@ -32,7 +32,7 @@ def _stage_tree(tmp_path: Path, *, with_symlink: bool = True) -> Path:
     plain.write_bytes(b"plain\n")
     os.chmod(plain, 0o644)
     (tree / ".bundle").mkdir()
-    (tree / ".bundle/manifest.json").write_text('{"version": 1}\n', encoding="utf-8")
+    (tree / ".bundle/manifest.json").write_bytes(b'{"version": 1}\n')
     if with_symlink and _POSIX:
         os.symlink("plain.txt", tree / "tree/main/link.txt")
     return tree
