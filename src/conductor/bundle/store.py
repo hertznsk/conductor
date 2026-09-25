@@ -44,7 +44,6 @@ import time
 from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
-from typing import IO
 
 from conductor.bundle.archive import write_bundle_archive
 from conductor.bundle.model import BundleEntry, BundleManifest, serialize_manifest
@@ -180,53 +179,41 @@ def publish_bundle(
 
 
 @contextmanager
-def _digest_lock(path: Path) -> Generator[None, None, None]:
+def _digest_lock(path: Path) -> Generator[None]:
     """Hold an exclusive cross-process lock for one bundle digest."""
-    with path.open("a+b") as lock_file:
-        _lock_file(lock_file)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR)
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            with contextlib.suppress(OSError):
+                os.write(fd, b"\0")
+            while True:
+                try:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX)
         try:
             yield
         finally:
-            _unlock_file(lock_file)
+            if sys.platform == "win32":
+                import msvcrt
 
+                os.lseek(fd, 0, os.SEEK_SET)
+                with contextlib.suppress(OSError):
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
 
-def _lock_file(lock_file: IO[bytes]) -> None:
-    """Acquire a blocking one-byte lock using the host platform API."""
-    if sys.platform == "win32":
-        import msvcrt
-
-        _ = lock_file.seek(0)
-        if lock_file.read(1) == b"":
-            _ = lock_file.write(b"\0")
-            lock_file.flush()
-        _ = lock_file.seek(0)
-        while True:
-            try:
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
-                break
-            except OSError as exc:
-                if exc.errno not in (errno.EACCES, errno.EDEADLK):
-                    raise
-                time.sleep(0.05)
-        return
-
-    import fcntl
-
-    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-
-
-def _unlock_file(lock_file: IO[bytes]) -> None:
-    """Release a lock acquired by :func:`_lock_file`."""
-    if sys.platform == "win32":
-        import msvcrt
-
-        _ = lock_file.seek(0)
-        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
-        return
-
-    import fcntl
-
-    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def _quarantine_and_remove(final: Path, key: str, digest: str) -> None:
