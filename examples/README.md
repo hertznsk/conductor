@@ -131,6 +131,24 @@ conductor validate examples/run-bundle.yaml --environment demo
 conductor run examples/run-bundle.yaml --environment demo
 ```
 
+## Secret Bindings
+
+### secret-bindings.yaml
+
+Demonstrates declarative secret bindings delivered to a script step. Demonstrates:
+- Requesting a logical secret reference on a step via `execution.secrets`
+- Mapping the logical secret to a host environment variable in an execution environment document (`examples/.conductor/environments/secrets-demo.yaml`)
+- Delivering the secret into the subprocess environment safely
+- Verifying secret delivery in a provider-free script step without exposing the secret value
+
+```bash
+# Validate against the secrets-demo environment
+conductor validate examples/secret-bindings.yaml --environment secrets-demo
+
+# Run with the secrets-demo environment (requires DEMO_SECRET)
+DEMO_SECRET="my-secret-token" conductor run examples/secret-bindings.yaml --environment secrets-demo
+```
+
 ## Human-in-the-Loop Examples
 
 ### design-review.yaml

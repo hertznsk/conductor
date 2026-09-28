@@ -989,6 +989,16 @@ When validating workflow profile references, Conductor applies a three-level che
 | **Bare validate** (`conductor validate workflow.yaml`) | One or more present | Discovers available environment documents (`.conductor/environments/` project walk and user level).<br>• If refs resolve in all discovered environments: silence.<br>• If refs resolve in some but not all: warning naming environments where the profile is missing.<br>• If refs do not resolve in any discovered environment: validation error.<br>• If no environments are found: warning to run `conductor validate --environment <name>` for the full cross-check.<br>• If a discovered file is malformed: warning naming the file and treating it as not resolving. |
 | **Explicit validate** (`conductor validate workflow.yaml --environment <name\|PATH>`) | Any | Skips ambient discovery. Loads the specified environment document (fatal error if unreadable or invalid), compiles the full run manifest, and prints the **Execution Resolution** report (environment name, source, path, default profile, step-to-profile-to-backend table, and audit classification). |
 
+### Secret Reference Validation Levels
+
+When validating workflow secret references (`execution.secrets` or MCP server `secrets`), Conductor applies a similar multi-level check:
+
+| Mode | Workflow Secret Refs | Behavior |
+|------|----------------------|----------|
+| **Bare validate** (`conductor validate workflow.yaml`) | None present | **Lazy gate:** No environment discovery or secret validation is performed. Validation proceeds silently. |
+| **Bare validate** (`conductor validate workflow.yaml`) | One or more present | Performs structural checks (scope placement, delivery transport, delivery name collisions). Discovers available environment documents.<br>• If refs resolve in all discovered environments: silence.<br>• If refs resolve in some but not all: warning naming environments where the secret is missing.<br>• If refs do not resolve in any discovered environment: validation error.<br>• If no authored environments are found: warning to run `conductor validate --environment <name>`. (The built-in `local/default` environment never counts as authored). |
+| **Explicit validate** (`conductor validate workflow.yaml --environment <name\|PATH>`) | Any | Loads the specified environment document, compiles the full run manifest with secret uses, validates `allow` policies against consumers (errors if consumer scope is not permitted), and warns if any declared source variable is unset on the local machine. When secret references are present, prints the **Secret Bindings** report (bindings table with names, source kinds, allow lists, and consumers table with consumer step, ref, scope, and delivery). |
+
 ### Validation Checks
 
 **Errors** (validation fails):
@@ -1002,9 +1012,15 @@ When validating workflow profile references, Conductor applies a three-level che
 - **Stale agent references in templates** — `{{ old_agent.output.field }}` where `old_agent` doesn't exist
 - **Missing workflow input references** — `{{ workflow.input.x }}` where `x` isn't declared in `input:`
 - Stale references checked across `prompt`, `system_prompt`, `command`, `args`, `working_dir`, `input_mapping`, parallel-group inputs, and workflow `output:` templates
+- **Invalid secret scopes or positions** — using `scope: agent` (reserved), using non-script scope on script steps, or non-MCP scope on MCP servers
+- **Invalid secret delivery transports** — header delivery on script steps or stdio MCP servers
+- **Secret delivery name collisions** — colliding literal and secret environment variables or HTTP headers within the same consumer
+- **Secret allow list violations** — consumer scope disallowed by the binding's `allow` policy under `--environment`
 
 **Warnings** (validation passes with notes):
 - **Undeclared dependencies in explicit mode** — agent prompt references `{{ a.output.val }}` but doesn't declare `a.output` in its `input:` list
+- **Unset secret sources** — secret binding source environment variable is unset on the current validation machine when running with `--environment`
+- **Ambiguous or missing ambient secret bindings** — secret references not present in all discovered environment documents during bare validation
 
 ### Bundle Closure Report
 

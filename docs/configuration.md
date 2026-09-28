@@ -945,14 +945,60 @@ default: shell
 profiles:
   shell:
     backend: local
+    inherit_control_environment: true
   isolated:
     backend: local
+    inherit_control_environment: false
+
+# Optional: secret bindings mapping logical names to credential sources
+secrets:
+  api_token:
+    source:
+      env: PROD_API_TOKEN
+    allow: [script, mcp]
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `default` | string (optional) | Profile assigned to executable steps without an explicit `execution.profile`. When set, it must match one of the keys in `profiles`. |
-| `profiles` | mapping (required) | Non-empty dictionary of profile names. Each profile specifies a `backend` name from available runners (such as `local`). |
+| `profiles` | mapping (required) | Non-empty dictionary of profile names. Each profile specifies a `backend` name from available runners (such as `local`) and an optional `inherit_control_environment` flag. |
+| `secrets` | mapping (optional) | Dictionary of logical secret names mapped to source definitions and consumer access rules. |
+
+#### Profile Settings
+
+Each profile under `profiles` supports:
+
+- `backend` (required): The runner backend implementing this profile (for example, `local`).
+- `inherit_control_environment` (optional, boolean): Controls whether subprocesses executed under this profile inherit the host process environment. When omitted (`None`), the backend decides the default. The local subprocess runner defaults to effective `true`, while future remote runner backends default to effective `false`.
+
+#### Secret Bindings
+
+The `secrets` section maps logical secret names to concrete credential sources:
+
+```yaml
+secrets:
+  api_token:
+    source:
+      env: PRODUCTION_API_KEY
+    allow: [script, mcp]
+
+  database_url:
+    source:
+      env: DB_CONNECTION_STRING
+    # allow omitted: permitted for all consumer classes
+
+  revoked_key:
+    source:
+      env: STALE_KEY
+    allow: [] # fail-closed: permitted for no consumer classes
+```
+
+- **Name**: The dictionary key is the logical secret identifier matching `[A-Za-z0-9_.-]+`.
+- **Source (`source`)**: Defines where the secret value is read from. In v1, `source.env` is the supported source kind, pointing to a host environment variable name (`[A-Za-z_][A-Za-z0-9_]*`).
+- **Access Policy (`allow`)**: Restricts which workflow consumer classes can resolve the secret:
+  - `None` (omitted): Allowed for all consumer classes (`script`, `mcp`).
+  - `[]` (empty list): Explicitly fail-closed. Denied for all consumers.
+  - `["script"]` / `["mcp"]`: Restricted to the specified consumer classes. Validation fails if an unlisted consumer attempts to reference the secret.
 
 ### Plain YAML Loading (No Variable Expansion)
 

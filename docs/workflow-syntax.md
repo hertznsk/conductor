@@ -14,6 +14,7 @@ This document provides a comprehensive reference for the Conductor workflow YAML
 - [Skills](#skills)
 - [Plugins](#plugins)
 - [Execution Profiles](#execution-profiles)
+- [Secret Bindings](#secret-bindings)
 - [Context Compaction](#context-compaction)
 - [External File References](#external-file-references)
 - [Run Bundles](#run-bundles)
@@ -3081,6 +3082,127 @@ Engine-local step types do not execute on a runner backend. They reject the `exe
 ### Execution Environment Documents
 
 Execution profiles are resolved against environment documents defined in project or user configuration. See [Execution Environments](configuration.md#execution-environments) for details on document format, discovery rules, and resolution precedence.
+
+## Secret Bindings
+
+Secret bindings provide a secure, declarative way for workflow steps and MCP servers to request credentials without hardcoding secrets or relying on ambient environment variables.
+
+Workflows declare logical secret references at the step or server level. An execution environment document (see [Execution Environments](configuration.md#execution-environments)) binds those logical names to credential sources and enforces consumer access rules.
+
+### Use-Sites
+
+#### 1. Executable Step Secrets (`execution.secrets`)
+
+Script steps declare secret references in the `execution.secrets` list:
+
+```yaml
+agents:
+  - name: deploy_package
+    type: script
+    execution:
+      profile: shell
+      secrets:
+        - ref: deploy_token
+          scope: script
+          delivery:
+            env: DEPLOY_API_TOKEN
+    command: python
+    args: ["scripts/deploy.py"]
+    routes:
+      - to: $end
+```
+
+#### 2. MCP Server Secrets (`runtime.mcp_servers.<name>.secrets`)
+
+Workflow-declared MCP servers configure secrets under `secrets`:
+
+```yaml
+workflow:
+  name: mcp-workflow
+  entry_point: run_query
+  runtime:
+    mcp_servers:
+      remote_api:
+        type: http
+        url: https://api.example.com/mcp
+        secrets:
+          - ref: service_token
+            scope: mcp
+            delivery:
+              header: Authorization
+```
+
+### Secret Reference Fields
+
+Each secret reference in `secrets:` contains:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ref` | string (required) | Logical secret name matching `[A-Za-z0-9_.-]+`. Must match a binding in the resolved environment document. |
+| `scope` | string (required) | Target consumer scope: `script` or `mcp`. `agent` is reserved for future releases. |
+| `delivery` | object (required) | Delivery mechanism. Exactly one of `env` or `header` must be set. |
+
+### Delivery Targets (`delivery`)
+
+- **`env`**: Injects the secret value into an environment variable for the script subprocess or MCP server. Supported on `script` steps and all MCP server transports (`stdio`, `http`, `sse`). Must be a valid shell identifier (`[A-Za-z_][A-Za-z0-9_]*`).
+- **`header`**: Injects the secret value as an HTTP request header. Supported on HTTP and SSE MCP servers. Header names must follow RFC 9110 token rules (`[!#$%&'*+\-.^_`|~0-9A-Za-z]+`). Header delivery is rejected on script steps and stdio MCP servers.
+
+### Scope and Validation Rules
+
+1. **Scope Requirements**:
+   - `scope: script` is required for script steps.
+   - `scope: mcp` is required for MCP servers.
+   - `scope: agent` is reserved for future agent execution realms (architecture step 7). Using `agent` scope raises a validation error.
+2. **Delivery Collisions**:
+   - Literal `env` and secret `env` delivery names within the same consumer must be unique.
+   - Literal `headers` and secret `header` delivery names within the same consumer must be unique (case-insensitive).
+3. **Redaction**:
+   - Registered secret values are automatically sanitized across event streams, checkpoints, terminal records, and CLI output displays.
+
+### End-to-End Example
+
+Given an environment document `.conductor/environments/prod.yaml`:
+
+```yaml
+default: shell
+profiles:
+  shell:
+    backend: local
+
+secrets:
+  service_key:
+    source:
+      env: PROD_SERVICE_KEY
+    allow: [script]
+```
+
+A workflow file consuming the secret:
+
+```yaml
+workflow:
+  name: secrets-demo
+  entry_point: query_service
+
+agents:
+  - name: query_service
+    type: script
+    execution:
+      secrets:
+        - ref: service_key
+          scope: script
+          delivery:
+            env: API_KEY
+    command: python
+    args: ["-c", "import os; print('Key present:', bool(os.environ.get('API_KEY')) )"]
+    routes:
+      - to: $end
+```
+
+Run with:
+
+```bash
+PROD_SERVICE_KEY=secret-value conductor run workflow.yaml --environment prod
+```
 
 ## External File References
 
