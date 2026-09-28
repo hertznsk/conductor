@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -29,7 +30,7 @@ from conductor.config.schema import (
 from conductor.engine.checkpoint import CheckpointManager
 from conductor.engine.secrets import SecretValueCache
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
-from conductor.exceptions import ConfigurationError
+from conductor.exceptions import ConfigurationError, WorkflowTerminated
 from conductor.redaction import REDACTED_MARKER, RunRedactor
 
 _CLI_TOKEN_VAR = "CONDUCTOR_TEST_TASK7_CLI_TOKEN"
@@ -416,3 +417,405 @@ async def test_build_mcp_servers_secrets_defaults_to_legacy() -> None:
 
     assert legacy is not None
     assert legacy == with_none
+
+
+def _wire_registry_with_engine(
+    mock_registry_cls: MagicMock,
+    mock_engine_cls: MagicMock,
+    engine: MagicMock,
+) -> None:
+    """Wire the standard async registry mock around a pre-built engine mock.
+
+    Unlike ``_mock_registry_and_engine`` this leaves the engine's own method
+    mocks (``run`` / ``resume`` side effects) untouched.
+    """
+    mock_registry = AsyncMock()
+    mock_registry_cls.return_value = mock_registry
+    mock_registry.__aenter__ = AsyncMock(return_value=mock_registry)
+    mock_registry.__aexit__ = AsyncMock(return_value=False)
+    mock_engine_cls.return_value = engine
+
+
+class TestFinalStdoutSink:
+    """Sinks II: the final stdout boundary scrubs a copy."""
+
+    @pytest.mark.asyncio
+    async def test_final_stdout_output_is_scrubbed_copy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Requirement: run_workflow_async returns the final output as a
+        # scrubbed COPY — every print site in cli/app.py (normal and --silent
+        # paths alike) reads post-redactor values — while the engine-produced
+        # dict itself is never mutated.
+        secret = "final-secret-value-1"
+        monkeypatch.setenv(_CLI_TOKEN_VAR, secret)
+        wf_path = _write_workflow(tmp_path)
+        _write_environment(tmp_path)
+        engine_raw = {"result": f"prefix-{secret}-suffix"}
+
+        from conductor.cli.run import run_workflow_async
+
+        with (
+            patch("conductor.cli.run.ProviderRegistry") as mock_registry_cls,
+            patch("conductor.cli.run.WorkflowEngine") as mock_engine_cls,
+        ):
+            engine = MagicMock()
+            engine.run = AsyncMock(return_value=engine_raw)
+            engine.config.workflow.cost.show_summary = False
+            _wire_registry_with_engine(mock_registry_cls, mock_engine_cls, engine)
+            result = await run_workflow_async(wf_path, {}, environment="demo")
+
+        rendered = json.dumps(result)
+        assert secret not in rendered
+        assert REDACTED_MARKER in rendered
+        assert result is not engine_raw
+        assert engine_raw == {"result": f"prefix-{secret}-suffix"}
+
+    @pytest.mark.asyncio
+    async def test_terminated_reraise_scrubs_rendered_fields(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Requirement: a caught WorkflowTerminated is re-created with scrubbed
+        # message/output/reason/suggestion — all Jinja-rendered from context
+        # and able to carry a declared value — while terminated_by (a step
+        # name, never rendered) is preserved verbatim and the original
+        # exception object is not mutated.
+        secret = "terminate-secret-2"
+        monkeypatch.setenv(_CLI_TOKEN_VAR, secret)
+        wf_path = _write_workflow(tmp_path)
+        _write_environment(tmp_path)
+        original = WorkflowTerminated(
+            f"boom {secret}",
+            output={"detail": f"out-{secret}"},
+            reason=f"because {secret}",
+            terminated_by="stop_here",
+            suggestion=f"rotate {secret}",
+        )
+
+        from conductor.cli.run import run_workflow_async
+
+        with (
+            patch("conductor.cli.run.ProviderRegistry") as mock_registry_cls,
+            patch("conductor.cli.run.WorkflowEngine") as mock_engine_cls,
+        ):
+            engine = MagicMock()
+            engine.run = AsyncMock(side_effect=original)
+            engine.config.workflow.cost.show_summary = False
+            _wire_registry_with_engine(mock_registry_cls, mock_engine_cls, engine)
+            with pytest.raises(WorkflowTerminated) as exc_info:
+                await run_workflow_async(wf_path, {}, environment="demo")
+
+        raised = exc_info.value
+        assert raised is not original
+        assert raised.terminated_by == "stop_here"
+        for rendered in (str(raised), raised.args[0], raised.reason):
+            assert secret not in rendered
+            assert REDACTED_MARKER in rendered
+        assert raised.suggestion is not None
+        assert secret not in raised.suggestion
+        assert REDACTED_MARKER in raised.suggestion
+        raised_output = json.dumps(raised.output)
+        assert secret not in raised_output
+        assert REDACTED_MARKER in raised_output
+        # The original exception keeps its raw rendered fields.
+        assert original.args[0] == f"boom {secret}"
+        assert original.reason == f"because {secret}"
+        assert original.suggestion == f"rotate {secret}"
+        assert original.output == {"detail": f"out-{secret}"}
+
+
+class TestTerminalRecordTelemetrySink:
+    """Sinks II: terminal record + telemetry close get copies."""
+
+    @pytest.mark.asyncio
+    async def test_terminal_record_and_telemetry_close_receive_scrubbed_copies(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Requirement: the terminal run record (output + error type/message)
+        # and the telemetry close arguments (telemetry_closed is written
+        # outside the emitter, telemetry/subscriber.py) receive scrubbed
+        # copies — scrubbed while the CLI-owned redactor is still alive —
+        # without mutating the engine-produced terminal values.
+        secret = "terminal-secret-3"
+        monkeypatch.setenv(_CLI_TOKEN_VAR, secret)
+        wf_path = _write_workflow(tmp_path)
+        _write_environment(tmp_path)
+        original = WorkflowTerminated(
+            f"reason {secret}",
+            output={"detail": secret},
+            reason=f"reason {secret}",
+            terminated_by="stop_here",
+        )
+
+        from conductor.cli.run import run_workflow_async
+
+        with (
+            patch("conductor.cli.run.ProviderRegistry") as mock_registry_cls,
+            patch("conductor.cli.run.WorkflowEngine") as mock_engine_cls,
+            patch("conductor.cli.run._write_terminal_record_for_current_process") as mock_record,
+            patch("conductor.telemetry.subscriber.TelemetrySubscriber") as mock_telemetry_cls,
+        ):
+            engine = MagicMock()
+            engine.run = AsyncMock(side_effect=original)
+            engine.config.workflow.cost.show_summary = False
+            _wire_registry_with_engine(mock_registry_cls, mock_engine_cls, engine)
+            with pytest.raises(WorkflowTerminated):
+                await run_workflow_async(wf_path, {}, environment="demo")
+
+        record_kwargs = mock_record.call_args.kwargs
+        record_output = json.dumps(record_kwargs["output"])
+        assert secret not in record_output
+        assert REDACTED_MARKER in record_output
+        assert record_kwargs["error_type"] == "WorkflowTerminated"
+        assert record_kwargs["error_message"] is not None
+        assert secret not in record_kwargs["error_message"]
+        assert REDACTED_MARKER in record_kwargs["error_message"]
+
+        close_kwargs = mock_telemetry_cls.return_value.close.call_args.kwargs
+        assert close_kwargs["error_type"] == "WorkflowTerminated"
+        assert close_kwargs["error_message"] is not None
+        assert secret not in close_kwargs["error_message"]
+        assert REDACTED_MARKER in close_kwargs["error_message"]
+
+        # The engine-produced values behind both sinks are untouched.
+        assert original.output == {"detail": secret}
+        assert original.reason == f"reason {secret}"
+
+
+class TestDashboardReplaySink:
+    """Sinks II: replay seeding scrubs dashboard history."""
+
+    def test_replay_events_from_jsonl_scrubs_history_payloads(self, tmp_path: Path) -> None:
+        # Requirement: payloads replayed from the prior run's JSONL log land
+        # in dashboard history scrubbed of declared values; the on-disk log
+        # is not rewritten (historical pre-upgrade logs stay as they are).
+        from conductor.web.server import WebDashboard
+
+        dashboard = WebDashboard(WorkflowEventEmitter(), host="127.0.0.1", port=0)
+        secret = "replay-secret-4"
+        redactor = RunRedactor()
+        redactor.register([secret])
+        dashboard.set_redactor(redactor)
+        log = tmp_path / "prior.events.jsonl"
+        log.write_text(
+            json.dumps(
+                {
+                    "type": "agent_completed",
+                    "timestamp": 1.0,
+                    "data": {"output": f"token {secret}"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        before = log.read_bytes()
+
+        count = dashboard.replay_events_from_jsonl(log)
+
+        assert count == 1
+        history = json.dumps(dashboard._event_history)  # noqa: SLF001
+        assert secret not in history
+        assert REDACTED_MARKER in history
+        assert log.read_bytes() == before
+
+    def test_replay_synthetic_from_context_scrubs_agent_outputs(self) -> None:
+        # Requirement: synthetic *_started/*_completed pairs carry
+        # agent_outputs from the checkpoint context — a declared value in an
+        # output is scrubbed before the history-append, and the context's
+        # outputs are not mutated.
+        from conductor.web.server import WebDashboard
+
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="synth", entry_point="mark"),
+            agents=[SetStepDef(name="mark", value="'ok'", routes=[RouteDef(to="$end")])],
+        )
+        dashboard = WebDashboard(WorkflowEventEmitter(), host="127.0.0.1", port=0)
+        secret = "synthetic-secret-5"
+        redactor = RunRedactor()
+        redactor.register([secret])
+        dashboard.set_redactor(redactor)
+        agent_outputs = {"mark": {"result": secret}}
+        context = SimpleNamespace(execution_history=["mark"], agent_outputs=agent_outputs)
+
+        count = dashboard.replay_synthetic_from_context(context, config)
+
+        assert count == 2
+        history = json.dumps(dashboard._event_history)  # noqa: SLF001
+        assert secret not in history
+        assert REDACTED_MARKER in history
+        assert agent_outputs == {"mark": {"result": secret}}
+
+    def test_inactive_redactor_replays_payloads_verbatim(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Requirement: with an inactive redactor (or none attached) replay
+        # appends payloads byte-identically — a spy on RunRedactor.scrub
+        # proves zero copies were made.
+        from conductor.web.server import WebDashboard
+
+        scrub_calls: list[Any] = []
+        real_scrub = RunRedactor.scrub
+
+        def spy_scrub(self: RunRedactor, obj: Any) -> Any:
+            result = real_scrub(self, obj)
+            scrub_calls.append((obj, result))
+            return result
+
+        monkeypatch.setattr(RunRedactor, "scrub", spy_scrub)
+
+        payload = {
+            "type": "agent_completed",
+            "timestamp": 1.0,
+            "data": {"output": "token plain"},
+        }
+        log = tmp_path / "prior.events.jsonl"
+        log.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+        for redactor in (None, RunRedactor()):
+            scrub_calls.clear()
+            dashboard = WebDashboard(WorkflowEventEmitter(), host="127.0.0.1", port=0)
+            dashboard.set_redactor(redactor)
+
+            count = dashboard.replay_events_from_jsonl(log)
+
+            assert count == 1
+            assert scrub_calls == []
+            assert dashboard._event_history == [payload]  # noqa: SLF001
+
+
+class TestResumeSeedingSink:
+    """Sinks II: the resume-generation workflow_started scrub."""
+
+    @pytest.mark.asyncio
+    async def test_resume_direct_workflow_started_write_is_scrubbed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Requirement: the resume-generation workflow_started is prepended to
+        # dashboard history and written directly to the JSONL log AND the
+        # telemetry subscriber — all three bypass the emitter, so the payload
+        # is scrubbed once up front; the dict the engine built is not mutated.
+        secret = "resume-seed-secret-6"
+        monkeypatch.setenv(_CLI_TOKEN_VAR, secret)
+        wf_path = _write_workflow(tmp_path)
+        _write_environment(tmp_path)
+        prior_log = tmp_path / "prior.events.jsonl"
+        prior_log.write_text("", encoding="utf-8")
+        cp_path = _write_checkpoint(tmp_path, wf_path, event_log_path=prior_log)
+        started_data = {"name": "cli-secrets", "inputs": {"token": secret}}
+
+        engine = MagicMock()
+        engine.add_user_guidance = MagicMock()
+        engine.build_workflow_started_data = AsyncMock(return_value=started_data)
+        engine.resume = AsyncMock(return_value={"result": "ok"})
+
+        dashboard = MagicMock()
+        dashboard.port = 8080
+        dashboard.url = "http://127.0.0.1:8080"
+        dashboard.start = AsyncMock()
+        dashboard.stop = AsyncMock()
+        dashboard.wait_for_stop = AsyncMock()
+        dashboard.wait_for_clients_disconnect = AsyncMock()
+        dashboard.replay_events_from_jsonl = MagicMock(return_value=1)
+        monkeypatch.setattr("conductor.web.server.WebDashboard", MagicMock(return_value=dashboard))
+
+        direct_writes: list[WorkflowEvent] = []
+        telemetry_writes: list[WorkflowEvent] = []
+
+        from conductor.engine import event_log as event_log_mod
+
+        real_subscriber_cls = event_log_mod.EventLogSubscriber
+
+        def subscriber_factory(*args: Any, **kwargs: Any) -> Any:
+            instance = real_subscriber_cls(*args, **kwargs)
+            real_on_event = instance.on_event
+
+            def spy_on_event(event: WorkflowEvent) -> None:
+                if event.type == "workflow_started":
+                    direct_writes.append(event)
+                return real_on_event(event)
+
+            instance.on_event = spy_on_event
+            return instance
+
+        monkeypatch.setattr(event_log_mod, "EventLogSubscriber", subscriber_factory)
+
+        def spy_telemetry(event: WorkflowEvent) -> None:
+            if event.type == "workflow_started":
+                telemetry_writes.append(event)
+
+        from conductor.cli.run import resume_workflow_async
+
+        with (
+            patch("conductor.cli.run.ProviderRegistry") as mock_registry_cls,
+            patch("conductor.cli.run.WorkflowEngine") as mock_engine_cls,
+            patch("conductor.cli.run._write_terminal_record_for_current_process"),
+            patch("conductor.telemetry.subscriber.TelemetrySubscriber") as mock_telemetry_cls,
+        ):
+            mock_telemetry_cls.return_value.on_event.side_effect = spy_telemetry
+            _wire_registry_with_engine(mock_registry_cls, mock_engine_cls, engine)
+            await resume_workflow_async(
+                checkpoint_path=cp_path,
+                environment="demo",
+                web=True,
+                web_bg=True,
+            )
+
+        assert len(direct_writes) == 1
+        assert len(telemetry_writes) == 1
+        for event in (*direct_writes, *telemetry_writes):
+            rendered = json.dumps(event.data)
+            assert secret not in rendered
+            assert REDACTED_MARKER in rendered
+        prepended = dashboard.prepend_workflow_started.call_args.args[0]
+        prepended_rendered = json.dumps(prepended)
+        assert secret not in prepended_rendered
+        assert REDACTED_MARKER in prepended_rendered
+        # The dict the engine built is untouched.
+        assert started_data == {"name": "cli-secrets", "inputs": {"token": secret}}
+
+
+class TestInactiveSinkParity:
+    """Sinks II: an inactive redactor keeps byte parity."""
+
+    @pytest.mark.asyncio
+    async def test_inactive_redactor_returns_engine_output_verbatim(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Requirement: with no declared secrets the redactor never activates:
+        # the returned output is the very object the engine produced, the
+        # terminal record receives that same object, and a spy on
+        # RunRedactor.scrub proves every call was an identity passthrough
+        # (zero copies) — the pre-secrets behavior is byte-identical.
+        wf_path = _write_workflow(tmp_path, _PLAIN_WORKFLOW)
+        engine_raw = {"result": "ok"}
+        scrub_calls: list[tuple[Any, Any]] = []
+        real_scrub = RunRedactor.scrub
+
+        def spy_scrub(self: RunRedactor, obj: Any) -> Any:
+            result = real_scrub(self, obj)
+            scrub_calls.append((obj, result))
+            return result
+
+        monkeypatch.setattr(RunRedactor, "scrub", spy_scrub)
+
+        from conductor.cli.run import run_workflow_async
+
+        with (
+            patch("conductor.cli.run.ProviderRegistry") as mock_registry_cls,
+            patch("conductor.cli.run.WorkflowEngine") as mock_engine_cls,
+            patch("conductor.cli.run._write_terminal_record_for_current_process") as mock_record,
+        ):
+            engine = MagicMock()
+            engine.run = AsyncMock(return_value=engine_raw)
+            engine.config.workflow.cost.show_summary = False
+            _wire_registry_with_engine(mock_registry_cls, mock_engine_cls, engine)
+            result = await run_workflow_async(wf_path, {"key": "plain"}, environment=None)
+
+        assert result is engine_raw
+        assert scrub_calls
+        assert all(original is scrubbed for original, scrubbed in scrub_calls)
+        record_kwargs = mock_record.call_args.kwargs
+        assert record_kwargs["status"] == "success"
+        assert record_kwargs["output"] is engine_raw
+        assert record_kwargs["error_type"] is None
+        assert record_kwargs["error_message"] is None

@@ -2193,6 +2193,33 @@ def _remove_run_record_for_current_process_safe() -> None:
         logger.warning("Failed to remove fleet run record", exc_info=True)
 
 
+def _scrub_workflow_terminated(
+    exc: WorkflowTerminated,
+    redactor: RunRedactor | None,
+) -> WorkflowTerminated:
+    """Re-create a ``WorkflowTerminated`` with its rendered fields scrubbed.
+
+    ``message`` / ``output`` / ``reason`` / ``suggestion`` are all
+    Jinja-rendered from the workflow context and may carry a declared secret
+    value (Oracle R2-NF3) — and the CLI's terminate handler prints exactly
+    these fields to stdout. The scrubbed exception is therefore built as a
+    copy at this boundary (the CLI print sites stay out of the diff);
+    ``terminated_by`` is a step name, never rendered from context, and is
+    preserved verbatim. Identity passthrough when the redactor is missing or
+    inactive (byte parity for secret-less runs); the original exception is
+    never mutated.
+    """
+    if redactor is None or not redactor.active:
+        return exc
+    return WorkflowTerminated(
+        redactor.scrub(exc.args[0] if exc.args else ""),
+        output=redactor.scrub_event_data(exc.output),
+        reason=redactor.scrub(exc.reason),
+        terminated_by=exc.terminated_by,
+        suggestion=redactor.scrub(exc.suggestion) if exc.suggestion is not None else None,
+    )
+
+
 def _write_terminal_record_for_current_process(
     *,
     event_log_subscriber: Any,
@@ -2733,8 +2760,17 @@ async def run_workflow_async(
 
             if terminate_exc is not None:
                 # Re-raise so the CLI handler emits the non-zero exit code
-                # and prints the structured termination message/output.
-                raise terminate_exc
+                # and prints the structured termination message/output. The
+                # exception is re-created with scrubbed rendered fields —
+                # the CLI's terminate printer reads message/output/reason/
+                # suggestion verbatim, so the scrub happens here at the
+                # boundary rather than at the print sites.
+                raise _scrub_workflow_terminated(terminate_exc, secret_redactor)
+            if secret_redactor is not None and secret_redactor.active:
+                # Final stdout sink: app.py prints the returned dict (normal
+                # and --silent paths alike), so the boundary returns a
+                # scrubbed copy — the engine-produced dict is never mutated.
+                return secret_redactor.scrub_event_data(result)
             return result
     except BaseException as exc:
         if not isinstance(exc, WorkflowTerminated):
@@ -2751,6 +2787,27 @@ async def run_workflow_async(
         raise
     finally:
         try:
+            # Scrub the terminal-record copies while the redactor still holds
+            # the registered values: the CLI-owned pair is cleared only in
+            # the inner finally below, after these sinks drain. The redactor
+            # copies — the terminal locals above keep the engine-produced
+            # values untouched (Oracle R1-B7).
+            record_output = terminal_output
+            record_error_type = terminal_error_type
+            record_error_message = terminal_error_message
+            if secret_redactor is not None and secret_redactor.active:
+                record_output = secret_redactor.scrub_event_data(terminal_output)
+                record_error_type = (
+                    None
+                    if terminal_error_type is None
+                    else secret_redactor.scrub(terminal_error_type)
+                )
+                record_error_message = (
+                    None
+                    if terminal_error_message is None
+                    else secret_redactor.scrub(terminal_error_message)
+                )
+
             # Write the terminal run record (MCP server plan E2) before
             # removing the live one below, so a completed run remains
             # resolvable by run_id after this process exits. Never raises --
@@ -2760,9 +2817,9 @@ async def run_workflow_async(
                 workflow_path=workflow_path,
                 started_at=started_at_iso,
                 status=terminal_status,
-                output=terminal_output,
-                error_type=terminal_error_type,
-                error_message=terminal_error_message,
+                output=record_output,
+                error_type=record_error_type,
+                error_message=record_error_message,
                 engine=engine,
             )
 
@@ -2788,10 +2845,12 @@ async def run_workflow_async(
                 # Spans still open here never saw a terminal workflow event
                 # (interrupt/cancellation escaping the engine) — mark them
                 # failed rather than let them read as clean completions.
+                # ``telemetry_closed`` is written outside the emitter, so the
+                # scrubbed copies above are the arguments it receives.
                 telemetry_subscriber.close(
                     failed=terminal_status != "success",
-                    error_type=terminal_error_type,
-                    error_message=terminal_error_message,
+                    error_type=record_error_type,
+                    error_message=record_error_message,
                 )
 
             # Close JSONL event log and report path
@@ -3337,6 +3396,12 @@ async def resume_workflow_async(
                 bg=bg_mode,
                 workflow_root=resolved_workflow_path.resolve().parent,
             )
+            # Replay seeding (JSONL replay + synthetic fallback) appends
+            # straight to dashboard history, bypassing the emitter's scrub —
+            # hand the dashboard the run redactor so each replayed payload is
+            # scrubbed before the history-append (identity passthrough when
+            # inactive, so a secret-less resume stays byte-identical).
+            dashboard.set_redactor(secret_redactor)
 
         # Build MCP servers config (same as run_workflow_async)
         mcp_servers = await _build_mcp_servers(config, secrets=secret_uses)
@@ -3477,6 +3542,15 @@ async def resume_workflow_async(
             #      starts and treat the live run as a child workflow.
             if dashboard is not None:
                 workflow_started_data = await engine.build_workflow_started_data()
+                # The three sinks below — dashboard history prepend, the
+                # direct JSONL write, and the direct telemetry write — all
+                # bypass the emitter, so the emitter's scrub never reaches
+                # them, and the payload rendered from the restored context
+                # can carry a declared secret value. Scrub one copy up
+                # front: the redactor never mutates the dict the engine
+                # built (Oracle R1-B7).
+                if secret_redactor is not None and secret_redactor.active:
+                    workflow_started_data = secret_redactor.scrub_event_data(workflow_started_data)
                 dashboard.prepend_workflow_started(workflow_started_data)
                 # Persist a resume-generation marker directly to the JSONL
                 # log. The engine's own `workflow_started` emit is
@@ -3672,7 +3746,13 @@ async def resume_workflow_async(
                         await asyncio.Event().wait()
 
             if terminate_exc is not None:
-                raise terminate_exc
+                # Mirror of the matching arm in `run_workflow_async`: the
+                # re-raise carries scrubbed rendered fields for the CLI's
+                # terminate printer.
+                raise _scrub_workflow_terminated(terminate_exc, secret_redactor)
+            if secret_redactor is not None and secret_redactor.active:
+                # Final stdout sink — parity with run_workflow_async.
+                return secret_redactor.scrub_event_data(result)
             return result
     except BaseException as exc:
         if not isinstance(exc, WorkflowTerminated):
@@ -3687,6 +3767,26 @@ async def resume_workflow_async(
         raise
     finally:
         try:
+            # Scrubbed terminal-record copies — mirrors run_workflow_async:
+            # the redactor still holds the registered values here (cleanup
+            # runs only in the inner finally below), and the copies leave the
+            # captured terminal locals untouched.
+            record_output = terminal_output
+            record_error_type = terminal_error_type
+            record_error_message = terminal_error_message
+            if secret_redactor is not None and secret_redactor.active:
+                record_output = secret_redactor.scrub_event_data(terminal_output)
+                record_error_type = (
+                    None
+                    if terminal_error_type is None
+                    else secret_redactor.scrub(terminal_error_type)
+                )
+                record_error_message = (
+                    None
+                    if terminal_error_message is None
+                    else secret_redactor.scrub(terminal_error_message)
+                )
+
             # Write the terminal run record (MCP server plan E2) before
             # removing the live one below -- mirrors run_workflow_async. A
             # resumed run reuses its predecessor's run_id, so this call
@@ -3697,9 +3797,9 @@ async def resume_workflow_async(
                 workflow_path=resolved_workflow_path,
                 started_at=started_at_iso,
                 status=terminal_status,
-                output=terminal_output,
-                error_type=terminal_error_type,
-                error_message=terminal_error_message,
+                output=record_output,
+                error_type=record_error_type,
+                error_message=record_error_message,
                 engine=engine,
             )
 
@@ -3717,10 +3817,15 @@ async def resume_workflow_async(
                     logger.warning("Failed to stop dashboard during resume cleanup", exc_info=True)
 
             if telemetry_subscriber is not None:
+                # Spans still open here never saw a terminal workflow event
+                # (interrupt/cancellation escaping the engine) — mark them
+                # failed rather than let them read as clean completions.
+                # ``telemetry_closed`` is written outside the emitter, so the
+                # scrubbed copies above are the arguments it receives.
                 telemetry_subscriber.close(
                     failed=terminal_status != "success",
-                    error_type=terminal_error_type,
-                    error_message=terminal_error_message,
+                    error_type=record_error_type,
+                    error_message=record_error_message,
                 )
 
             # Close JSONL event log and report path

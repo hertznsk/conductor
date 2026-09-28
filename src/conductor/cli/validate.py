@@ -23,7 +23,7 @@ from conductor.telemetry.guards import OTEL_SDK_AVAILABLE
 
 if TYPE_CHECKING:
     from conductor.config.environment import ResolvedEnvironment
-    from conductor.config.schema import WorkflowConfig
+    from conductor.config.schema import StepSecretRef, WorkflowConfig
     from conductor.engine.run_manifest import ResolvedRunManifest
 
 
@@ -90,16 +90,17 @@ def validate_workflow(
 
     # Semantic validation: cross-field references, template refs, etc.
     try:
-        from conductor.config.validator import validate_workflow_config
+        from conductor.config.validator import _has_secret_references, validate_workflow_config
 
         environment_context = None
-        if environment is not None:
+        if environment is not None and resolved_environment is not None:
             environment_context = {
                 "refs_found": False,
-                "environments": None,
+                "environments": {resolved_environment.name: resolved_environment},
                 "explicit": True,
                 "root_workflow_dir": workflow_path.parent,
                 "warned_no_environments": False,
+                "warned_no_secret_environments": False,
             }
         warnings = validate_workflow_config(
             config,
@@ -124,6 +125,8 @@ def validate_workflow(
             output_console,
         ):
             return False, None
+        if _has_secret_references(config):
+            _report_secret_bindings(config, resolved_environment, output_console)
     _report_mcp(config, output_console)
     _report_telemetry_sdk(output_console)
 
@@ -241,6 +244,83 @@ def _bundle_entry_root(logical_path: str) -> str:
     if parts[1] == "registry" and len(parts) >= 4:
         return "/".join(parts[:4])
     return "/".join(parts[:3])
+
+
+def _secret_delivery_label(secret: StepSecretRef) -> str:
+    """Render a secret's delivery as ``env: NAME`` / ``header: NAME``.
+
+    The delivery name is authored in the workflow file itself, so it is safe
+    to print — unlike the environment document's ``source.env`` variable
+    name, which this report never discloses.
+    """
+    if secret.delivery.env is not None:
+        return f"env: {secret.delivery.env}"
+    assert secret.delivery.header is not None
+    return f"header: {secret.delivery.header}"
+
+
+def _report_secret_bindings(
+    config: WorkflowConfig,
+    environment: ResolvedEnvironment,
+    console: MarkupFreeConsole,
+) -> None:
+    """Print the secret bindings and consumers in effect under ``--environment``.
+
+    Two tables: the environment's declared bindings (name, source kind, allow
+    list) and the workflow's consumers (consumer, ref, scope, delivery). The
+    report deliberately prints **no secret values and no source variable
+    names** — a binding whose source variable is unset on this machine is
+    marked ``(unset)`` instead, mirroring the validator's warning. Presence
+    checks use ``os.environ.get(...) is None`` only; no resolver or redactor
+    is ever instantiated on the validate path.
+
+    The caller gates this report on ``_has_secret_references`` — a workflow
+    with no secret references gets no section at all (the lazy-gate
+    precedent: bare validate must produce zero new output and zero new I/O
+    for secret-free workflows).
+
+    Args:
+        config: The validated workflow configuration.
+        environment: The resolved environment the manifest compiled against.
+        console: Rich console for output.
+    """
+    from conductor.config.validator import _secret_step_consumers
+
+    console.print(Text.from_markup("\n[bold]Secret Bindings[/bold]"))
+
+    bindings = environment.document.secrets or {}
+    binding_table = Table(show_header=True, header_style="bold", box=None)
+    binding_table.add_column("Name")
+    binding_table.add_column("Source")
+    binding_table.add_column("Allow")
+    for name, binding in sorted(bindings.items()):
+        env_var = binding.source.env
+        source_kind = "env" if env_var is not None else "other"
+        if env_var is not None and os.environ.get(env_var) is None:
+            source_kind = "env (unset)"
+        if binding.allow is None:
+            allow = "all"
+        else:
+            allow = ", ".join(binding.allow) if binding.allow else "none"
+        binding_table.add_row(name, source_kind, allow)
+    console.print(binding_table)
+
+    consumers_table = Table(show_header=True, header_style="bold", box=None)
+    consumers_table.add_column("Consumer")
+    consumers_table.add_column("Ref")
+    consumers_table.add_column("Scope")
+    consumers_table.add_column("Delivery")
+    for key, step in _secret_step_consumers(config):
+        assert step.execution is not None
+        for secret in step.execution.secrets:
+            consumers_table.add_row(key, secret.ref, secret.scope, _secret_delivery_label(secret))
+    for server_name in sorted(config.workflow.runtime.mcp_servers):
+        server = config.workflow.runtime.mcp_servers[server_name]
+        for secret in server.secrets:
+            consumers_table.add_row(
+                f"mcp:{server_name}", secret.ref, secret.scope, _secret_delivery_label(secret)
+            )
+    console.print(consumers_table)
 
 
 def _report_telemetry_sdk(console: MarkupFreeConsole) -> None:
