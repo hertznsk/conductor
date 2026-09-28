@@ -203,6 +203,10 @@ class TestSaveCheckpointRedaction:
         }
 
         # Pin every entropy/timestamp source so two saves are byte-comparable.
+        # The two saves must still land in distinct files: on Windows rename()
+        # does not overwrite an existing destination, so reusing one filename
+        # would make the second save fail-open to None. The filename suffix is
+        # not part of the serialized payload, so byte parity is unaffected.
         fixed_now = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
 
         class _FixedDatetime(datetime):
@@ -211,7 +215,7 @@ class TestSaveCheckpointRedaction:
                 return fixed_now
 
         with (
-            patch("secrets.token_hex", return_value="aabbccdd"),
+            patch("secrets.token_hex", side_effect=["aabbccdd", "eeff0011"]),
             patch("time.strftime", return_value="20260101-000000"),
             patch("conductor.engine.checkpoint.datetime", _FixedDatetime),
         ):
