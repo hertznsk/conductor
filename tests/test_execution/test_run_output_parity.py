@@ -118,7 +118,16 @@ async def test_provider_free_workflow_output_shape_pinned() -> None:
         "hermetic": False,
         "classification": "non-hermetic-compatibility",
     }
+    # Requirement: the manifest pins the effective inherit-control-environment policy per step.
     assert manifest["profiles"] == {
-        "say": {"profile": "default", "backend": "local"},
-        "check42": {"profile": "default", "backend": "local"},
+        "say": {
+            "profile": "default",
+            "backend": "local",
+            "inherit_control_environment": True,
+        },
+        "check42": {
+            "profile": "default",
+            "backend": "local",
+            "inherit_control_environment": True,
+        },
     }

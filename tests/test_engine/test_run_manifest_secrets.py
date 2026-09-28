@@ -1,0 +1,322 @@
+from __future__ import annotations
+
+import json
+from typing import Literal
+
+import pytest
+
+from conductor.config.environment import (
+    EnvironmentDocument,
+    ProfileDefinition,
+    ResolvedEnvironment,
+    SecretBinding,
+    SecretBindingSource,
+)
+from conductor.config.schema import (
+    AgentDef,
+    MCPServerDef,
+    OutputField,
+    RouteDef,
+    RuntimeConfig,
+    ScriptStepDef,
+    SecretDelivery,
+    StepExecutionConfig,
+    StepSecretRef,
+    WorkflowConfig,
+    WorkflowDef,
+)
+from conductor.engine.run_manifest import (
+    ResolvedRunManifest,
+    ResolvedSecretUse,
+    compile_run_manifest,
+)
+from conductor.exceptions import ConfigurationError
+
+
+def _secret(
+    ref: str,
+    scope: Literal["script", "mcp", "agent"],
+    *,
+    env: str | None = None,
+    header: str | None = None,
+) -> StepSecretRef:
+    return StepSecretRef(
+        ref=ref,
+        scope=scope,
+        delivery=SecretDelivery(env=env, header=header),
+    )
+
+
+def _environment(
+    *,
+    inherit_control_environment: bool | None = None,
+    secret_names: tuple[str, ...] = ("alpha", "beta"),
+) -> ResolvedEnvironment:
+    document = EnvironmentDocument(
+        default="default",
+        profiles={
+            "default": ProfileDefinition(
+                backend="local",
+                inherit_control_environment=inherit_control_environment,
+            )
+        },
+        secrets={
+            name: SecretBinding(source=SecretBindingSource(env=f"SOURCE_{name.upper()}"))
+            for name in secret_names
+        },
+    )
+    return ResolvedEnvironment(
+        document=document,
+        name="test-env",
+        source="path",
+        path=None,
+        digest="sha256:test",
+    )
+
+
+def _script_config(*secrets: StepSecretRef) -> WorkflowConfig:
+    return WorkflowConfig(
+        workflow=WorkflowDef(name="script-secrets", entry_point="run"),
+        agents=[
+            ScriptStepDef(
+                name="run",
+                command="echo",
+                execution=StepExecutionConfig(secrets=list(secrets)),
+                routes=[RouteDef(to="$end")],
+            )
+        ],
+        output={"result": "{{ run.output.stdout }}"},
+    )
+
+
+def _agent_config(*secrets: StepSecretRef) -> WorkflowConfig:
+    return WorkflowConfig(
+        workflow=WorkflowDef(name="agent-secrets", entry_point="agent"),
+        agents=[
+            AgentDef(
+                name="agent",
+                model="gpt-4",
+                prompt="test",
+                output={"value": OutputField(type="string")},
+                execution=StepExecutionConfig(secrets=list(secrets)),
+                routes=[RouteDef(to="$end")],
+            )
+        ],
+        output={"result": "{{ agent.output.value }}"},
+    )
+
+
+def _mcp_config(server: MCPServerDef) -> WorkflowConfig:
+    return WorkflowConfig(
+        workflow=WorkflowDef(
+            name="mcp-secrets",
+            entry_point="agent",
+            runtime=RuntimeConfig(mcp_servers={"server": server}),
+        ),
+        agents=[
+            AgentDef(
+                name="agent",
+                model="gpt-4",
+                prompt="test",
+                output={"value": OutputField(type="string")},
+                routes=[RouteDef(to="$end")],
+            )
+        ],
+        output={"result": "{{ agent.output.value }}"},
+    )
+
+
+def test_secret_uses_are_recorded_in_step_then_sorted_server_order() -> None:
+    # Requirement: records preserve executable-step order, followed by MCP servers by name.
+    config = WorkflowConfig(
+        workflow=WorkflowDef(
+            name="ordered-secrets",
+            entry_point="first",
+            runtime=RuntimeConfig(
+                mcp_servers={
+                    "zeta": MCPServerDef(
+                        type="http",
+                        url="https://example.test/zeta",
+                        secrets=[_secret("beta", "mcp", header="Authorization")],
+                    ),
+                    "alpha": MCPServerDef(
+                        command="alpha-server",
+                        secrets=[_secret("alpha", "mcp", env="MCP_TOKEN")],
+                    ),
+                }
+            ),
+        ),
+        agents=[
+            ScriptStepDef(
+                name="first",
+                command="first",
+                execution=StepExecutionConfig(
+                    secrets=[_secret("alpha", "script", env="FIRST_TOKEN")]
+                ),
+                routes=[RouteDef(to="second")],
+            ),
+            ScriptStepDef(
+                name="second",
+                command="second",
+                execution=StepExecutionConfig(
+                    secrets=[_secret("beta", "script", env="SECOND_TOKEN")]
+                ),
+                routes=[RouteDef(to="$end")],
+            ),
+        ],
+        output={"result": "{{ second.output.stdout }}"},
+    )
+
+    manifest = compile_run_manifest(config, workflow_path=None, environment=_environment())
+
+    assert manifest.secrets == (
+        ResolvedSecretUse(
+            consumer="first",
+            ref="alpha",
+            scope="script",
+            delivery_kind="env",
+            delivery_name="FIRST_TOKEN",
+        ),
+        ResolvedSecretUse(
+            consumer="second",
+            ref="beta",
+            scope="script",
+            delivery_kind="env",
+            delivery_name="SECOND_TOKEN",
+        ),
+        ResolvedSecretUse(
+            consumer="mcp:alpha",
+            ref="alpha",
+            scope="mcp",
+            delivery_kind="env",
+            delivery_name="MCP_TOKEN",
+        ),
+        ResolvedSecretUse(
+            consumer="mcp:zeta",
+            ref="beta",
+            scope="mcp",
+            delivery_kind="header",
+            delivery_name="Authorization",
+        ),
+    )
+
+
+@pytest.mark.parametrize(("configured", "expected"), [(False, False), (None, True)])
+def test_profile_records_effective_inherit_control_environment(
+    configured: bool | None,
+    expected: bool,
+) -> None:
+    # Requirement: the compiler writes explicit False and the local backend's effective True.
+    manifest = compile_run_manifest(
+        _script_config(),
+        workflow_path=None,
+        environment=_environment(inherit_control_environment=configured),
+    )
+
+    assert manifest.profiles["run"].inherit_control_environment is expected
+    assert (
+        manifest.model_dump(mode="json")["profiles"]["run"]["inherit_control_environment"]
+        is expected
+    )
+
+
+def test_secret_manifest_compile_is_byte_identical() -> None:
+    # Requirement: secret audit records contain only run-invariant use-site metadata.
+    config = _script_config(_secret("alpha", "script", env="TOKEN"))
+    environment = _environment()
+
+    first = compile_run_manifest(config, workflow_path=None, environment=environment)
+    second = compile_run_manifest(config, workflow_path=None, environment=environment)
+
+    assert json.dumps(first.model_dump(mode="json")) == json.dumps(second.model_dump(mode="json"))
+
+
+def test_pre_secrets_v1_payload_round_trips_with_additive_defaults() -> None:
+    # Requirement: an origin/main v1 payload without either additive field still parses.
+    old_payload = {
+        "version": 1,
+        "workflow": {"name": "old", "digest": None},
+        "environment": {"name": "local/default", "source": "builtin", "digest": "sha256:0"},
+        "profiles": {"run": {"profile": "default", "backend": "local"}},
+        "conductor_version": "old",
+        "audit": {"hermetic": False, "classification": "non-hermetic-compatibility"},
+    }
+
+    parsed = ResolvedRunManifest.model_validate(old_payload)
+
+    assert parsed.secrets == ()
+    assert parsed.profiles["run"].inherit_control_environment is True
+    assert parsed.model_dump(mode="json", exclude_defaults=True) == old_payload
+
+
+def test_script_scope_conflicts_with_mcp_scope() -> None:
+    # Requirement: a secret attached to a script position must declare script scope.
+    with pytest.raises(ConfigurationError, match="position requires scope 'script'"):
+        compile_run_manifest(
+            _script_config(_secret("alpha", "mcp", env="TOKEN")),
+            workflow_path=None,
+            environment=_environment(),
+        )
+
+
+def test_mcp_scope_conflicts_with_script_scope() -> None:
+    # Requirement: a secret attached to an MCP server position must declare MCP scope.
+    server = MCPServerDef(
+        command="server",
+        secrets=[_secret("alpha", "script", env="TOKEN")],
+    )
+    with pytest.raises(ConfigurationError, match="position requires scope 'mcp'"):
+        compile_run_manifest(_mcp_config(server), workflow_path=None, environment=_environment())
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        _agent_config(_secret("alpha", "script", env="TOKEN")),
+        _script_config(_secret("alpha", "agent", env="TOKEN")),
+        _mcp_config(
+            MCPServerDef(
+                command="server",
+                secrets=[_secret("alpha", "agent", env="TOKEN")],
+            )
+        ),
+    ],
+)
+def test_agent_secret_scope_is_reserved_until_step_7(config: WorkflowConfig) -> None:
+    # Requirement: non-script use-sites and explicit agent scope fail at runtime until step 7.
+    with pytest.raises(ConfigurationError, match=r"agent-scope.*step 7"):
+        compile_run_manifest(config, workflow_path=None, environment=_environment())
+
+
+def test_header_delivery_on_step_is_rejected() -> None:
+    # Requirement: HTTP header delivery is valid only at an MCP server use-site.
+    with pytest.raises(ConfigurationError, match="header delivery is MCP-only"):
+        compile_run_manifest(
+            _script_config(_secret("alpha", "script", header="Authorization")),
+            workflow_path=None,
+            environment=_environment(),
+        )
+
+
+def test_header_delivery_on_stdio_server_names_transport() -> None:
+    # Requirement: stdio MCP servers cannot receive HTTP headers and the error names transport.
+    server = MCPServerDef(
+        command="server",
+        secrets=[_secret("alpha", "mcp", header="Authorization")],
+    )
+    with pytest.raises(ConfigurationError, match=r"transport 'stdio'"):
+        compile_run_manifest(_mcp_config(server), workflow_path=None, environment=_environment())
+
+
+def test_unknown_secret_ref_lists_available_names() -> None:
+    # Requirement: runtime validation identifies the unknown ref and every available binding.
+    with pytest.raises(ConfigurationError) as exc_info:
+        compile_run_manifest(
+            _script_config(_secret("missing", "script", env="TOKEN")),
+            workflow_path=None,
+            environment=_environment(),
+        )
+
+    message = str(exc_info.value)
+    assert "missing" in message
+    assert "available secrets: alpha, beta" in message
