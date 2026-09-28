@@ -21,6 +21,7 @@ from typing import Any, Literal
 from conductor.engine.context import WorkflowContext
 from conductor.engine.limits import LimitEnforcer
 from conductor.exceptions import CheckpointError
+from conductor.redaction import RunRedactor
 
 logger = logging.getLogger(__name__)
 
@@ -192,6 +193,8 @@ class CheckpointManager:
         run_id: str = "",
         event_log_path: str = "",
         trigger: CheckpointTrigger = "failure",
+        *,
+        redactor: RunRedactor | None = None,
     ) -> Path | None:
         """Serialize workflow state to a checkpoint file.
 
@@ -230,6 +233,15 @@ class CheckpointManager:
                 ``"periodic"`` (milestone/time-based save at a step boundary).
                 Persisted under the top-level ``"trigger"`` key and used by
                 ``conductor checkpoint list`` and rotation.
+            redactor: Optional run-scoped secret redactor. When provided and
+                :attr:`RunRedactor.active`, the assembled checkpoint payload
+                (``inputs``, ``context``, ``failure.message``, ``system``,
+                ``instructions_preamble``, and every other serialized value)
+                is scrubbed as a *copy* before serialization, so registered
+                secret values never reach the file. The live ``WorkflowContext``
+                and the caller's ``inputs`` mapping are never mutated. When
+                ``None`` or inactive, output is byte-identical to an
+                unredacted save.
 
         Returns:
             Path to the saved checkpoint file, or ``None`` if saving failed.
@@ -277,6 +289,14 @@ class CheckpointManager:
                 "run_id": run_id,
                 "event_log_path": event_log_path,
             }
+
+            # Scrub registered secrets from the payload as a copy before
+            # serialization — the checkpoint key set is unchanged (only
+            # string values inside are replaced) and the live engine context
+            # is never mutated. Zero work when no redactor is set or none
+            # are registered, preserving byte parity with unredacted saves.
+            if redactor is not None and redactor.active:
+                checkpoint = redactor.scrub_event_data(checkpoint)
 
             # Serialize to JSON
             json_data = json.dumps(checkpoint, indent=2)

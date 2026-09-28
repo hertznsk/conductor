@@ -6,6 +6,7 @@ run-scoped registration and resolution, and the emitter redaction sink.
 
 from __future__ import annotations
 
+from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.redaction import (
     REDACTED_MARKER,
     RunRedactor,
@@ -246,3 +247,98 @@ class TestContextVarIntegration:
             reset_current(token1)
 
         assert current() is None
+
+
+class TestEmitterRedaction:
+    """Requirement (secrets-contract sinks I): the event emitter scrubs payloads
+    before the subscriber snapshot when an active redactor is attached, passes
+    events through untouched (identity) otherwise, and never mutates the
+    caller's original event object."""
+
+    def _emit_and_capture(
+        self, emitter: WorkflowEventEmitter, event: WorkflowEvent
+    ) -> list[WorkflowEvent]:
+        captured: list[WorkflowEvent] = []
+        emitter.subscribe(captured.append)
+        emitter.emit(event)
+        assert len(captured) == 1
+        return captured
+
+    def test_active_redactor_subscriber_receives_sanitized_copy(self) -> None:
+        # Requirement: with an active redactor, the subscriber receives a copy
+        # with registered secrets replaced by the marker.
+        secret = "emitter-secret-token"
+        redactor = RunRedactor()
+        redactor.register([secret])
+
+        emitter = WorkflowEventEmitter()
+        emitter.set_redactor(redactor)
+        event = WorkflowEvent(
+            type="agent_completed", timestamp=1.5, data={"output": f"answer uses {secret}"}
+        )
+        (received,) = self._emit_and_capture(emitter, event)
+
+        assert received is not event
+        assert received.type == "agent_completed"
+        assert received.timestamp == 1.5
+        assert received.data == {"output": f"answer uses {REDACTED_MARKER}"}
+
+    def test_active_redactor_original_event_unmutated(self) -> None:
+        # Requirement: the caller's original event object and its payload are
+        # never mutated by the scrub.
+        secret = "emitter-secret-token"
+        redactor = RunRedactor()
+        redactor.register([secret])
+        original_payload = {"output": f"answer uses {secret}"}
+
+        emitter = WorkflowEventEmitter()
+        emitter.set_redactor(redactor)
+        event = WorkflowEvent(type="agent_completed", timestamp=2.0, data=original_payload)
+        self._emit_and_capture(emitter, event)
+
+        assert event.data is original_payload
+        assert event.data == {"output": f"answer uses {secret}"}
+
+    def test_inactive_redactor_same_event_object_reaches_subscribers(self) -> None:
+        # Requirement: an attached but inactive redactor performs zero work —
+        # the exact same event object reaches subscribers (identity passthrough).
+        redactor = RunRedactor()
+        emitter = WorkflowEventEmitter()
+        emitter.set_redactor(redactor)
+        event = WorkflowEvent(type="agent_started", timestamp=3.0, data={"agent": "a"})
+
+        (received,) = self._emit_and_capture(emitter, event)
+
+        assert received is event
+
+    def test_no_redactor_same_event_object_reaches_subscribers(self) -> None:
+        # Requirement: without any redactor attached the event passes through
+        # unchanged (identity) — pre-change behavior preserved.
+        emitter = WorkflowEventEmitter()
+        event = WorkflowEvent(type="agent_started", timestamp=4.0, data={"agent": "a"})
+
+        (received,) = self._emit_and_capture(emitter, event)
+
+        assert received is event
+
+    def test_set_redactor_idempotent_and_clearable(self) -> None:
+        # Requirement: set_redactor is idempotent and set_redactor(None) detaches,
+        # restoring the identity passthrough.
+        redactor = RunRedactor()
+        redactor.register(["emitter-secret-token"])
+        emitter = WorkflowEventEmitter()
+
+        emitter.set_redactor(redactor)
+        emitter.set_redactor(redactor)
+        event = WorkflowEvent(
+            type="agent_completed", timestamp=5.0, data={"out": "emitter-secret-token"}
+        )
+        (received,) = self._emit_and_capture(emitter, event)
+        assert received.data == {"out": REDACTED_MARKER}
+
+        emitter.set_redactor(None)
+        passthrough = WorkflowEvent(
+            type="agent_started", timestamp=6.0, data={"out": "emitter-secret-token"}
+        )
+        (received2,) = self._emit_and_capture(emitter, passthrough)
+        assert received2 is passthrough
