@@ -19,11 +19,11 @@ explicit, and shadowing keeps every resolved document byte-accountable to
 one file on disk (plus one digest).
 
 Documents are loaded as **plain YAML with no ``${VAR}`` expansion**.
-Secrets are expected to arrive as typed references in a later step, and
-silently expanding machine-dependent environment variables inside an
-environment document would be an anti-hermetic vector — the same document
-would resolve to different backends on different machines with nothing in
-the file to say why.
+Secrets arrive as typed references in the document's ``secrets`` mapping
+(each mapping a secret name to a source behind the resolution seam, such as
+an environment variable), and the document contains no secret values — silently
+expanding machine-dependent environment variables across the entire document
+would be an anti-hermetic vector.
 
 Importing this module performs no I/O: every filesystem access happens
 inside an explicit function call.
@@ -37,7 +37,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic import ValidationError as PydanticValidationError
@@ -61,6 +61,13 @@ AVAILABLE_BACKEND_NAMES = frozenset({"local"})
 # path separators and dots; anything outside it must be written as a path.
 _ENVIRONMENT_NAME_PATTERN = re.compile(r"\A[A-Za-z0-9_-]+\Z")
 
+# Secret binding names map to logical identifiers, supporting letters,
+# digits, underscores, dots, and hyphens.
+_SECRET_NAME_PATTERN = re.compile(r"\A[A-Za-z0-9_.-]+\Z")
+
+# Environment variable names for secret bindings must be valid shell identifiers.
+_ENV_VAR_NAME_PATTERN = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
+
 # Project-level environment documents live here, relative to each walked
 # ancestor of the workflow file.
 _PROJECT_ENVIRONMENTS_ROOT = Path(".conductor") / "environments"
@@ -76,6 +83,57 @@ _REPO_MARKER = ".git"
 _yaml = YAML(typ="safe")
 
 
+class SecretBindingSource(BaseModel):
+    """Source configuration for resolving a secret binding.
+
+    v1 supports the ``env`` source kind exclusively. Future vault/keychain
+    sources will add optional fields to this model.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    env: str | None = None
+    """Environment variable name providing the secret value."""
+
+    @field_validator("env")
+    @classmethod
+    def _validate_env_var_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped or _ENV_VAR_NAME_PATTERN.match(stripped) is None:
+            raise ValueError(
+                f"Invalid environment variable name '{value}': must be non-empty and "
+                f"match {_ENV_VAR_NAME_PATTERN.pattern} (letters, digits, and underscores, "
+                "not starting with a digit)."
+            )
+        return stripped
+
+    @model_validator(mode="after")
+    def _validate_exactly_one_source_kind(self) -> SecretBindingSource:
+        set_kinds = [k for k in ("env",) if getattr(self, k) is not None]
+        if len(set_kinds) != 1:
+            raise ValueError("exactly one source kind must be set (supported source kinds: env)")
+        return self
+
+
+class SecretBinding(BaseModel):
+    """A secret binding declaring its source and allowed consumer classes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: SecretBindingSource
+    """Source resolving the secret value."""
+
+    allow: list[Literal["script", "mcp"]] | None = None
+    """Allowed consumer classes for this secret.
+
+    When ``None`` (the default), all consumer classes are allowed forever.
+    When set to an empty list (``[]``), the binding is explicitly fail-closed
+    and accessible to no consumer classes.
+    """
+
+
 class ProfileDefinition(BaseModel):
     """One named execution profile inside an environment document."""
 
@@ -83,6 +141,14 @@ class ProfileDefinition(BaseModel):
 
     backend: str
     """Runner backend implementing this profile, from ``AVAILABLE_BACKEND_NAMES``."""
+
+    inherit_control_environment: bool | None = None
+    """Whether commands run under this profile inherit the host control process's environment.
+
+    When ``None`` (the default), the runner backend's default applies (the local
+    subprocess backend defaults to effective ``True``, while future remote backends
+    default to effective ``False``).
+    """
 
     @field_validator("backend")
     @classmethod
@@ -94,6 +160,16 @@ class ProfileDefinition(BaseModel):
                 f"Conductor (available: {available})"
             )
         return value
+
+    def model_dump(
+        self,
+        *args: Any,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        dump = super().model_dump(*args, **kwargs)
+        if dump.get("inherit_control_environment") is None:
+            dump.pop("inherit_control_environment", None)
+        return dump
 
 
 class EnvironmentDocument(BaseModel):
@@ -117,6 +193,24 @@ class EnvironmentDocument(BaseModel):
     profiles: dict[str, ProfileDefinition] = Field(min_length=1)
     """Named execution profiles, each mapping to a runner backend."""
 
+    secrets: dict[str, SecretBinding] | None = None
+    """Named secret bindings declaring source and access policies."""
+
+    @field_validator("secrets")
+    @classmethod
+    def _validate_secret_names(
+        cls, value: dict[str, SecretBinding] | None
+    ) -> dict[str, SecretBinding] | None:
+        if value is None:
+            return None
+        for name in value:
+            if _SECRET_NAME_PATTERN.match(name) is None:
+                raise ValueError(
+                    f"Invalid secret binding name '{name}': names must match "
+                    f"{_SECRET_NAME_PATTERN.pattern} (letters, digits, '_', '.', and '-')."
+                )
+        return value
+
     @model_validator(mode="after")
     def _default_names_an_existing_profile(self) -> EnvironmentDocument:
         if self.default is not None and self.default not in self.profiles:
@@ -125,6 +219,19 @@ class EnvironmentDocument(BaseModel):
                 f"(defined: {', '.join(sorted(self.profiles))})"
             )
         return self
+
+    def model_dump(
+        self,
+        *args: Any,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        dump = super().model_dump(*args, **kwargs)
+        if dump.get("secrets") is None:
+            dump.pop("secrets", None)
+        for p in dump.get("profiles", {}).values():
+            if isinstance(p, dict) and p.get("inherit_control_environment") is None:
+                p.pop("inherit_control_environment", None)
+        return dump
 
 
 @dataclass(frozen=True)
@@ -160,7 +267,13 @@ def _document_digest(document: EnvironmentDocument) -> str:
     Spelled ``sha256:<hex>``, matching the workflow-hash convention in
     ``engine.checkpoint``.
     """
-    return canonical_json_digest(document.model_dump(mode="json"))
+    dump = document.model_dump(mode="json")
+    if dump.get("secrets") is None:
+        dump.pop("secrets", None)
+    for p in dump.get("profiles", {}).values():
+        if isinstance(p, dict) and p.get("inherit_control_environment") is None:
+            p.pop("inherit_control_environment", None)
+    return canonical_json_digest(dump)
 
 
 def load_environment_document(path: Path) -> EnvironmentDocument:

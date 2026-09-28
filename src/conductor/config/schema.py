@@ -1142,6 +1142,71 @@ class RoutableStepBase(StepBase):
     routes: list[RouteDef] = Field(default_factory=list)
 
 
+class SecretDelivery(BaseModel):
+    """Delivery destination for an injected secret (environment variable or HTTP header)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    env: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)] | None = None
+    """Environment variable name to inject the secret into."""
+
+    header: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)] | None = None
+    """HTTP header name to inject the secret into."""
+
+    @field_validator("env")
+    @classmethod
+    def validate_env(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not regex.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+            raise ValueError(
+                "delivery env must match [A-Za-z_][A-Za-z0-9_]* "
+                "(letters, digits, '_' only, not starting with a digit)"
+            )
+        return value
+
+    @field_validator("header")
+    @classmethod
+    def validate_header(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not regex.fullmatch(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+", value):
+            raise ValueError("delivery header must match RFC 9110 token charset")
+        return value
+
+    @model_validator(mode="after")
+    def validate_delivery_target(self) -> SecretDelivery:
+        has_env = self.env is not None
+        has_header = self.header is not None
+        if has_env == has_header:
+            raise ValueError("exactly one of 'env' or 'header' must be set for secret delivery")
+        return self
+
+
+class StepSecretRef(BaseModel):
+    """Reference to a secret bound in an execution environment document."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ref: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+    """Logical secret reference name matching a secret declared in the environment."""
+
+    scope: Literal["script", "mcp", "agent"]
+    """Target execution scope for the secret."""
+
+    delivery: SecretDelivery
+    """Delivery mechanism for the secret (environment variable or HTTP header)."""
+
+    @field_validator("ref")
+    @classmethod
+    def validate_ref(cls, value: str) -> str:
+        if not regex.fullmatch(r"[A-Za-z0-9_.-]+", value):
+            raise ValueError(
+                "secret ref must match [A-Za-z0-9_.-]+ (letters, digits, '_', '.', '-' only)"
+            )
+        return value
+
+
 class StepExecutionConfig(BaseModel):
     """Execution profile selection for an executable workflow step.
 
@@ -1156,6 +1221,9 @@ class StepExecutionConfig(BaseModel):
 
     profile: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)] | None = None
     """Logical execution profile name for the step."""
+
+    secrets: list[StepSecretRef] = Field(default_factory=list)
+    """Secret references injected into the step."""
 
     @field_validator("profile")
     @classmethod
@@ -1717,6 +1785,9 @@ class MCPServerDef(BaseModel):
 
     tools: list[str] = Field(default_factory=lambda: ["*"])
     """List of tools to enable. ["*"] means all tools."""
+
+    secrets: list[StepSecretRef] = Field(default_factory=list)
+    """Secret references for delivery into the MCP server."""
 
     @model_validator(mode="after")
     def validate_type_requirements(self) -> MCPServerDef:
