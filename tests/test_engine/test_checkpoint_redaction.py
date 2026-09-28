@@ -230,6 +230,160 @@ class TestSaveCheckpointRedaction:
         # And the raw secret is present: no scrubbing happened at all.
         assert secret.encode() in bytes_none
 
+    def test_secret_named_workflow_preserves_protocol_keys_and_path(self, tmp_path: Path) -> None:
+        # Requirement (review b5): a registered secret equal to "workflow"
+        # must not rename protocol keys — scrubbing ``workflow_path`` would
+        # make the checkpoint unloadable while the save still reported
+        # success. Keys survive verbatim; the path value (which does not
+        # contain the secret) survives; a value equal to the secret is
+        # scrubbed.
+        secret = "workflow"
+        # The workflow file lives outside tmp_path (whose pytest-generated
+        # directory name contains the secret) so the path VALUE itself stays
+        # secret-free and the field can be asserted verbatim.
+        wf = tmp_path.parent / "app-run" / "app.yaml"
+        wf.parent.mkdir(exist_ok=True)
+        wf.write_text("name: app\n", encoding="utf-8")
+        ctx = _make_context({"q": "hi"}, {"agent_a": {"answer": "yes"}})
+        redactor = RunRedactor()
+        redactor.register([secret])
+
+        path = _save(
+            tmp_path,
+            workflow_path=wf,
+            context=ctx,
+            inputs={"q": "hi"},
+            error=RuntimeError("boom"),
+            redactor=redactor,
+        )
+
+        data = json.loads(path.read_text())
+        assert "workflow_path" in data
+        assert data["workflow_path"] == str(wf.resolve())
+        assert "agent_outputs" in data["context"]
+        loaded = CheckpointManager.load_checkpoint(path)
+        assert loaded.workflow_path == str(wf.resolve())
+        assert loaded.context["agent_outputs"]["agent_a"]["answer"] == "yes"
+
+    def test_secret_named_iteration_preserves_counters_and_limits(self, tmp_path: Path) -> None:
+        # Requirement (review b5): a registered secret equal to "iteration"
+        # must not rename the iteration-related keys — the deserializer would
+        # otherwise silently reset restored counters and limits to defaults.
+        # Keys survive; counter values survive; a string value CONTAINING the
+        # secret is scrubbed; restore keeps the counters.
+        secret = "iteration"
+        ctx = _make_context({"q": "hi"}, {"agent_a": {"answer": f"ran at {secret} 3"}})
+        ctx.current_iteration = 4
+        limits = _make_limits(4, 25, ["agent_a"])
+        redactor = RunRedactor()
+        redactor.register([secret])
+
+        path = _save(tmp_path, context=ctx, limits=limits, redactor=redactor)
+
+        data = json.loads(path.read_text())
+        assert data["failure"]["iteration"] == 4
+        assert data["limits"]["current_iteration"] == 4
+        assert data["limits"]["max_iterations"] == 25
+        assert data["context"]["current_iteration"] == 4
+        assert data["context"]["agent_outputs"]["agent_a"]["answer"] == (
+            f"ran at {REDACTED_MARKER} 3"
+        )
+
+        loaded = CheckpointManager.load_checkpoint(path)
+        restored_ctx = WorkflowContext.from_dict(loaded.context)
+        assert restored_ctx.current_iteration == 4
+        restored_limits = LimitEnforcer.from_dict(
+            loaded.limits,
+            timeout_seconds=300,
+            budget_usd=None,
+            budget_mode="audit",
+        )
+        assert restored_limits.current_iteration == 4
+        assert restored_limits.max_iterations == 25
+
+    def test_execution_manifest_structure_survives_secret_named_like_its_keys(
+        self, tmp_path: Path
+    ) -> None:
+        # Requirement (review b5, oracle round): inside
+        # ``system.execution_manifest`` the ENTIRE key set is the fixed
+        # ResolvedRunManifest schema — including the dynamic profile identity
+        # keys (executable step names) and the secret audit rows. A
+        # registered secret equal to one of those key names (``profile``,
+        # ``environment``, ``ref``, ``scope``) or to a step name must not
+        # rename any key: the persisted audit manifest must stay
+        # structurally valid and re-parse.
+        from conductor.config.environment import (
+            EnvironmentDocument,
+            ProfileDefinition,
+            ResolvedEnvironment,
+            SecretBinding,
+            SecretBindingSource,
+        )
+        from conductor.config.schema import (
+            RouteDef,
+            ScriptStepDef,
+            SecretDelivery,
+            StepExecutionConfig,
+            StepSecretRef,
+            WorkflowConfig,
+            WorkflowDef,
+        )
+        from conductor.engine.run_manifest import ResolvedRunManifest, compile_run_manifest
+
+        environment = ResolvedEnvironment(
+            document=EnvironmentDocument(
+                default="default",
+                profiles={"default": ProfileDefinition(backend="local")},
+                secrets={"alpha": SecretBinding(source=SecretBindingSource(env="SRC_ALPHA"))},
+            ),
+            name="test-env",
+            source="path",
+            path=None,
+            digest="sha256:test",
+        )
+        config = WorkflowConfig(
+            workflow=WorkflowDef(name="audit-manifest", entry_point="worker"),
+            agents=[
+                ScriptStepDef(
+                    name="worker",
+                    command="echo",
+                    execution=StepExecutionConfig(
+                        secrets=[
+                            StepSecretRef(
+                                ref="alpha",
+                                scope="script",
+                                delivery=SecretDelivery(env="TOKEN"),
+                            )
+                        ]
+                    ),
+                    routes=[RouteDef(to="$end")],
+                )
+            ],
+        )
+        manifest = compile_run_manifest(config, workflow_path=None, environment=environment)
+        redactor = RunRedactor()
+        redactor.register(["profile", "environment", "ref", "scope", "worker"])
+
+        path = _save(
+            tmp_path,
+            system_metadata={"execution_manifest": manifest.model_dump(mode="json")},
+            redactor=redactor,
+        )
+
+        data = json.loads(path.read_text())
+        parsed = ResolvedRunManifest.model_validate(data["system"]["execution_manifest"])
+        # Dynamic profile identity key (the step name) survived.
+        assert "worker" in parsed.profiles
+        assert parsed.profiles["worker"].profile == "default"
+        # The secret audit row kept its fixed key names.
+        (use,) = parsed.secrets
+        assert use.ref == "alpha"
+        assert use.scope == "script"
+        assert use.delivery_kind == "env"
+        assert use.delivery_name == "TOKEN"
+        # The environment block kept its key names.
+        assert parsed.environment.name == "test-env"
+
     def test_none_redactor_leaves_raw_secret_in_file(self, tmp_path: Path) -> None:
         # Requirement: the default (redactor=None) keeps the pre-change behavior —
         # registered-or-not, nothing is scrubbed without an attached redactor.

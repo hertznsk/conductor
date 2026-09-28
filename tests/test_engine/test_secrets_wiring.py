@@ -52,7 +52,7 @@ from conductor.execution import (
     RunSpec,
     WorkspaceLease,
 )
-from conductor.redaction import RunRedactor
+from conductor.redaction import REDACTED_MARKER, RunRedactor
 
 _TOKEN_VAR = "CONDUCTOR_TEST_TASK7W_TOKEN"
 
@@ -213,6 +213,44 @@ async def test_injected_pair_survives_finalize_and_reset(
     assert cache.secret_for("token").value == "injected-value-01"
 
 
+def test_cache_only_injection_derives_session_redactor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Requirement (review r1): injecting a cache without a redactor derives
+    # the session redactor FROM the cache — the same object the cache
+    # registers every resolved value into — so runtime sinks scrub the
+    # delivered values instead of an inactive replacement redactor.
+    monkeypatch.setenv(_TOKEN_VAR, "cache-only-value-01")
+    cache = SecretValueCache(_environment(), RunRedactor())
+    session = ExecutionResolverSession(_environment(), RecordingBackend(), secret_cache=cache)
+
+    assert session.redactor is cache.redactor
+    assert not session.owns_secrets
+
+    cache.resolve("token", consumer_class="script", consumer_label="step 'run'")
+    assert session.redactor.active
+    # The value the cache registered is scrubbed by the very redactor the
+    # session hands to runtime sinks.
+    resolved = session.secret_cache.secret_for("token")
+    assert session.redactor.scrub(f"token={resolved.value}") == f"token={REDACTED_MARKER}"
+
+
+def test_mismatched_cache_and_redactor_pair_is_rejected() -> None:
+    # Requirement (review r1): an explicitly injected pair whose cache and
+    # redactor are NOT the same objects is a wiring bug — values would be
+    # registered into one redactor while sinks scrub with the other — and
+    # must be rejected at construction rather than discovered as an
+    # unredacted leak later.
+    cache = SecretValueCache(_environment(), RunRedactor())
+    with pytest.raises(ValueError, match="same run pair"):
+        ExecutionResolverSession(
+            _environment(),
+            RecordingBackend(),
+            secret_cache=cache,
+            redactor=RunRedactor(),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Resolver views: per-config index over the shared cache
 # ---------------------------------------------------------------------------
@@ -344,14 +382,38 @@ async def test_engine_never_resets_injected_cli_secrets(
 async def test_env_name_collision_between_env_and_secret_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Requirement: a variable declared both in the step's ``env`` and via a
-    # secret delivery is a ConfigurationError naming the step and the names.
+    # Requirement (review b6): a variable declared both in the step's ``env``
+    # and via a secret delivery is rejected — at manifest compilation, before
+    # any execution, because ``conductor run`` never runs the semantic
+    # validator that used to be the only early choke point.
     monkeypatch.setenv(_TOKEN_VAR, "s3cr3t-value-0012")
     session = ExecutionResolverSession(_environment(), RecordingBackend())
-    engine = _engine(_script_config(env={"DELIVERED_TOKEN": "authored"}), session)
+    with pytest.raises(ConfigurationError, match="collides within consumer 'run'"):
+        _engine(_script_config(env={"DELIVERED_TOKEN": "authored"}), session)
 
-    with pytest.raises(ConfigurationError, match="both 'env' and secret delivery"):
-        await engine.run({})
+
+@pytest.mark.asyncio
+async def test_two_secret_refs_colliding_on_one_delivery_name_fail_before_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Requirement (review b6): execution without a preceding ``conductor
+    # validate`` must still reject two references collapsing onto one
+    # delivery name (last credential would win while the manifest lists
+    # both) — the engine compiles the shared, platform-aware collision check
+    # at construction, before any backend call.
+    monkeypatch.setenv(_TOKEN_VAR, "s3cr3t-value-0015")
+    config = _script_config(with_secret=False)
+    step = config.agents[0]
+    assert isinstance(step, ScriptStepDef)
+    step.execution = StepExecutionConfig(
+        secrets=[
+            StepSecretRef(ref="token", scope="script", delivery=SecretDelivery(env="TOKEN")),
+            StepSecretRef(ref="token", scope="script", delivery=SecretDelivery(env="TOKEN")),
+        ]
+    )
+    session = ExecutionResolverSession(_environment(), RecordingBackend())
+    with pytest.raises(ConfigurationError, match="collides within consumer 'run'"):
+        _engine(config, session)
 
 
 @pytest.mark.asyncio
@@ -394,7 +456,12 @@ async def test_mcp_step_connect_redacts_errors_for_binding_backed_server(
     fake_manager.connect_server = AsyncMock()
     monkeypatch.setattr("conductor.mcp.manager.MCPManager", MagicMock(return_value=fake_manager))
 
-    async def _passthrough(name: str, cfg: dict[str, Any]) -> dict[str, Any]:
+    captured: dict[str, Any] = {}
+
+    async def _passthrough(
+        name: str, cfg: dict[str, Any], *, secret_uses: Any = None
+    ) -> dict[str, Any]:
+        captured["secret_uses"] = secret_uses
         return cfg
 
     monkeypatch.setattr(
@@ -405,8 +472,94 @@ async def test_mcp_step_connect_redacts_errors_for_binding_backed_server(
     manager = await engine._get_mcp_step_manager("srv", "/tmp")
 
     assert manager is fake_manager
+    # The engine's own view threads its SecretUseIndex into resolution (b1):
+    # the provider connection path and the mcp-step path share one delivery
+    # contract.
+    assert captured["secret_uses"] is engine._execution_resolver.secret_uses
     connect_kwargs = fake_manager.connect_server.call_args.kwargs
     assert connect_kwargs["redact_errors"] is True
+
+
+def _mcp_secret_config(name: str = "mcp-secret", delivery_env: str = "SRV_TOKEN") -> WorkflowConfig:
+    """A config whose single step sits beside an MCP server declaring a secret."""
+    return WorkflowConfig(
+        workflow=WorkflowDef(
+            name=name,
+            entry_point="run",
+            runtime=RuntimeConfig(
+                provider="copilot",
+                mcp_servers={
+                    "srv": MCPServerDef(
+                        command="srv-command",
+                        secrets=[
+                            StepSecretRef(
+                                ref="token",
+                                scope="mcp",
+                                delivery=SecretDelivery(env=delivery_env),
+                            )
+                        ],
+                    )
+                },
+            ),
+            context=ContextConfig(mode="accumulate"),
+            limits=LimitsConfig(max_iterations=10),
+        ),
+        agents=[ScriptStepDef(name="run", command="run-command", routes=[RouteDef(to="$end")])],
+    )
+
+
+@pytest.mark.asyncio
+async def test_mcp_step_manager_delivers_declared_secret_env_to_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Requirement (review b1): with the REAL resolver (no stubbed
+    # resolve_mcp_server_config), the engine's own MCP-step connect path
+    # delivers the declared binding to connect_server as env — previously
+    # the binding was resolved and audited but the connection received
+    # env=None because this path never passed the SecretUseIndex.
+    monkeypatch.setenv(_TOKEN_VAR, "s3cr3t-value-0014")
+    session = ExecutionResolverSession(_environment(), RecordingBackend())
+    engine = _engine(_mcp_secret_config(), session)
+
+    fake_manager = MagicMock()
+    fake_manager.connect_server = AsyncMock()
+    monkeypatch.setattr("conductor.mcp.manager.MCPManager", MagicMock(return_value=fake_manager))
+
+    manager = await engine._get_mcp_step_manager("srv", "/tmp")
+
+    assert manager is fake_manager
+    connect_kwargs = fake_manager.connect_server.call_args.kwargs
+    assert connect_kwargs["env"] == {"SRV_TOKEN": "s3cr3t-value-0014"}
+    assert connect_kwargs["redact_errors"] is True
+
+
+@pytest.mark.asyncio
+async def test_child_mcp_step_manager_delivers_its_own_secret_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement (review b1): a sub-workflow child's MCP-step connect uses
+    # the CHILD's own resolver view — the child's declared binding resolves
+    # lazily over the shared run cache and reaches connect_server as env.
+    monkeypatch.setenv(_TOKEN_VAR, "child-srv-value")
+    child_path = tmp_path / "child.yaml"
+    child_path.write_text("child", encoding="utf-8")
+    session = ExecutionResolverSession(_environment(), RecordingBackend())
+    child = WorkflowEngine(
+        _mcp_secret_config(name="child", delivery_env="CHILD_SRV"),
+        MagicMock(),
+        workflow_path=child_path,
+        _execution_session=session,
+        _subworkflow_depth=1,
+    )
+
+    fake_manager = MagicMock()
+    fake_manager.connect_server = AsyncMock()
+    monkeypatch.setattr("conductor.mcp.manager.MCPManager", MagicMock(return_value=fake_manager))
+
+    await child._get_mcp_step_manager("srv", "/tmp")
+
+    connect_kwargs = fake_manager.connect_server.call_args.kwargs
+    assert connect_kwargs["env"] == {"CHILD_SRV": "child-srv-value"}
 
 
 @pytest.mark.asyncio

@@ -232,8 +232,24 @@ class ScriptExecutor:
 
     @staticmethod
     def _make_diagnostics() -> Callable[[str], None]:
-        """Adapt backend diagnostics to the existing verbose logger."""
-        return _verbose_log
+        """Adapt backend diagnostics to the existing verbose logger.
+
+        Backend diagnostics carry the child's stderr, so the text is scrubbed
+        through the run-scoped redactor (when one is active in the current
+        context) before reaching the verbose console / ``--log-file``: a
+        script that prints a delivered credential to stderr would otherwise
+        write it to both. The live subprocess result is untouched.
+        """
+
+        def _log_diagnostic(message: str) -> None:
+            from conductor import redaction
+
+            redactor = redaction.current()
+            if redactor is not None and redactor.active:
+                message = redactor.scrub(message)
+            _verbose_log(message)
+
+        return _log_diagnostic
 
     @staticmethod
     def _reconstruct_start_error(result: CommandResult) -> OSError:

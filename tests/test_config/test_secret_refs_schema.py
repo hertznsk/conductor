@@ -221,6 +221,67 @@ class TestMCPServerDefSecrets:
         assert server.secrets[0].delivery.env == "GITHUB_TOKEN"
 
 
+class TestWorkflowDefaultsSecrets:
+    """Tests for the ``workflow.defaults.execution`` position of StepExecutionConfig."""
+
+    def test_defaults_execution_rejects_secret_references(self) -> None:
+        # Requirement (review r2): StepExecutionConfig backs both step-level
+        # ``execution:`` blocks and ``workflow.defaults.execution``, but
+        # secret use-sites resolve per executable step — validation, manifest
+        # compilation, and indexing never inspect the defaults location, so a
+        # reference there would parse yet produce no delivery and no audit
+        # row. It is rejected at the schema until inheritance is designed.
+        from conductor.config.loader import load_config_string
+        from conductor.exceptions import ConfigurationError
+
+        with pytest.raises(ConfigurationError, match="not supported"):
+            load_config_string(
+                """\
+                workflow:
+                  name: defaults-secrets
+                  entry_point: run
+                  defaults:
+                    execution:
+                      secrets:
+                        - ref: token
+                          scope: script
+                          delivery:
+                            env: TOKEN
+                agents:
+                  - name: run
+                    type: script
+                    command: echo ok
+                    routes:
+                      - to: $end
+                """
+            )
+
+    def test_defaults_execution_profile_without_secrets_still_valid(self) -> None:
+        # Requirement: the defaults block keeps its long-standing profile
+        # role — only secret references are rejected there.
+        from conductor.config.loader import load_config_string
+
+        config = load_config_string(
+            """\
+            workflow:
+              name: defaults-profile
+              entry_point: run
+              defaults:
+                execution:
+                  profile: shell
+            agents:
+              - name: run
+                type: script
+                command: echo ok
+                routes:
+                  - to: $end
+            """
+        )
+        assert config.workflow.defaults.execution is not None
+        assert config.workflow.defaults.execution.profile == "shell"
+        assert config.workflow.defaults.execution.secrets == []
+
+
 class TestWorkflowConfigSecretRefsParsing:
     """Tests for full WorkflowConfig parsing of steps and MCP servers with secret references."""
 

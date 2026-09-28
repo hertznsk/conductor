@@ -320,3 +320,105 @@ def test_unknown_secret_ref_lists_available_names() -> None:
     message = str(exc_info.value)
     assert "missing" in message
     assert "available secrets: alpha, beta" in message
+
+
+# ---------------------------------------------------------------------------
+# Delivery collision checks at compile time (review b6) and provider transport
+# restrictions for remote env delivery (review r6)
+# ---------------------------------------------------------------------------
+
+
+def test_two_secret_refs_colliding_on_one_delivery_name_fail_at_compile() -> None:
+    # Requirement (review b6): two secret references targeting the same
+    # delivery variable collapse into one dictionary entry at delivery time
+    # (last credential wins) while the manifest still lists both. The
+    # collision is rejected at manifest compilation — the shared,
+    # platform-aware check — before any delivery dict is built, and normal
+    # execution hits this because the engine compiles the manifest even
+    # though it never runs the semantic validator.
+    config = _script_config(
+        _secret("alpha", "script", env="TOKEN"),
+        _secret("beta", "script", env="TOKEN"),
+    )
+    with pytest.raises(ConfigurationError, match="collides within consumer 'run'"):
+        compile_run_manifest(config, workflow_path=None, environment=_environment())
+
+
+def test_literal_env_case_insensitive_collision_fails_at_compile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Requirement (review b6): the runtime literal-collision backstop compares
+    # env names case-sensitively on POSIX, which misses the case-only overlap
+    # that Windows environment semantics make real. The compile-time check is
+    # platform-aware and rejects it there.
+    monkeypatch.setattr("sys.platform", "win32")
+    config = WorkflowConfig(
+        workflow=WorkflowDef(name="case-collision", entry_point="run"),
+        agents=[
+            ScriptStepDef(
+                name="run",
+                command="echo",
+                env={"Token": "authored"},
+                execution=StepExecutionConfig(secrets=[_secret("alpha", "script", env="TOKEN")]),
+                routes=[RouteDef(to="$end")],
+            )
+        ],
+        output={"result": "{{ run.output.stdout }}"},
+    )
+    with pytest.raises(ConfigurationError, match="collides within consumer 'run'"):
+        compile_run_manifest(config, workflow_path=None, environment=_environment())
+
+
+def test_mcp_secret_refs_colliding_on_one_header_fail_at_compile() -> None:
+    # Requirement (review b6): the same collapse exists for MCP header
+    # deliveries within one server (header names are always case-insensitive).
+    server = MCPServerDef(
+        type="http",
+        url="https://example.test",
+        secrets=[
+            _secret("alpha", "mcp", header="X-Api-Key"),
+            _secret("beta", "mcp", header="x-api-key"),
+        ],
+    )
+    with pytest.raises(ConfigurationError, match="collides within consumer 'mcp:server'"):
+        compile_run_manifest(_mcp_config(server), workflow_path=None, environment=_environment())
+
+
+def test_claude_agent_sdk_remote_env_delivery_is_rejected_at_compile() -> None:
+    # Requirement (review r6): env delivery on an http/sse server is rejected
+    # at manifest compilation when the workflow runs on claude-agent-sdk,
+    # whose remote config shape has no env field — the advertised
+    # configuration must fail with the header-delivery remedy instead of an
+    # opaque SDK error mid-run.
+    config = _mcp_config(
+        MCPServerDef(
+            type="http",
+            url="https://example.test",
+            secrets=[_secret("alpha", "mcp", env="REMOTE_TOKEN")],
+        )
+    )
+    config.workflow.runtime.provider = RuntimeConfig(provider="claude-agent-sdk").provider
+    with pytest.raises(ConfigurationError, match="cannot deliver environment variables"):
+        compile_run_manifest(config, workflow_path=None, environment=_environment())
+
+
+def test_claude_agent_sdk_remote_env_delivery_allowed_on_copilot() -> None:
+    # Requirement (review r6): the same configuration stays valid on a
+    # provider whose remote config carries per-server env (Copilot SDK).
+    config = _mcp_config(
+        MCPServerDef(
+            type="http",
+            url="https://example.test",
+            secrets=[_secret("alpha", "mcp", env="REMOTE_TOKEN")],
+        )
+    )
+    manifest = compile_run_manifest(config, workflow_path=None, environment=_environment())
+    assert manifest.secrets == (
+        ResolvedSecretUse(
+            consumer="mcp:server",
+            ref="alpha",
+            scope="mcp",
+            delivery_kind="env",
+            delivery_name="REMOTE_TOKEN",
+        ),
+    )

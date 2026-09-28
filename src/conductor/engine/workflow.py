@@ -936,7 +936,14 @@ class WorkflowEngine:
             server_config["env"] = server_def.env
         if server_def.timeout:
             server_config["timeout"] = server_def.timeout
-        resolved = await resolve_mcp_server_config(server_name, server_config)
+        # DRIFT HAZARD: secret delivery must mirror cli/run.py::_build_mcp_servers
+        # (the provider connection path) — a declared binding must not connect
+        # here with env=None while it was resolved and audited.
+        resolved = await resolve_mcp_server_config(
+            server_name,
+            server_config,
+            secret_uses=self._execution_resolver.secret_uses,
+        )
 
         try:
             manager = MCPManager(tool_output=self.config.workflow.runtime.tool_output)

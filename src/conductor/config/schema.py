@@ -3054,6 +3054,25 @@ class WorkflowDefaults(BaseModel):
     execution: StepExecutionConfig | None = None
     """Default execution profile for executable steps without their own block."""
 
+    @model_validator(mode="after")
+    def _reject_default_secret_references(self) -> WorkflowDefaults:
+        """Reject ``secrets`` under ``workflow.defaults.execution``.
+
+        ``StepExecutionConfig`` backs both step-level ``execution:`` blocks
+        and this defaults block, but secret use-sites are resolved per
+        executable step (manifest compilation, indexing, and validation only
+        walk steps and MCP servers). A default-block reference would be
+        silently ignored — no delivery, no audit row — so it is a schema
+        error until secret inheritance through defaults is designed.
+        """
+        if self.execution is not None and self.execution.secrets:
+            raise ValueError(
+                "workflow.defaults.execution.secrets is not supported: declare "
+                "execution.secrets on each step that consumes the secret. "
+                "Secret references are not inherited through workflow defaults."
+            )
+        return self
+
 
 class WorkflowDef(BaseModel):
     """Top-level workflow configuration."""

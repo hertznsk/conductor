@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import textwrap
 from pathlib import Path
 from typing import Any, Literal, cast
 from unittest.mock import ANY, patch
@@ -30,6 +31,7 @@ from conductor.config.schema import (
     WorkflowConfig,
     WorkflowDef,
     WorkflowDefaults,
+    WorkflowStepDef,
 )
 from conductor.config.validator import validate_workflow_config
 from conductor.exceptions import ConfigurationError
@@ -370,15 +372,80 @@ class TestExplicitEnvironment:
             warnings = _validate_explicit(config, environment, tmp_path)
         assert warnings == []
 
-    def test_unknown_ref_is_not_double_reported_by_the_validator(self, tmp_path: Path) -> None:
-        # Requirement: under --environment, unknown refs surface through manifest
-        # compilation (which runs first), so the validator stays silent on them.
+    def test_unknown_ref_is_rejected_by_the_validator(self, tmp_path: Path) -> None:
+        # Requirement: under --environment an unknown reference is reported by
+        # the validator itself. Only the ROOT manifest is compiled before
+        # validation (in cli/validate.py); this validator then recursively
+        # re-runs on child workflows, which no compilation covered — so the
+        # "compilation already rejected it" assumption does not hold there and
+        # the check must live here. For the root the CLI flow still fails
+        # earlier at compile time, so the error is not double-reported there.
         environment = _environment({"token": _binding("CONDUCTOR_TEST_TASK10_TOKEN")})
         config = _script_config(_secret("ghost", "script", env="TOKEN"))
         with pytest.MonkeyPatch.context() as monkeypatch:
             monkeypatch.setenv("CONDUCTOR_TEST_TASK10_TOKEN", "x")
-            warnings = _validate_explicit(config, environment, tmp_path)
-        assert warnings == []
+            with pytest.raises(ConfigurationError, match="not defined in environment 'test-env'"):
+                _validate_explicit(config, environment, tmp_path)
+
+    def test_claude_agent_sdk_remote_env_delivery_is_rejected(self, tmp_path: Path) -> None:
+        # Requirement (review r6): env delivery on an http/sse server is
+        # rejected at validation when the workflow runs on claude-agent-sdk,
+        # whose remote config shape has no env field — the docs direct remote
+        # MCP users to header delivery, and the message matches the manifest
+        # compiler's verbatim.
+        config = _mcp_config(
+            MCPServerDef(
+                type="http",
+                url="https://example.test",
+                secrets=[_secret("alpha", "mcp", env="REMOTE_TOKEN")],
+            )
+        )
+        config.workflow.runtime.provider = RuntimeConfig(provider="claude-agent-sdk").provider
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setenv("CONDUCTOR_TEST_TASK10_ALPHA", "x")
+            with pytest.raises(ConfigurationError, match="cannot deliver environment variables"):
+                _validate_explicit(config, _alpha_beta_environment(), tmp_path)
+
+    def test_nested_workflow_unknown_ref_is_rejected(self, tmp_path: Path) -> None:
+        # Requirement (review r3): a CHILD workflow referencing a binding the
+        # explicit environment does not define fails validate --environment
+        # even though only the root manifest was compiled — previously this
+        # passed validation and failed only when the child started executing.
+        environment = _environment({"token": _binding("CONDUCTOR_TEST_TASK10_TOKEN")})
+        child = tmp_path / "child.yaml"
+        child.write_text(
+            textwrap.dedent(
+                """\
+                workflow:
+                  name: child
+                  entry_point: inner
+                agents:
+                  - name: inner
+                    type: script
+                    command: run
+                    execution:
+                      secrets:
+                        - ref: ghost
+                          scope: script
+                          delivery:
+                            env: CHILD_TOKEN
+                    routes:
+                      - to: $end
+                """
+            )
+        )
+        config = _script_config(_secret("token", "script", env="TOKEN"))
+        config.agents.append(
+            WorkflowStepDef(name="sub", workflow="child.yaml", routes=[RouteDef(to="$end")])
+        )
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setenv("CONDUCTOR_TEST_TASK10_TOKEN", "x")
+            with pytest.raises(
+                ConfigurationError,
+                match=r"sub-workflow 'child.yaml' failed validation[\s\S]*"
+                r"not defined in environment 'test-env'",
+            ):
+                _validate_explicit(config, environment, tmp_path)
 
     def test_explicit_mode_never_discovers(self, tmp_path: Path) -> None:
         # Requirement: an explicit environment disables ambient discovery entirely.

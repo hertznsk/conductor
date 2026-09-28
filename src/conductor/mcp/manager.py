@@ -405,10 +405,30 @@ class MCPManager:
                     _scrub_log_value(str(truncation_err)),
                 )
 
+            # Scrub the COMPLETE response before slicing the preview: a secret
+            # starting inside the 200-char window would otherwise leave its
+            # leading characters in the log (exact-match redaction cannot see
+            # a value the slice truncated). A marker the boundary splits is
+            # completed rather than left as a broken token.
+            scrubbed = _scrub_log_value(response_text)
+            preview = scrubbed[:200]
+            # Complete a marker the boundary split — but only when a redactor
+            # actually replaced values: with no active redactor an ordinary
+            # response containing a literal ``***redacted***`` must log
+            # byte-identically to the pre-fix preview.
+            active = redaction.current()
+            if active is not None and active.active:
+                marker = redaction.REDACTED_MARKER
+                for width in range(len(marker) - 1, 0, -1):
+                    if preview.endswith(marker[:width]) and scrubbed[len(preview) :].startswith(
+                        marker[width:]
+                    ):
+                        preview = scrubbed[: len(preview) + (len(marker) - width)]
+                        break
             logger.debug(
                 "MCP tool '%s' returned: %s...",
                 original_name,
-                _scrub_log_value(response_text[:200]),
+                preview,
             )
             return response_text
 

@@ -142,6 +142,16 @@ class SecretValueCache:
         self._redactor = redactor
         self._cache: dict[str, ResolvedSecret] = {}
 
+    @property
+    def redactor(self) -> RunRedactor:
+        """The run redactor every resolved value is registered into.
+
+        Read-only accessor so session owners (``ExecutionResolverSession``)
+        can derive their sinks from the same pair a caller injected, instead
+        of building a parallel redactor the values never reach.
+        """
+        return self._redactor
+
     def resolve(self, ref: str, consumer_class: str, consumer_label: str) -> ResolvedSecret:
         """Resolve a secret reference for one consumer.
 

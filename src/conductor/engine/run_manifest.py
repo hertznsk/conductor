@@ -46,7 +46,8 @@ new model fields preserve reads of manifests written by earlier v1 producers.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
+import sys
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from types import MappingProxyType
 from typing import Literal
@@ -363,6 +364,47 @@ def _resolved_secret_use(
     )
 
 
+def _check_delivery_collisions(
+    consumer: str,
+    *,
+    literal_env: Iterable[str],
+    literal_headers: Iterable[str],
+    secrets: Iterable[StepSecretRef],
+) -> None:
+    """Reject delivery-name collisions within one consumer at compile time.
+
+    Mirrors ``config.validator._delivery_collision_errors`` with identical
+    wording, so the same mistake reads the same whether it surfaces at
+    ``conductor validate`` or at manifest compilation. Running here matters
+    because ``conductor run`` never invokes the semantic validator: without
+    it, two secret references collapsing onto one delivery name silently
+    let the last credential win in the delivery dicts, and a case-only
+    literal collision goes unnoticed on Windows, where environment variable
+    names are case-insensitive.
+    """
+    env_names = {name.casefold() if sys.platform == "win32" else name for name in literal_env}
+    header_names = {name.casefold() for name in literal_headers}
+    for secret in secrets:
+        delivery = secret.delivery
+        if delivery.env is not None:
+            env_key = delivery.env.casefold() if sys.platform == "win32" else delivery.env
+            if env_key in env_names:
+                raise ConfigurationError(
+                    f"Secret delivery name '{delivery.env}' collides within consumer "
+                    f"'{consumer}' (environment variable names must be unique)."
+                )
+            env_names.add(env_key)
+        else:
+            assert delivery.header is not None
+            header_key = delivery.header.casefold()
+            if header_key in header_names:
+                raise ConfigurationError(
+                    f"Secret delivery name '{delivery.header}' collides within consumer "
+                    f"'{consumer}' (HTTP header names are case-insensitive and must be unique)."
+                )
+            header_names.add(header_key)
+
+
 def _compile_step_secret_uses(
     key: str,
     step: ExecutableStepBase,
@@ -394,6 +436,15 @@ def _compile_step_secret_uses(
             )
         _require_known_secret_ref(secret, consumer=key, environment=environment)
         uses.append(_resolved_secret_use(key, secret, "script"))
+    # Non-script steps and agent-scope refs raised above, so the literal
+    # ``env`` keys to check against are the script step's own.
+    assert isinstance(step, ScriptStepDef)
+    _check_delivery_collisions(
+        key,
+        literal_env=step.env,
+        literal_headers=(),
+        secrets=secrets,
+    )
     return uses
 
 
@@ -424,8 +475,27 @@ def _compile_mcp_secret_uses(
                     f"secret '{secret.ref}' through an HTTP header.",
                     suggestion="Use delivery.env for stdio, or an HTTP/SSE transport for headers.",
                 )
+            if (
+                secret.delivery.env is not None
+                and server.type in ("http", "sse")
+                and config.workflow.runtime.provider.name == "claude-agent-sdk"
+            ):
+                raise ConfigurationError(
+                    f"MCP server '{server_name}' uses transport '{server.type}' with env "
+                    f"delivery for secret '{secret.ref}', but the claude-agent-sdk provider "
+                    "cannot deliver environment variables to remote MCP servers (its remote "
+                    "config shape accepts only url and headers).",
+                    suggestion="Use delivery.header (e.g. header: Authorization) for remote "
+                    "servers on the claude-agent-sdk provider.",
+                )
             _require_known_secret_ref(secret, consumer=consumer, environment=environment)
             uses.append(_resolved_secret_use(consumer, secret, "mcp"))
+        _check_delivery_collisions(
+            consumer,
+            literal_env=server.env,
+            literal_headers=server.headers,
+            secrets=server.secrets,
+        )
     return uses
 
 

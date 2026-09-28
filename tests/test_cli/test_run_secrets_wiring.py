@@ -10,6 +10,7 @@ are cleared (with the contextvar restored via token) in the outermost finally.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -237,6 +238,199 @@ async def test_run_prepares_secrets_before_inputs_print_and_scrubs(
     inputs_panel = printed[order.index("section:Workflow Inputs") - 1]
     assert secret not in inputs_panel
     assert REDACTED_MARKER in inputs_panel
+
+
+@pytest.mark.asyncio
+async def test_inputs_panel_scrubs_before_serialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement (review b4): secrets containing characters JSON escaping
+    # rewrites (quotes, backslashes, newlines) must still be scrubbed from
+    # the inputs panel — the scrub happens on the inputs mapping BEFORE
+    # json.dumps, not on the serialized string. The caller's inputs dict is
+    # never mutated.
+    secret = 'quote"back\\slash\nnewline-secret-77'
+    monkeypatch.setenv(_CLI_TOKEN_VAR, secret)
+    wf_path = _write_workflow(tmp_path)
+    _write_environment(tmp_path)
+
+    printed: list[str] = []
+
+    from conductor.cli import run as run_module
+
+    real_section = run_module.verbose_log_section
+
+    def spy_section(title: str, content: str) -> None:
+        printed.append(content)
+        return real_section(title, content)
+
+    monkeypatch.setattr(run_module, "verbose_log_section", spy_section)
+
+    inputs = {"key": secret}
+    from conductor.cli.run import run_workflow_async
+
+    with (
+        patch("conductor.cli.run.ProviderRegistry") as mock_registry_cls,
+        patch("conductor.cli.run.WorkflowEngine") as mock_engine_cls,
+    ):
+        _mock_registry_and_engine(mock_registry_cls, mock_engine_cls, "run")
+        await run_workflow_async(wf_path, inputs, environment="demo")
+
+    assert printed == [json.dumps({"key": REDACTED_MARKER}, indent=2, ensure_ascii=False)]
+    assert inputs == {"key": secret}
+
+
+@pytest.mark.asyncio
+class TestEscapingExceptionSink:
+    """Any exception escaping run/resume has its CLI-rendered fields scrubbed."""
+
+    @pytest.mark.asyncio
+    async def test_escaped_exception_is_scrubbed_before_redactor_cleanup(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Requirement (review b2): only WorkflowTerminated was sanitized at
+        # the boundary, so an ordinary exception whose message/suggestion
+        # embed a declared secret (e.g. a script echoing its credential into
+        # a field that fails an output-schema check) reached print_error —
+        # which runs AFTER the redactor is cleared — with plaintext. The
+        # raised exception and the actual CLI error renderer must both be
+        # clean.
+        secret = "escaped-exception-secret-1"
+        monkeypatch.setenv(_CLI_TOKEN_VAR, secret)
+        wf_path = _write_workflow(tmp_path)
+        _write_environment(tmp_path)
+
+        from conductor.exceptions import ExecutionError
+
+        failure = ExecutionError(
+            f"script output failed schema enum check: got '{secret}'",
+            suggestion=f"rotate the credential {secret}",
+        )
+
+        from conductor.cli.run import run_workflow_async
+
+        with (
+            patch("conductor.cli.run.ProviderRegistry") as mock_registry_cls,
+            patch("conductor.cli.run.WorkflowEngine") as mock_engine_cls,
+        ):
+            engine = MagicMock()
+            engine.run = AsyncMock(side_effect=failure)
+            engine.config.workflow.cost.show_summary = False
+            _wire_registry_with_engine(mock_registry_cls, mock_engine_cls, engine)
+            with pytest.raises(ExecutionError) as exc_info:
+                await run_workflow_async(wf_path, {}, environment="demo")
+
+        raised = exc_info.value
+        assert raised is failure
+        assert secret not in str(raised)
+        assert REDACTED_MARKER in str(raised)
+        assert raised.suggestion is not None
+        assert secret not in raised.suggestion
+        assert REDACTED_MARKER in raised.suggestion
+
+        # The actual CLI error renderer stays clean after cleanup cleared it.
+        from conductor.cli.app import print_error
+
+        print_error(raised)
+        rendered = capsys.readouterr().err
+        assert secret not in rendered
+        assert REDACTED_MARKER in rendered
+
+    @pytest.mark.asyncio
+    async def test_resume_escaped_exception_is_scrubbed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Requirement (review b2): the resume path mirrors run — an escaping
+        # exception is scrubbed before the CLI-owned redactor is cleared.
+        secret = "resume-exception-secret-2"
+        monkeypatch.setenv(_CLI_TOKEN_VAR, secret)
+        wf_path = _write_workflow(tmp_path)
+        _write_environment(tmp_path)
+        cp_path = _write_checkpoint(tmp_path, wf_path)
+
+        from conductor.exceptions import ExecutionError
+
+        failure = ExecutionError(f"resumed step failed with '{secret}'")
+
+        from conductor.cli.run import resume_workflow_async
+
+        with (
+            patch("conductor.cli.run.ProviderRegistry") as mock_registry_cls,
+            patch("conductor.cli.run.WorkflowEngine") as mock_engine_cls,
+            patch("conductor.cli.run._write_terminal_record_for_current_process"),
+        ):
+            engine = MagicMock()
+            engine.resume = AsyncMock(side_effect=failure)
+            engine.config.workflow.cost.show_summary = False
+            _wire_registry_with_engine(mock_registry_cls, mock_engine_cls, engine)
+            with pytest.raises(ExecutionError) as exc_info:
+                await resume_workflow_async(checkpoint_path=cp_path, environment="demo")
+
+        assert secret not in str(exc_info.value)
+        assert REDACTED_MARKER in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_script_stderr_diagnostics_are_scrubbed_real_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement (review b3): backend diagnostics carry the child's stderr,
+    # so a script printing its delivered credential to stderr must not write
+    # it to the verbose console / --log-file sink. Real ScriptExecutor +
+    # LocalRunnerBackend end to end — the live subprocess result itself is
+    # unchanged.
+    secret = "stderr-secret-value-0042"
+    monkeypatch.setenv(_CLI_TOKEN_VAR, secret)
+    program = "import os,sys; sys.stderr.write(os.environ['DELIVERED_TOKEN'])"
+    body = f"""\
+workflow:
+  name: cli-secrets-stderr
+  entry_point: run
+agents:
+  - name: run
+    type: script
+    command: {json.dumps(sys.executable)}
+    args: [{json.dumps("-c")}, {json.dumps(program)}]
+    execution:
+      secrets:
+        - ref: token
+          scope: script
+          delivery:
+            env: DELIVERED_TOKEN
+    routes:
+      - to: $end
+output:
+  result: "{{{{ run.output.stdout }}}}"
+"""
+    wf_path = _write_workflow(tmp_path, body)
+    _write_environment(tmp_path)
+
+    logged: list[str] = []
+
+    from conductor.cli import run as run_module
+
+    real_verbose_log = run_module.verbose_log
+
+    def spy_verbose_log(message: Any, style: str = "dim") -> None:
+        logged.append(str(message))
+        return real_verbose_log(message, style)
+
+    monkeypatch.setattr(run_module, "verbose_log", spy_verbose_log)
+
+    from conductor.cli.run import run_workflow_async
+
+    with patch("conductor.cli.run.ProviderRegistry") as mock_registry_cls:
+        mock_registry = AsyncMock()
+        mock_registry_cls.return_value = mock_registry
+        mock_registry.__aenter__ = AsyncMock(return_value=mock_registry)
+        mock_registry.__aexit__ = AsyncMock(return_value=False)
+        result = await run_workflow_async(wf_path, {}, environment="demo")
+
+    rendered = "\n".join(logged)
+    assert secret not in rendered
+    assert REDACTED_MARKER in rendered
+    # The live result is unaffected: the step ran and routed to $end.
+    assert result == {"result": ""}
 
 
 @pytest.mark.asyncio
@@ -618,6 +812,42 @@ class TestDashboardReplaySink:
         assert REDACTED_MARKER in history
         assert log.read_bytes() == before
 
+    def test_replay_preserves_event_envelope_when_secret_matches_event_type(
+        self, tmp_path: Path
+    ) -> None:
+        # Requirement (review r4): replay scrubs only the ``data`` payload and
+        # preserves the envelope's ``type`` and ``timestamp`` — exactly what
+        # live emission guarantees. A registered secret equal to part of an
+        # event type (e.g. ``completed``) must not rewrite ``agent_completed``
+        # into an undispatchable ``agent_***redacted***`` (whose positive
+        # replay count would also block the synthetic-history fallback).
+        from conductor.web.server import WebDashboard
+
+        dashboard = WebDashboard(WorkflowEventEmitter(), host="127.0.0.1", port=0)
+        redactor = RunRedactor()
+        redactor.register(["completed"])
+        dashboard.set_redactor(redactor)
+        log = tmp_path / "prior.events.jsonl"
+        log.write_text(
+            json.dumps(
+                {
+                    "type": "agent_completed",
+                    "timestamp": 1.0,
+                    "data": {"output": "task completed"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        count = dashboard.replay_events_from_jsonl(log)
+
+        assert count == 1
+        (event,) = dashboard._event_history  # noqa: SLF001
+        assert event["type"] == "agent_completed"
+        assert event["timestamp"] == 1.0
+        assert event["data"] == {"output": f"task {REDACTED_MARKER}"}
+
     def test_replay_synthetic_from_context_scrubs_agent_outputs(self) -> None:
         # Requirement: synthetic *_started/*_completed pairs carry
         # agent_outputs from the checkpoint context — a declared value in an
@@ -784,8 +1014,9 @@ class TestInactiveSinkParity:
         # Requirement: with no declared secrets the redactor never activates:
         # the returned output is the very object the engine produced, the
         # terminal record receives that same object, and a spy on
-        # RunRedactor.scrub proves every call was an identity passthrough
-        # (zero copies) — the pre-secrets behavior is byte-identical.
+        # RunRedactor.scrub proves no scrub call happens at all — every sink
+        # short-circuits on the active check (zero copies) — so the
+        # pre-secrets behavior is byte-identical.
         wf_path = _write_workflow(tmp_path, _PLAIN_WORKFLOW)
         engine_raw = {"result": "ok"}
         scrub_calls: list[tuple[Any, Any]] = []
@@ -812,8 +1043,7 @@ class TestInactiveSinkParity:
             result = await run_workflow_async(wf_path, {"key": "plain"}, environment=None)
 
         assert result is engine_raw
-        assert scrub_calls
-        assert all(original is scrubbed for original, scrubbed in scrub_calls)
+        assert not scrub_calls
         record_kwargs = mock_record.call_args.kwargs
         assert record_kwargs["status"] == "success"
         assert record_kwargs["output"] is engine_raw

@@ -1699,6 +1699,21 @@ def _validate_secret_references(
                     f"deliver secret '{secret.ref}' through an HTTP header."
                 )
                 continue
+            if (
+                secret.delivery.env is not None
+                and server.type in ("http", "sse")
+                and config.workflow.runtime.provider.name == "claude-agent-sdk"
+            ):
+                # Mirrors the manifest compiler's message verbatim, so the
+                # same unsupported combination reads the same at validate
+                # time and at run time.
+                errors.append(
+                    f"MCP server '{server_name}' uses transport '{server.type}' with env "
+                    f"delivery for secret '{secret.ref}', but the claude-agent-sdk provider "
+                    "cannot deliver environment variables to remote MCP servers (its remote "
+                    "config shape accepts only url and headers)."
+                )
+                continue
             references.append((secret.ref, secret.scope, consumer))
         errors.extend(
             _delivery_collision_errors(
@@ -1711,10 +1726,12 @@ def _validate_secret_references(
 
     context["refs_found"] = True
     if context["explicit"]:
-        # The explicitly resolved environment is authoritative: unknown refs
-        # already failed manifest compilation (which runs first), so only the
-        # allow list — which the compiler does not check — and unset sources
-        # are reported here.
+        # The explicitly resolved environment is authoritative. Unknown refs
+        # are reported here (not assumed to have failed compilation): only
+        # the root manifest is compiled before this validator recursively
+        # re-runs on child workflows, so a child reference has no compilation
+        # choke point above it. The allow list — which the compiler does not
+        # check — and unset sources are likewise reported here.
         environments = context["environments"] or {}
         environment = next((item for item in environments.values() if item is not None), None)
         if environment is None:
@@ -1723,6 +1740,14 @@ def _validate_secret_references(
         for reference, scope, consumer in references:
             binding = bindings.get(reference)
             if binding is None:
+                # Only the root manifest is compiled before this validator
+                # recursively re-runs on child workflows (which no manifest
+                # compilation covered), so an unknown reference is reported
+                # here rather than assumed to have been rejected already.
+                errors.append(
+                    f"Secret reference '{reference}' used by '{consumer}' is not defined "
+                    f"in environment '{environment.name}'."
+                )
                 continue
             if binding.allow is not None and scope not in binding.allow:
                 allowed = ", ".join(binding.allow) if binding.allow else "none"

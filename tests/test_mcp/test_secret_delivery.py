@@ -292,6 +292,26 @@ async def _log_response_preview(manager: Any) -> None:
         await manager.call_tool("server__tool", {})
 
 
+def _make_preview_boundary_exercise(marker_width: int) -> Callable[[Any], Awaitable[None]]:
+    """A response whose secret starts ``marker_width`` chars before the preview cut."""
+
+    async def _exercise(manager: Any) -> None:
+        # Requirement (review r5): the debug preview is built from the
+        # COMPLETE scrubbed response and only then truncated to 200 chars —
+        # a secret starting inside the preview window must not leave its
+        # leading characters in the log (exact-match redaction cannot see a
+        # value the slice truncated), at every marker-split width.
+        session = AsyncMock()
+        session.call_tool.return_value = _tool_result(f"{'x' * (200 - marker_width)}{_SECRET}")
+        manager.tool_to_server["server__tool"] = "server"
+        manager.sessions["server"] = session
+        text_type = type(session.call_tool.return_value.content[0])
+        with patch("conductor.mcp.manager.TextContent", text_type):
+            await manager.call_tool("server__tool", {})
+
+    return _exercise
+
+
 async def _log_tool_exception(manager: Any) -> None:
     session = AsyncMock()
     session.call_tool.side_effect = RuntimeError(f"tool stderr {_SECRET}")
@@ -373,6 +393,9 @@ async def _log_cancellation_exception(manager: Any) -> None:
     [
         pytest.param(_log_tool_arguments, id="tool-arguments"),
         pytest.param(_log_response_preview, id="response-preview"),
+        pytest.param(_make_preview_boundary_exercise(1), id="response-preview-boundary-width-1"),
+        pytest.param(_make_preview_boundary_exercise(7), id="response-preview-boundary-width-7"),
+        pytest.param(_make_preview_boundary_exercise(13), id="response-preview-boundary-width-13"),
         pytest.param(_log_tool_exception, id="tool-exception"),
         pytest.param(_log_truncation_exception, id="truncation-exception"),
         pytest.param(_log_connect_exception, id="connect-exception"),
@@ -396,3 +419,27 @@ async def test_manager_dynamic_log_sinks_scrub_active_secret(
 
     assert _SECRET not in caplog.text
     assert REDACTED_MARKER in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_manager_preview_is_byte_stable_without_active_redactor(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Requirement (review r5, zero-noise round): with NO active redactor an
+    # ordinary response containing a literal ``***redacted***`` crossing the
+    # 200-char preview boundary logs exactly the pre-fix preview — the
+    # marker completion must not fire when no replacement happened.
+    manager = _manager()
+    session = AsyncMock()
+    session.call_tool.return_value = _tool_result(f"{'y' * 190}{REDACTED_MARKER}tail")
+    manager.tool_to_server["server__tool"] = "server"
+    manager.sessions["server"] = session
+    text_type = type(session.call_tool.return_value.content[0])
+    caplog.set_level(logging.DEBUG, logger="conductor.mcp.manager")
+    with patch("conductor.mcp.manager.TextContent", text_type):
+        await manager.call_tool("server__tool", {})
+
+    message = next(r.getMessage() for r in caplog.records if "returned:" in r.getMessage())
+    # The preview is cut mid-token at exactly 200 chars, as before the fix.
+    assert f"{'y' * 190}{REDACTED_MARKER[:10]}..." in message
+    assert f"{'y' * 190}{REDACTED_MARKER}" not in message

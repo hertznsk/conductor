@@ -20,7 +20,12 @@ from conductor.engine.run_manifest import (
     compile_run_manifest,
     executable_step_identity,
 )
-from conductor.engine.secrets import IndexedSecretUse, SecretValueCache, index_config
+from conductor.engine.secrets import (
+    IndexedSecretUse,
+    SecretUseIndex,
+    SecretValueCache,
+    index_config,
+)
 from conductor.execution import (
     LocalRunnerBackend,
     RunnerBackend,
@@ -43,14 +48,34 @@ class ExecutionResolverSession:
         secret_cache: SecretValueCache | None = None,
         redactor: RunRedactor | None = None,
     ) -> None:
-        """Create a session seeded with the run's local backend instance."""
+        """Create a session seeded with the run's local backend instance.
+
+        Secret-primitive pairing: when a ``secret_cache`` is injected without
+        a redactor, the session redactor is derived from the cache (the one
+        its values are registered into) so runtime sinks scrub exactly the
+        values the cache resolved. An explicitly injected ``(cache, redactor)``
+        pair whose two members are not the same objects is a wiring bug:
+        delivered values would be registered into one redactor while sinks
+        scrub with the other, so it is rejected here rather than discovered
+        as an unredacted leak later.
+        """
         self.environment = environment
         self.backends: dict[str, RunnerBackend] = {
             "local": default_backend or LocalRunnerBackend(),
         }
         self.leases: dict[str, WorkspaceLease] = {}
         self._owns_secrets = secret_cache is None
-        self._redactor = redactor
+        if secret_cache is not None:
+            if redactor is not None and secret_cache.redactor is not redactor:
+                raise ValueError(
+                    "secret_cache and redactor must belong to the same run pair "
+                    "(the cache's redactor is the one its resolved values are "
+                    "registered into); derive the session redactor from the "
+                    "injected cache instead of passing a separate instance."
+                )
+            self._redactor = secret_cache.redactor
+        else:
+            self._redactor = redactor
         self._secret_cache = secret_cache
 
     @property
@@ -210,3 +235,15 @@ class ExecutionResolver:
     def deliveries_for_server(self, name: str) -> tuple[IndexedSecretUse, ...]:
         """Return this view's secret deliveries for one MCP server."""
         return self._secret_uses.deliveries_for_server(name)
+
+    @property
+    def secret_uses(self) -> SecretUseIndex:
+        """This view's per-config secret-use index.
+
+        Exposed so MCP configuration resolution (``type: mcp`` steps connect
+        in the engine, not the CLI) can deliver this config's declared secret
+        values, exactly as ``_build_mcp_servers`` does for the provider
+        connection path. Values are read through the cache at delivery time;
+        the index itself never holds plaintext.
+        """
+        return self._secret_uses

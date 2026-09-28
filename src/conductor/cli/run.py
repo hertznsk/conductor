@@ -2193,6 +2193,26 @@ def _remove_run_record_for_current_process_safe() -> None:
         logger.warning("Failed to remove fleet run record", exc_info=True)
 
 
+def _scrub_exception_fields(exc: BaseException, redactor: RunRedactor) -> None:
+    """Scrub registered secret values from the fields a CLI error render reads.
+
+    ``print_error`` renders ``str(exc)`` (the exception args) and, for
+    :class:`~conductor.exceptions.ConductorError`, the ``suggestion`` — both
+    may embed a declared secret (e.g. a script output that echoed its bound
+    credential failing an output-schema check). This runs at the run/resume
+    boundary *before* the redactor is cleared, so an escaping exception
+    cannot carry plaintext past the sinks that were already scrubbed. The
+    exception class, ``__cause__`` chain, and classification are untouched;
+    only string args and the suggestion are replaced, in place, on the
+    exception object that is already on its way out.
+    """
+    exc.args = tuple(redactor.scrub(arg) if isinstance(arg, str) else arg for arg in exc.args)
+    from conductor.exceptions import ConductorError
+
+    if isinstance(exc, ConductorError) and exc.suggestion is not None:
+        exc.suggestion = redactor.scrub(exc.suggestion)
+
+
 def _scrub_workflow_terminated(
     exc: WorkflowTerminated,
     redactor: RunRedactor | None,
@@ -2556,12 +2576,15 @@ async def run_workflow_async(
         if inputs:
             # ``ensure_ascii=False`` so the panel shows real non-ASCII input values
             # rather than ``\uXXXX`` escapes (issue #356). The active run
-            # redactor scrubs the rendered content first (identity passthrough
-            # when no secrets are registered, so a secret-less run is
-            # byte-identical).
+            # redactor scrubs the *inputs* before serialization — scrubbing
+            # the serialized string instead would miss any secret containing
+            # quotes, backslashes, or newlines, which JSON escaping rewrites
+            # (identity passthrough when no secrets are registered, so a
+            # secret-less run is byte-identical, and the inputs mapping
+            # itself is never mutated).
             verbose_log_section(
                 "Workflow Inputs",
-                secret_redactor.scrub(json.dumps(inputs, indent=2, ensure_ascii=False)),
+                json.dumps(secret_redactor.scrub_event_data(inputs), indent=2, ensure_ascii=False),
             )
 
         # Apply provider override if specified.
@@ -2781,6 +2804,11 @@ async def run_workflow_async(
             # already captured where it was raised, above, and re-raising
             # it here must not clobber that with a generic "failed"/no
             # message (MCP server plan E2).
+            if secret_redactor is not None and secret_redactor.active:
+                # The escaping exception reaches ``cli.app.print_error``
+                # AFTER the redactor is cleared below, so the fields the
+                # error renderer reads are scrubbed here at the boundary.
+                _scrub_exception_fields(exc, secret_redactor)
             terminal_status = "failed"
             terminal_error_type = type(exc).__name__
             terminal_error_message = str(exc)
@@ -3761,6 +3789,8 @@ async def resume_workflow_async(
             # `WorkflowTerminated` branch above -- a setup error before the
             # engine ever ran (checkpoint resolution, config load, ...) or
             # one that escaped the inner try/except (MCP server plan E2).
+            if secret_redactor is not None and secret_redactor.active:
+                _scrub_exception_fields(exc, secret_redactor)
             terminal_status = "failed"
             terminal_error_type = type(exc).__name__
             terminal_error_message = str(exc)

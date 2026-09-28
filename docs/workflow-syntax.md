@@ -3144,8 +3144,8 @@ Each secret reference in `secrets:` contains:
 
 ### Delivery Targets (`delivery`)
 
-- **`env`**: Injects the secret value into an environment variable for the script subprocess or MCP server. Supported on `script` steps and all MCP server transports (`stdio`, `http`, `sse`). Must be a valid shell identifier (`[A-Za-z_][A-Za-z0-9_]*`).
-- **`header`**: Injects the secret value as an HTTP request header. Supported on HTTP and SSE MCP servers. Header names must follow RFC 9110 token rules (`[!#$%&'*+\-.^_`|~0-9A-Za-z]+`). Header delivery is rejected on script steps and stdio MCP servers.
+- **`env`**: Injects the secret value into an environment variable for the script subprocess or MCP server. Supported on `script` steps and on stdio MCP servers for every MCP-capable provider. On `http`/`sse` MCP servers, `env` delivery additionally requires a provider whose remote-server config shape carries per-server environment variables (today: the Copilot SDK) — the `claude-agent-sdk` provider rejects that combination at validation and at manifest compilation, so use `header` delivery for remote servers there. Must be a valid shell identifier (`[A-Za-z_][A-Za-z0-9_]*`).
+- **`header`**: Injects the secret value as an HTTP request header. Supported on HTTP and SSE MCP servers for every MCP-capable provider. Header names must follow RFC 9110 token rules (`[!#$%&'*+\-.^_`|~0-9A-Za-z]+`). Header delivery is rejected on script steps and stdio MCP servers.
 
 ### Scope and Validation Rules
 

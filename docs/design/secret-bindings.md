@@ -17,7 +17,7 @@ Before this feature, workflows relied on ad-hoc ambient environment variable ref
 - **Scattered redaction**: Sensitive tokens lacked unified run-scoped redaction across logs, events, checkpoints, and diagnostics.
 - **Lack of auditability**: Run manifests could not verify or audit which secrets a workflow step consumed.
 
-The secret bindings contract solves these problems by providing an explicit, validated boundary between workflow author intent and operator configuration.
+The secret bindings contract addresses these problems by providing an explicit, validated boundary between workflow author intent and operator configuration. The boundary is about *declared* consumption: ambient inheritance stays the local default (see "Binding Authorization vs. Process Isolation" below), and the contract's guarantees are typed resolution, targeted delivery, audit, and sink redaction — not sandboxing of trusted local workflow code.
 
 ## Trust Model
 
@@ -26,6 +26,10 @@ The security model separates roles and responsibilities:
 1. **Workflow Author**: Defines what logical secrets a step needs (`ref: "api_token"`, `scope: "script"`, `delivery: {env: "API_TOKEN"}`). The author cannot bind credentials directly to host sources.
 2. **Environment Operator**: Controls the execution environment document (`.conductor/environments/<name>.yaml`). The operator maps logical secret references to actual sources (for example, host environment variables) and enforces consumer-class access restrictions via `allow` lists.
 3. **Consumer Code**: Scripts, tools, and MCP servers receive delivered secrets. Any credential delivered to an LLM agent, script, or MCP server is considered accessible to that execution realm. Authors and operators must grant only the credentials required for that specific step.
+
+### Binding Authorization vs. Process Isolation
+
+The `allow` list governs typed resolution only: it decides which consumer *classes* may receive a delivered value through a binding. It is not process isolation. Local runner profiles inherit the control process's full `os.environ` by default (`inherit_control_environment` effective `true`), so a script step whose binding says `allow: [mcp]` — or even `allow: []` — can still read the source variable from its inherited environment if it knows the variable name. Operators who need that boundary set `inherit_control_environment: false` on the profile, which runs steps on a minimal environment plus the declared deliveries. Local workflow code remains trusted input regardless: it can always echo, transform, or exfiltrate any credential delivered to it, and sink redaction degrades such echoes to a marker only at Conductor-controlled sinks, never inside the consumer's own process.
 
 ## Grammar and Syntax
 
@@ -110,8 +114,15 @@ workflow:
 - **Delivery Targets**: `SecretDelivery` supports `env` (valid shell identifier) or `header` (RFC 9110 token charset). Exactly one target must be specified.
 - **Scope Dictionary**:
   - `script`: Valid on script steps. Delivery must be `env`.
-  - `mcp`: Valid on MCP servers. Stdio servers require `env` delivery; HTTP/SSE servers support `env` and `header` deliveries.
+  - `mcp`: Valid on MCP servers. Stdio servers require `env` delivery; HTTP/SSE servers support `env` and `header` deliveries, subject to the provider restrictions below.
   - `agent`: Reserved for future agent execution realms (step 7). Declaring `scope: agent` is rejected at validation and manifest compilation time.
+
+### Transport and Provider Restrictions
+
+Delivery targets are additionally bounded by what the selected provider's MCP transport accepts:
+
+- **stdio servers**: `env` delivery works on every MCP-capable provider — the server is a local child process Conductor spawns, so an environment variable is always meaningful.
+- **http/sse servers**: `header` delivery works on every MCP-capable provider. `env` delivery additionally requires a provider whose remote-server config shape carries per-server environment variables (today: the Copilot SDK). The `claude-agent-sdk` provider translates remote servers into a config shape with only `url` and `headers`, so `env` delivery on an http/sse server is rejected at `conductor validate` and at manifest compilation time when the workflow runs on that provider — the remedy is `header` delivery (for example `header: Authorization`).
 
 ### Collision Rules
 
@@ -159,7 +170,7 @@ Conductor scrubs registered secret values across all standard output, diagnostic
 1. **Event Emitter** (`conductor.events`): `WorkflowEventEmitter.emit` scrubs event payloads before notifying subscribers.
 2. **Checkpoint Payloads** (`conductor.engine.checkpoint`): `save_checkpoint` scrubs a deep copy of the checkpoint dictionary prior to serialization. Live memory context is not mutated.
 3. **Terminal Run Records** (`conductor.fleet.records`): Completed run records (`record_output`, `record_error_type`, `record_error_message`) are scrubbed before being written to disk.
-4. **Final Output Boundary** (`conductor.cli.run`): Final workflow results returned to stdout and caught `WorkflowTerminated` exceptions are scrubbed at the CLI boundary.
+4. **Final Output Boundary** (`conductor.cli.run`): Final workflow results returned to stdout and caught `WorkflowTerminated` exceptions are scrubbed at the CLI boundary, as are the message and suggestion fields of any other exception that escapes the run or resume path before secret cleanup (the CLI error renderer runs after the redactor is cleared, so the scrub happens at the boundary).
 5. **Telemetry Closure** (`conductor.telemetry`): Telemetry shutdown events and subscriber close payloads are sanitized before export.
 6. **Dashboard & Event Replay**: Replayed events and seeded `workflow_started` metadata are scrubbed before client transmission.
 7. **CLI Inputs Panel**: The startup input display scrubs values before rendering.

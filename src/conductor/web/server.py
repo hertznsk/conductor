@@ -809,7 +809,7 @@ class WebDashboard:
                     continue
                 if event_type in self._REPLAY_ROOT_SKIP_TYPES and self._is_root_event(event_dict):
                     continue
-            self._event_history.append(self._scrub_replay_payload(event_dict))
+            self._event_history.append(self._scrub_replay_event(event_dict))
             count += 1
 
         logger.info("Replayed %d events from %s", count, path)
@@ -1791,7 +1791,7 @@ class WebDashboard:
         self._redactor = redactor
 
     def _scrub_replay_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Scrub one replay payload through the attached redactor.
+        """Scrub one payload dict through the attached redactor.
 
         Returns the payload unchanged — zero copies — when no redactor is
         attached or it is inactive; otherwise a sanitized copy. The caller's
@@ -1803,3 +1803,21 @@ class WebDashboard:
             return payload
         scrubbed = redactor.scrub(payload)
         return scrubbed if isinstance(scrubbed, dict) else payload
+
+    def _scrub_replay_event(self, event_dict: dict[str, Any]) -> dict[str, Any]:
+        """Scrub one replayed event envelope, preserving its protocol fields.
+
+        Only the ``data`` payload is scrubbed — the envelope's ``type`` and
+        ``timestamp`` are protocol fields and survive verbatim, exactly as
+        live emission preserves them (a registered secret equal to part of an
+        event type, e.g. ``completed``, must not rewrite ``agent_completed``
+        into an undispatchable ``agent_***redacted***``). Identity
+        passthrough when no redactor is attached or inactive.
+        """
+        redactor = self._redactor
+        if redactor is None or not redactor.active:
+            return event_dict
+        data = event_dict.get("data")
+        if not isinstance(data, dict):
+            return event_dict
+        return {**event_dict, "data": redactor.scrub_event_data(data)}
