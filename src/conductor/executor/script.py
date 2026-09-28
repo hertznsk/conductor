@@ -92,6 +92,8 @@ class ScriptExecutor:
         *,
         lease: WorkspaceLease | None = None,
         backend: RunnerBackend | None = None,
+        secret_env: dict[str, str] | None = None,
+        inherit_control_environment: bool = True,
     ) -> ScriptOutput:
         """Execute a script step.
 
@@ -109,6 +111,15 @@ class ScriptExecutor:
                 caller has none (default None).
             backend: Optional per-call backend override. When omitted, uses the
                 backend supplied at construction.
+            secret_env: Optional resolved secret deliveries (environment
+                variable name → plaintext value) merged verbatim into the
+                command's environment. ``None`` (the default) keeps the
+                pre-secrets behavior exactly.
+            inherit_control_environment: Effective inheritance policy from the
+                compiled run manifest. When False, the backend runs the command
+                on a minimal environment plus ``env`` instead of merging over
+                the control process's environment. Defaults to True (the local
+                backend's long-standing behavior).
 
         Returns:
             :class:`ScriptOutput` with stdout, stderr, exit_code, and stdin_bytes.
@@ -125,6 +136,16 @@ class ScriptExecutor:
         rendered_working_dir = (
             self.renderer.render(agent.working_dir, context) if agent.working_dir else None
         )
+        # Declared ``env`` values pass through verbatim — they are NOT
+        # Jinja-rendered, matching the long-standing contract. Secret
+        # deliveries merge on top verbatim as well (a secret value containing
+        # ``{{`` must reach the child byte-identically). A name collision
+        # between the two is rejected as a ``ConfigurationError`` by the
+        # engine's ``_execute_script`` before this call, so the plain update
+        # here cannot silently shadow an authored variable.
+        merged_env = dict(agent.env)
+        if secret_env:
+            merged_env.update(secret_env)
 
         # Render the optional stdin payload. ``None`` means "inherit the
         # parent's stdin" (the legacy behavior); any string — including an
@@ -164,7 +185,8 @@ class ScriptExecutor:
             command=rendered_command,
             args=tuple(rendered_args),
             working_dir=rendered_working_dir,
-            env=dict(agent.env),
+            env=merged_env,
+            inherit_control_environment=inherit_control_environment,
             stdin=stdin_payload,
             timeout=agent.timeout,
         )

@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from conductor import redaction
 from conductor.billing import BillingMode, aggregate_label
 from conductor.config.environment import ResolvedEnvironment, builtin_local_environment
 from conductor.config.schema import (
@@ -44,12 +45,14 @@ from conductor.engine.limits import LimitEnforcer
 from conductor.engine.pricing import ModelPricing
 from conductor.engine.router import Router, RouteResult
 from conductor.engine.run_manifest import executable_step_identity
+from conductor.engine.secrets import SecretValueCache
 from conductor.engine.usage import UsageTracker, WorkflowUsage
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.exceptions import (
     AgentTimeoutError,
     BudgetExceededError,
     ConductorError,
+    ConfigurationError,
     ExecutionError,
     InterruptError,
     MaxIterationsError,
@@ -93,6 +96,7 @@ from conductor.gates.interrupt import InterruptAction, InterruptHandler, Interru
 from conductor.mcp_auth import resolve_mcp_server_config
 from conductor.providers.base import AgentOutput, EventCallback
 from conductor.providers.capabilities import native_otel_spans_active
+from conductor.redaction import RunRedactor
 from conductor.telemetry import guards
 
 logger = logging.getLogger(__name__)
@@ -522,6 +526,8 @@ class WorkflowEngine:
         _inherited_bg_mode: bool = False,
         execution_backend: RunnerBackend | None = None,
         execution_environment: ResolvedEnvironment | None = None,
+        secret_cache: SecretValueCache | None = None,
+        redactor: RunRedactor | None = None,
         _execution_session: ExecutionResolverSession | None = None,
         _workspace_lease: WorkspaceLease | None = None,
     ) -> None:
@@ -630,12 +636,16 @@ class WorkflowEngine:
             self._execution_session = ExecutionResolverSession(
                 builtin_local_environment(),
                 default_backend=execution_backend,
+                secret_cache=secret_cache,
+                redactor=redactor,
             )
             if _workspace_lease is not None:
                 self._execution_session.leases["local"] = _workspace_lease
         else:
             self._execution_session = ExecutionResolverSession(
-                execution_environment or builtin_local_environment()
+                execution_environment or builtin_local_environment(),
+                secret_cache=secret_cache,
+                redactor=redactor,
             )
 
         manifest_workflow_path = Path(workflow_path) if workflow_path is not None else None
@@ -1855,8 +1865,31 @@ class WorkflowEngine:
                 executable_step_identity(agent.name, for_each_group=for_each_group)
             ].backend
         )
+        secret_env = self._execution_resolver.secret_env_for_step(
+            agent.name,
+            for_each_group=for_each_group,
+        )
+        collision = set(agent.env).intersection(secret_env)
+        if collision:
+            names = ", ".join(sorted(collision))
+            raise ConfigurationError(
+                f"Script step '{agent.name}' declares environment variable(s) {names} "
+                "in both 'env' and secret delivery.",
+                suggestion="Remove the duplicate from the step's 'env' mapping or choose a "
+                "different secret delivery name.",
+            )
         return await self.limits.wait_for_with_timeout(
-            self.script_executor.execute(agent, context, lease=lease, backend=backend),
+            self.script_executor.execute(
+                agent,
+                context,
+                lease=lease,
+                backend=backend,
+                secret_env=secret_env,
+                inherit_control_environment=self._execution_resolver.inherit_env_for_step(
+                    agent.name,
+                    for_each_group=for_each_group,
+                ),
+            ),
             operation_name=f"script '{agent.name}'",
         )
 
@@ -2283,16 +2316,20 @@ class WorkflowEngine:
         path = self._mcp_diagnostic_path()
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
+            diagnostic = (
+                f"=== {_time.strftime('%Y-%m-%d %H:%M:%S')} step={agent_name!r} "
+                f"server={server!r} tool={tool!r} ===\n"
+            )
+            if exc is not None:
+                diagnostic += "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            elif detail is not None:
+                diagnostic += detail
+            diagnostic += "\n"
+            active_redactor = redaction.current()
+            if active_redactor is not None:
+                diagnostic = active_redactor.scrub(diagnostic)
             with open(path, "a", encoding="utf-8") as fh:
-                fh.write(
-                    f"=== {_time.strftime('%Y-%m-%d %H:%M:%S')} step={agent_name!r} "
-                    f"server={server!r} tool={tool!r} ===\n"
-                )
-                if exc is not None:
-                    fh.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
-                elif detail is not None:
-                    fh.write(detail)
-                fh.write("\n")
+                fh.write(diagnostic)
         except OSError as write_exc:
             logger.warning(
                 "Failed to write MCP step diagnostic for '%s': %s", agent_name, write_exc
@@ -3417,8 +3454,12 @@ class WorkflowEngine:
         # from cancellation. Defaults to "failed": anything reaching the
         # finally without setting it died on an unexpected path.
         outcome: RunOutcome = "failed"
+        redaction_token = None
         try:
             if self._subworkflow_depth == 0:
+                if self._execution_session.owns_secrets:
+                    self._execution_session.reset_secrets()
+                    self._execution_resolver.refresh_secret_uses()
                 await self._execution_session.prepare_leases(
                     RunSpec(
                         run_id=self._run_id,
@@ -3426,6 +3467,11 @@ class WorkflowEngine:
                     )
                 )
                 self._workspace_lease = self._execution_session.lease_for_backend("local")
+                set_redactor = getattr(self._event_emitter, "set_redactor", None)
+                if set_redactor is not None:
+                    set_redactor(self._execution_session.redactor)
+                if redaction.current() is not self._execution_session.redactor:
+                    redaction_token = redaction.set_current(self._execution_session.redactor)
             result = await self._execute_loop(current_agent_name)
         except asyncio.CancelledError:
             outcome = "cancelled"
@@ -3450,8 +3496,12 @@ class WorkflowEngine:
                 self._warn_if_pricing_hook_silent()
             finally:
                 if self._subworkflow_depth == 0:
-                    await self._execution_session.finalize_leases(outcome)
-                    self._workspace_lease = None
+                    try:
+                        await self._execution_session.finalize_leases(outcome)
+                    finally:
+                        self._workspace_lease = None
+                        if redaction_token is not None:
+                            redaction.reset_current(redaction_token)
         # Successful completion: this run's periodic checkpoints are now stale.
         self._cleanup_run_periodic_checkpoints()
         return result
@@ -3489,8 +3539,12 @@ class WorkflowEngine:
         # execution backend identically, or resumed runs would silently skip
         # prepare/finalize (run/resume parity).
         outcome: RunOutcome = "failed"
+        redaction_token = None
         try:
             if self._subworkflow_depth == 0:
+                if self._execution_session.owns_secrets:
+                    self._execution_session.reset_secrets()
+                    self._execution_resolver.refresh_secret_uses()
                 await self._execution_session.prepare_leases(
                     RunSpec(
                         run_id=self._run_id,
@@ -3498,6 +3552,11 @@ class WorkflowEngine:
                     )
                 )
                 self._workspace_lease = self._execution_session.lease_for_backend("local")
+                set_redactor = getattr(self._event_emitter, "set_redactor", None)
+                if set_redactor is not None:
+                    set_redactor(self._execution_session.redactor)
+                if redaction.current() is not self._execution_session.redactor:
+                    redaction_token = redaction.set_current(self._execution_session.redactor)
             result = await self._execute_loop(current_agent_name)
         except asyncio.CancelledError:
             outcome = "cancelled"
@@ -3517,8 +3576,12 @@ class WorkflowEngine:
                 self._warn_if_pricing_hook_silent()
             finally:
                 if self._subworkflow_depth == 0:
-                    await self._execution_session.finalize_leases(outcome)
-                    self._workspace_lease = None
+                    try:
+                        await self._execution_session.finalize_leases(outcome)
+                    finally:
+                        self._workspace_lease = None
+                        if redaction_token is not None:
+                            redaction.reset_current(redaction_token)
         # Successful completion: this run's periodic checkpoints are now stale.
         self._cleanup_run_periodic_checkpoints()
         return result
@@ -3648,6 +3711,7 @@ class WorkflowEngine:
             run_id=self._run_context.run_id,
             event_log_path=self._run_context.log_file,
             trigger=trigger,
+            redactor=self._execution_session.redactor,
         )
 
     def _save_checkpoint_on_failure(self, error: BaseException) -> None:
