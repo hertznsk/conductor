@@ -1,6 +1,6 @@
 # Secret Bindings Contract
 
-Status: **Implemented**  
+Status: **Implemented**
 Related: Architecture step 5 of #527 (Secret bindings and execution environments)
 
 ## Summary
