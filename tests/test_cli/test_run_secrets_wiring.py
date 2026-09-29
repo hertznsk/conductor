@@ -9,6 +9,7 @@ are cleared (with the contextvar restored via token) in the outermost finally.
 
 from __future__ import annotations
 
+import errno
 import json
 import sys
 from pathlib import Path
@@ -285,26 +286,22 @@ class TestEscapingExceptionSink:
     """Any exception escaping run/resume has its CLI-rendered fields scrubbed."""
 
     @pytest.mark.asyncio
-    async def test_escaped_exception_is_scrubbed_before_redactor_cleanup(
+    async def test_run_configuration_error_structured_fields_are_scrubbed(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        # Requirement (review b2): only WorkflowTerminated was sanitized at
-        # the boundary, so an ordinary exception whose message/suggestion
-        # embed a declared secret (e.g. a script echoing its credential into
-        # a field that fails an output-schema check) reached print_error —
-        # which runs AFTER the redactor is cleared — with plaintext. The
-        # raised exception and the actual CLI error renderer must both be
-        # clean.
+        # Requirement (review fix B): run scrubs every ConfigurationError field
+        # consumed by the real CLI renderer before clearing its redactor.
         secret = "escaped-exception-secret-1"
         monkeypatch.setenv(_CLI_TOKEN_VAR, secret)
         wf_path = _write_workflow(tmp_path)
         _write_environment(tmp_path)
 
-        from conductor.exceptions import ExecutionError
-
-        failure = ExecutionError(
-            f"script output failed schema enum check: got '{secret}'",
+        failure = ConfigurationError(
+            f"configuration contains {secret}",
             suggestion=f"rotate the credential {secret}",
+            file_path=f"/private/{secret}/workflow.yaml",
+            line_number=42,
+            field_path=f"workflow.{secret}.token",
         )
 
         from conductor.cli.run import run_workflow_async
@@ -317,16 +314,16 @@ class TestEscapingExceptionSink:
             engine.run = AsyncMock(side_effect=failure)
             engine.config.workflow.cost.show_summary = False
             _wire_registry_with_engine(mock_registry_cls, mock_engine_cls, engine)
-            with pytest.raises(ExecutionError) as exc_info:
+            with pytest.raises(ConfigurationError) as exc_info:
                 await run_workflow_async(wf_path, {}, environment="demo")
 
         raised = exc_info.value
         assert raised is failure
-        assert secret not in str(raised)
-        assert REDACTED_MARKER in str(raised)
-        assert raised.suggestion is not None
-        assert secret not in raised.suggestion
-        assert REDACTED_MARKER in raised.suggestion
+        assert raised.line_number == 42
+        for value in (raised.args[0], raised.suggestion, raised.file_path, raised.field_path):
+            assert value is not None
+            assert secret not in value
+            assert REDACTED_MARKER in value
 
         # The actual CLI error renderer stays clean after cleanup cleared it.
         from conductor.cli.app import print_error
@@ -334,23 +331,27 @@ class TestEscapingExceptionSink:
         print_error(raised)
         rendered = capsys.readouterr().err
         assert secret not in rendered
-        assert REDACTED_MARKER in rendered
+        assert rendered.count(REDACTED_MARKER) == 4
 
     @pytest.mark.asyncio
-    async def test_resume_escaped_exception_is_scrubbed(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    async def test_resume_configuration_error_structured_fields_are_scrubbed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        # Requirement (review b2): the resume path mirrors run — an escaping
-        # exception is scrubbed before the CLI-owned redactor is cleared.
+        # Requirement (review fix B): resume provides the same complete
+        # ConfigurationError rendering boundary as a fresh run.
         secret = "resume-exception-secret-2"
         monkeypatch.setenv(_CLI_TOKEN_VAR, secret)
         wf_path = _write_workflow(tmp_path)
         _write_environment(tmp_path)
         cp_path = _write_checkpoint(tmp_path, wf_path)
 
-        from conductor.exceptions import ExecutionError
-
-        failure = ExecutionError(f"resumed step failed with '{secret}'")
+        failure = ConfigurationError(
+            f"resumed configuration contains {secret}",
+            suggestion=f"replace {secret}",
+            file_path=f"/private/{secret}/resume.yaml",
+            line_number=7,
+            field_path=f"agents.{secret}.model",
+        )
 
         from conductor.cli.run import resume_workflow_async
 
@@ -363,11 +364,172 @@ class TestEscapingExceptionSink:
             engine.resume = AsyncMock(side_effect=failure)
             engine.config.workflow.cost.show_summary = False
             _wire_registry_with_engine(mock_registry_cls, mock_engine_cls, engine)
-            with pytest.raises(ExecutionError) as exc_info:
+            with pytest.raises(ConfigurationError) as exc_info:
                 await resume_workflow_async(checkpoint_path=cp_path, environment="demo")
 
-        assert secret not in str(exc_info.value)
-        assert REDACTED_MARKER in str(exc_info.value)
+        raised = exc_info.value
+        assert raised is failure
+        assert raised.line_number == 7
+
+        from conductor.cli.app import print_error
+
+        print_error(raised)
+        rendered = capsys.readouterr().err
+        assert secret not in str(raised)
+        assert secret not in rendered
+        assert rendered.count(REDACTED_MARKER) == 4
+
+    @pytest.mark.asyncio
+    async def test_run_oserror_structured_fields_are_scrubbed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Requirement (review fix B): run scrubs the OSError attributes used
+        # by __str__ while preserving the original object, subtype, and errno.
+        secret = "run-oserror-secret-3"
+        monkeypatch.setenv(_CLI_TOKEN_VAR, secret)
+        wf_path = _write_workflow(tmp_path)
+        _write_environment(tmp_path)
+        failure = FileNotFoundError(
+            errno.ENOENT,
+            f"missing executable {secret}",
+            f"/private/{secret}/command",
+        )
+
+        from conductor.cli.run import run_workflow_async
+
+        with (
+            patch("conductor.cli.run.ProviderRegistry") as mock_registry_cls,
+            patch("conductor.cli.run.WorkflowEngine") as mock_engine_cls,
+        ):
+            engine = MagicMock()
+            engine.run = AsyncMock(side_effect=failure)
+            engine.config.workflow.cost.show_summary = False
+            _wire_registry_with_engine(mock_registry_cls, mock_engine_cls, engine)
+            with pytest.raises(FileNotFoundError) as exc_info:
+                await run_workflow_async(wf_path, {}, environment="demo")
+
+        raised = exc_info.value
+        assert raised is failure
+        assert type(raised) is FileNotFoundError
+        assert raised.errno == errno.ENOENT
+
+        from conductor.cli.app import print_error
+
+        print_error(raised)
+        rendered = capsys.readouterr().err
+        assert secret not in str(raised)
+        assert secret not in rendered
+        assert REDACTED_MARKER in str(raised)
+        assert REDACTED_MARKER in rendered
+
+    @pytest.mark.asyncio
+    async def test_resume_two_path_oserror_structured_fields_are_scrubbed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Requirement (review fix B): resume scrubs strerror and both filenames
+        # that CPython's two-path OSError renderer reads after cleanup.
+        secret = "resume-oserror-secret-4"
+        monkeypatch.setenv(_CLI_TOKEN_VAR, secret)
+        wf_path = _write_workflow(tmp_path)
+        _write_environment(tmp_path)
+        cp_path = _write_checkpoint(tmp_path, wf_path)
+        failure = OSError(
+            errno.EXDEV,
+            f"cross-device move {secret}",
+            f"/source/{secret}",
+            None,
+            f"/destination/{secret}",
+        )
+
+        from conductor.cli.run import resume_workflow_async
+
+        with (
+            patch("conductor.cli.run.ProviderRegistry") as mock_registry_cls,
+            patch("conductor.cli.run.WorkflowEngine") as mock_engine_cls,
+            patch("conductor.cli.run._write_terminal_record_for_current_process"),
+        ):
+            engine = MagicMock()
+            engine.resume = AsyncMock(side_effect=failure)
+            engine.config.workflow.cost.show_summary = False
+            _wire_registry_with_engine(mock_registry_cls, mock_engine_cls, engine)
+            with pytest.raises(OSError) as exc_info:
+                await resume_workflow_async(checkpoint_path=cp_path, environment="demo")
+
+        raised = exc_info.value
+        assert raised is failure
+        assert type(raised) is OSError
+        assert raised.errno == errno.EXDEV
+
+        from conductor.cli.app import print_error
+
+        print_error(raised)
+        rendered = capsys.readouterr().err
+        assert secret not in str(raised)
+        assert secret not in rendered
+        assert str(raised).count(REDACTED_MARKER) == 3
+        assert rendered.count(REDACTED_MARKER) == 3
+
+    async def test_inactive_redactor_leaves_exception_fields_byte_identical(self) -> None:
+        # Requirement (review fix B): direct helper calls with an inactive
+        # redactor preserve args, structured attributes, and rendered text.
+        from conductor.cli.run import _scrub_exception_fields
+
+        configuration = ConfigurationError(
+            "plain message",
+            suggestion="plain suggestion",
+            file_path="plain/path.yaml",
+            line_number=9,
+            field_path="workflow.plain",
+        )
+        os_error = OSError(errno.EXDEV, "plain move", "plain/source", None, "plain/target")
+        before = (
+            configuration.args,
+            configuration.suggestion,
+            configuration.file_path,
+            configuration.field_path,
+            str(configuration),
+            os_error.args,
+            os_error.strerror,
+            os_error.filename,
+            os_error.filename2,
+            str(os_error),
+        )
+
+        inactive = RunRedactor()
+        _scrub_exception_fields(configuration, inactive)
+        _scrub_exception_fields(os_error, inactive)
+
+        assert (
+            configuration.args,
+            configuration.suggestion,
+            configuration.file_path,
+            configuration.field_path,
+            str(configuration),
+            os_error.args,
+            os_error.strerror,
+            os_error.filename,
+            os_error.filename2,
+            str(os_error),
+        ) == before
+
+    async def test_scrubs_bytes_and_nested_container_args(self) -> None:
+        # Requirement (review fix B): every args element the renderer can
+        # print is scrubbed, including bytes payloads and nested containers.
+        from conductor.cli.run import _scrub_exception_fields
+
+        secret = "container-secret-value"
+        redactor = RunRedactor()
+        redactor.register([secret])
+
+        error = ValueError(b"prefix-" + secret.encode(), {"token": secret}, 42)
+
+        _scrub_exception_fields(error, redactor)
+
+        assert error.args[0] == b"prefix-" + REDACTED_MARKER.encode()
+        assert error.args[1] == {"token": REDACTED_MARKER}
+        assert error.args[2] == 42
+        assert secret not in str(error)
+        assert secret not in repr(error.args)
 
 
 @pytest.mark.asyncio

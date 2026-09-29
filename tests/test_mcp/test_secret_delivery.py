@@ -27,6 +27,7 @@ from conductor.config.schema import (
     SecretDelivery,
     SetStepDef,
     StepSecretRef,
+    ToolOutputConfig,
     WorkflowConfig,
     WorkflowDef,
 )
@@ -256,11 +257,11 @@ async def test_binding_duplicate_delivery_is_backstopped(
         )
 
 
-def _manager() -> Any:
+def _manager(tool_output: ToolOutputConfig | None = None) -> Any:
     with patch("conductor.mcp.manager.MCP_SDK_AVAILABLE", True):
         from conductor.mcp.manager import MCPManager
 
-        return MCPManager()
+        return MCPManager(tool_output=tool_output)
 
 
 def _tool_result(text: str) -> MagicMock:
@@ -443,3 +444,35 @@ async def test_manager_preview_is_byte_stable_without_active_redactor(
     # The preview is cut mid-token at exactly 200 chars, as before the fix.
     assert f"{'y' * 190}{REDACTED_MARKER[:10]}..." in message
     assert f"{'y' * 190}{REDACTED_MARKER}" not in message
+
+
+@pytest.mark.asyncio
+async def test_manager_scrubs_full_response_before_tool_result_truncation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Requirement (review fix C): logging redacts the complete tool response
+    # before result truncation can split a registered secret at max_chars.
+    secret = "boundary-secret-" + "s" * 1199
+    full_response = "x" * 190 + secret
+    manager = _manager(ToolOutputConfig(enabled=True, max_chars=1000, spill_to_file=False))
+    session = AsyncMock()
+    session.call_tool.return_value = _tool_result(full_response)
+    manager.tool_to_server["server__tool"] = "server"
+    manager.sessions["server"] = session
+    text_type = type(session.call_tool.return_value.content[0])
+    active = RunRedactor()
+    active.register([secret])
+    token = redaction.set_current(active)
+    caplog.set_level(logging.DEBUG, logger="conductor.mcp.manager")
+    try:
+        with patch("conductor.mcp.manager.TextContent", text_type):
+            result = await manager.call_tool("server__tool", {})
+    finally:
+        redaction.reset_current(token)
+
+    assert secret not in caplog.text
+    assert secret[:10] not in caplog.text
+    assert REDACTED_MARKER in caplog.text
+    assert result.startswith(full_response[:1000])
+    assert "[output truncated: 1405 chars -> 1000 kept." in result
+    assert REDACTED_MARKER not in result

@@ -3144,8 +3144,21 @@ Each secret reference in `secrets:` contains:
 
 ### Delivery Targets (`delivery`)
 
-- **`env`**: Injects the secret value into an environment variable for the script subprocess or MCP server. Supported on `script` steps and on stdio MCP servers for every MCP-capable provider. On `http`/`sse` MCP servers, `env` delivery additionally requires a provider whose remote-server config shape carries per-server environment variables (today: the Copilot SDK) — the `claude-agent-sdk` provider rejects that combination at validation and at manifest compilation, so use `header` delivery for remote servers there. Must be a valid shell identifier (`[A-Za-z_][A-Za-z0-9_]*`).
-- **`header`**: Injects the secret value as an HTTP request header. Supported on HTTP and SSE MCP servers for every MCP-capable provider. Header names must follow RFC 9110 token rules (`[!#$%&'*+\-.^_`|~0-9A-Za-z]+`). Header delivery is rejected on script steps and stdio MCP servers.
+- **`env`**: Injects the secret value into an environment variable for the script subprocess or MCP server. Must be a valid shell identifier (`[A-Za-z_][A-Za-z0-9_]*`).
+- **`header`**: Injects the secret value as an HTTP request header. Header delivery applies only to HTTP/SSE MCP servers; it is rejected on script steps and stdio MCP servers. Header names must follow RFC 9110 token rules (`[!#$%&'*+\-.^_`|~0-9A-Za-z]+`). Prefer `delivery.header` for remote authentication.
+
+MCP transport and delivery support is based on the effective providers of the agents that can consume the workflow's declared servers. Per-agent `provider:` overrides take precedence over the workflow default.
+
+| Provider | stdio | HTTP/SSE | stdio env | remote header | remote env |
+|---|---|---|---|---|---|
+| Copilot | Yes | Yes | Yes | Yes | Yes |
+| Claude | Yes | No (rejected before run) | Yes | n/a | n/a |
+| OpenAI | Yes | No (rejected before run) | Yes | n/a | n/a |
+| Claude Agent SDK | Yes | Yes | Yes | Yes | No (config shape accepts only url/headers) |
+| Hermes | No MCP | No MCP | n/a | n/a | n/a |
+| ACA | Forwarded to runner | Forwarded to runner | per inner-runner contract | per inner-runner contract | per inner-runner contract |
+
+Remote servers used by an effective Claude or OpenAI consumer are rejected by both `conductor validate` and manifest compilation; they are never silently passed through. Direct `type: mcp` steps are a separate, provider-independent path and support stdio only, so they are not counted as provider MCP consumers.
 
 ### Scope and Validation Rules
 

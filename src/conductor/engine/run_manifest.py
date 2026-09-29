@@ -63,6 +63,11 @@ from conductor.config.schema import (
 )
 from conductor.exceptions import ConfigurationError
 from conductor.execution import LocalRunnerBackend, RunnerBackend
+from conductor.providers.resolution import (
+    effective_mcp_consumer_providers,
+    format_claude_agent_sdk_remote_env_error,
+    format_remote_mcp_stdio_only_error,
+)
 
 # Capability-introspection registry: backend name -> a backend instance asked
 # only for its static ``capabilities()`` declaration. The instances are
@@ -453,9 +458,22 @@ def _compile_mcp_secret_uses(
     environment: ResolvedEnvironment,
 ) -> list[ResolvedSecretUse]:
     uses: list[ResolvedSecretUse] = []
+    consumers = effective_mcp_consumer_providers(config)
     for server_name in sorted(config.workflow.runtime.mcp_servers):
         server = config.workflow.runtime.mcp_servers[server_name]
         consumer = f"mcp:{server_name}"
+        if server.type in ("http", "sse"):
+            stdio_only = consumers & {"claude", "openai"}
+            if stdio_only:
+                raise ConfigurationError(
+                    format_remote_mcp_stdio_only_error(
+                        server_name,
+                        server.type,
+                        stdio_only,
+                    ),
+                    suggestion="Use a stdio MCP server or override every consuming agent to a "
+                    "provider that supports remote MCP transports.",
+                )
         for secret in server.secrets:
             if secret.scope == "agent":
                 raise ConfigurationError(
@@ -478,13 +496,14 @@ def _compile_mcp_secret_uses(
             if (
                 secret.delivery.env is not None
                 and server.type in ("http", "sse")
-                and config.workflow.runtime.provider.name == "claude-agent-sdk"
+                and "claude-agent-sdk" in consumers
             ):
                 raise ConfigurationError(
-                    f"MCP server '{server_name}' uses transport '{server.type}' with env "
-                    f"delivery for secret '{secret.ref}', but the claude-agent-sdk provider "
-                    "cannot deliver environment variables to remote MCP servers (its remote "
-                    "config shape accepts only url and headers).",
+                    format_claude_agent_sdk_remote_env_error(
+                        server_name,
+                        server.type,
+                        secret.ref,
+                    ),
                     suggestion="Use delivery.header (e.g. header: Authorization) for remote "
                     "servers on the claude-agent-sdk provider.",
                 )

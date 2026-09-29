@@ -2196,21 +2196,33 @@ def _remove_run_record_for_current_process_safe() -> None:
 def _scrub_exception_fields(exc: BaseException, redactor: RunRedactor) -> None:
     """Scrub registered secret values from the fields a CLI error render reads.
 
-    ``print_error`` renders ``str(exc)`` (the exception args) and, for
-    :class:`~conductor.exceptions.ConductorError`, the ``suggestion`` — both
-    may embed a declared secret (e.g. a script output that echoed its bound
-    credential failing an output-schema check). This runs at the run/resume
-    boundary *before* the redactor is cleared, so an escaping exception
-    cannot carry plaintext past the sinks that were already scrubbed. The
-    exception class, ``__cause__`` chain, and classification are untouched;
-    only string args and the suggestion are replaced, in place, on the
-    exception object that is already on its way out.
+    ``print_error`` renders exception args and structured ``ConductorError``
+    fields, while ``OSError.__str__`` reads its structured filename and error
+    attributes instead of rebuilt args. This runs at the run/resume boundary
+    *before* the redactor is cleared, so the same escaping exception object
+    cannot carry plaintext into the later CLI renderer. Its class, identity,
+    traceback, cause chain, errno, and classification remain untouched.
     """
-    exc.args = tuple(redactor.scrub(arg) if isinstance(arg, str) else arg for arg in exc.args)
+    if not redactor.active:
+        return
+
+    # scrub() returns unsupported types unchanged, so scrubbing every element
+    # also covers bytes args and containers (e.g. Exception({"token": secret}))
+    # whose nested strings the renderer would print.
+    exc.args = tuple(redactor.scrub(arg) for arg in exc.args)
     from conductor.exceptions import ConductorError
 
-    if isinstance(exc, ConductorError) and exc.suggestion is not None:
-        exc.suggestion = redactor.scrub(exc.suggestion)
+    if isinstance(exc, ConductorError):
+        for attribute in ("suggestion", "file_path", "field_path"):
+            value = getattr(exc, attribute, None)
+            if isinstance(value, (str, bytes)):
+                setattr(exc, attribute, redactor.scrub(value))
+
+    if isinstance(exc, OSError):
+        for attribute in ("strerror", "filename", "filename2"):
+            value = getattr(exc, attribute, None)
+            if isinstance(value, (str, bytes)):
+                setattr(exc, attribute, redactor.scrub(value))
 
 
 def _scrub_workflow_terminated(

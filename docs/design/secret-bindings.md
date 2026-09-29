@@ -119,10 +119,20 @@ workflow:
 
 ### Transport and Provider Restrictions
 
-Delivery targets are additionally bounded by what the selected provider's MCP transport accepts:
+Delivery targets are bounded by the effective providers of the actual agent consumers. An agent's `provider:` override takes precedence over the workflow default; script steps and direct `type: mcp` steps are not provider consumers.
 
-- **stdio servers**: `env` delivery works on every MCP-capable provider — the server is a local child process Conductor spawns, so an environment variable is always meaningful.
-- **http/sse servers**: `header` delivery works on every MCP-capable provider. `env` delivery additionally requires a provider whose remote-server config shape carries per-server environment variables (today: the Copilot SDK). The `claude-agent-sdk` provider translates remote servers into a config shape with only `url` and `headers`, so `env` delivery on an http/sse server is rejected at `conductor validate` and at manifest compilation time when the workflow runs on that provider — the remedy is `header` delivery (for example `header: Authorization`).
+| Provider | stdio | HTTP/SSE | stdio env | remote header | remote env |
+|---|---|---|---|---|---|
+| Copilot | Yes | Yes | Yes | Yes | Yes |
+| Claude | Yes | No (rejected before run) | Yes | n/a | n/a |
+| OpenAI | Yes | No (rejected before run) | Yes | n/a | n/a |
+| Claude Agent SDK | Yes | Yes | Yes | Yes | No (config shape accepts only url/headers) |
+| Hermes | No MCP | No MCP | n/a | n/a | n/a |
+| ACA | Forwarded to runner | Forwarded to runner | per inner-runner contract | per inner-runner contract | per inner-runner contract |
+
+`header` delivery applies only to HTTP/SSE servers, and remote authentication should prefer `delivery.header`. A remote server used by an effective Claude or OpenAI consumer is rejected at `conductor validate` and at manifest compilation rather than silently passed through. Claude Agent SDK accepts remote headers but rejects remote environment delivery because its remote config shape carries only `url` and `headers`.
+
+Direct `type: mcp` steps are a separate provider-independent path. They connect through the engine-owned MCP manager, support stdio only, and do not make the workflow default provider an MCP consumer.
 
 ### Collision Rules
 

@@ -37,6 +37,12 @@ from conductor.providers.capabilities import (
     requires_plugin_root_for_skills,
     uses_native_skills,
 )
+from conductor.providers.resolution import (
+    effective_mcp_consumer_providers,
+    format_claude_agent_sdk_remote_env_error,
+    format_remote_mcp_stdio_only_error,
+    provider_type_for_agent,
+)
 from conductor.skills import (
     BYTES_PER_TOKEN_ESTIMATE,
     SkillError,
@@ -501,6 +507,12 @@ def validate_workflow_config(
     # diagnostics for ``conductor validate`` only.
     errors.extend(_validate_mcp_steps(config))
 
+    # Remote MCP transports consumed by stdio-only providers (Claude, OpenAI)
+    # are rejected regardless of secret references — the restriction is a
+    # property of the transport, not of secret delivery. Mirrors the manifest
+    # compiler's server-level check.
+    errors.extend(_validate_remote_mcp_provider_support(config))
+
     if errors:
         raise ConfigurationError(
             "Workflow configuration validation failed:\n  - " + "\n  - ".join(errors),
@@ -791,6 +803,29 @@ def _validate_mcp_steps(config: WorkflowConfig) -> list[str]:
                     f"(line {exc.lineno})"
                 )
 
+    return errors
+
+
+def _validate_remote_mcp_provider_support(config: WorkflowConfig) -> list[str]:
+    """Reject remote MCP servers consumed by stdio-only providers.
+
+    Claude and OpenAI forward only stdio servers to their SDKs, so an
+    http/sse server consumed by either provider would be silently skipped at
+    runtime. This runs on every ``conductor validate``, with or without
+    secret references, and mirrors the manifest compiler's server-level
+    check so ``conductor run`` fails identically.
+
+    Returns:
+        List of error messages.
+    """
+    stdio_only = effective_mcp_consumer_providers(config) & {"claude", "openai"}
+    if not stdio_only:
+        return []
+    errors: list[str] = []
+    for server_name in sorted(config.workflow.runtime.mcp_servers):
+        server = config.workflow.runtime.mcp_servers[server_name]
+        if server.type in ("http", "sse"):
+            errors.append(format_remote_mcp_stdio_only_error(server_name, server.type, stdio_only))
     return errors
 
 
@@ -1642,6 +1677,7 @@ def _validate_secret_references(
     # that already failed a structural check is not re-reported against the
     # environment, mirroring the manifest compiler's fail-fast order.
     references: list[tuple[str, str, str]] = []
+    consumers = effective_mcp_consumer_providers(config)
 
     for key, step in _secret_step_consumers(config):
         assert step.execution is not None
@@ -1680,6 +1716,12 @@ def _validate_secret_references(
     for server_name in sorted(config.workflow.runtime.mcp_servers):
         server = config.workflow.runtime.mcp_servers[server_name]
         consumer = f"mcp:{server_name}"
+        if server.type in ("http", "sse"):
+            stdio_only = consumers & {"claude", "openai"}
+            if stdio_only:
+                # Already reported by the unconditional remote-transport
+                # check; skip to mirror the compiler's fail-fast order.
+                continue
         for secret in server.secrets:
             if secret.scope == "agent":
                 errors.append(
@@ -1702,16 +1744,14 @@ def _validate_secret_references(
             if (
                 secret.delivery.env is not None
                 and server.type in ("http", "sse")
-                and config.workflow.runtime.provider.name == "claude-agent-sdk"
+                and "claude-agent-sdk" in consumers
             ):
-                # Mirrors the manifest compiler's message verbatim, so the
-                # same unsupported combination reads the same at validate
-                # time and at run time.
                 errors.append(
-                    f"MCP server '{server_name}' uses transport '{server.type}' with env "
-                    f"delivery for secret '{secret.ref}', but the claude-agent-sdk provider "
-                    "cannot deliver environment variables to remote MCP servers (its remote "
-                    "config shape accepts only url and headers)."
+                    format_claude_agent_sdk_remote_env_error(
+                        server_name,
+                        server.type,
+                        secret.ref,
+                    )
                 )
                 continue
             references.append((secret.ref, secret.scope, consumer))
@@ -2434,7 +2474,7 @@ def _resolved_provider_name(agent: AgentDef, default: str) -> str:
     Honors the per-agent ``provider:`` override and falls back to the
     workflow-level default.
     """
-    return agent.provider or default
+    return provider_type_for_agent(agent, default)
 
 
 def _references_loop_variable(template: str, loop_var: str) -> bool:

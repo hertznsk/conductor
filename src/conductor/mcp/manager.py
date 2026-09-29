@@ -388,6 +388,12 @@ class MCPManager:
             if not response_text and structured:
                 response_text = str(structured)
 
+            # Scrub the complete response before tool-result truncation can
+            # split a registered value and make exact-match redaction miss it.
+            # This copy is logging-only; the returned result stays raw and
+            # follows the configured truncation/spill contract below.
+            scrubbed_full = _scrub_log_value(response_text)
+
             try:
                 response_text = self._maybe_truncate_response(
                     response_text,
@@ -410,8 +416,7 @@ class MCPManager:
             # leading characters in the log (exact-match redaction cannot see
             # a value the slice truncated). A marker the boundary splits is
             # completed rather than left as a broken token.
-            scrubbed = _scrub_log_value(response_text)
-            preview = scrubbed[:200]
+            preview = scrubbed_full[:200]
             # Complete a marker the boundary split — but only when a redactor
             # actually replaced values: with no active redactor an ordinary
             # response containing a literal ``***redacted***`` must log
@@ -420,10 +425,10 @@ class MCPManager:
             if active is not None and active.active:
                 marker = redaction.REDACTED_MARKER
                 for width in range(len(marker) - 1, 0, -1):
-                    if preview.endswith(marker[:width]) and scrubbed[len(preview) :].startswith(
-                        marker[width:]
-                    ):
-                        preview = scrubbed[: len(preview) + (len(marker) - width)]
+                    if preview.endswith(marker[:width]) and scrubbed_full[
+                        len(preview) :
+                    ].startswith(marker[width:]):
+                        preview = scrubbed_full[: len(preview) + (len(marker) - width)]
                         break
             logger.debug(
                 "MCP tool '%s' returned: %s...",

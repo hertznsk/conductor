@@ -22,6 +22,7 @@ from conductor.config.schema import (
     ForEachDef,
     MCPServerDef,
     OutputField,
+    ProviderName,
     RouteDef,
     RuntimeConfig,
     ScriptStepDef,
@@ -34,6 +35,7 @@ from conductor.config.schema import (
     WorkflowStepDef,
 )
 from conductor.config.validator import validate_workflow_config
+from conductor.engine.run_manifest import compile_run_manifest
 from conductor.exceptions import ConfigurationError
 
 
@@ -135,6 +137,45 @@ def _mcp_config(server: MCPServerDef) -> WorkflowConfig:
             )
         ],
         output={"result": "{{ agent.output.value }}"},
+    )
+
+
+def _remote_mcp_config(
+    server_type: Literal["http", "sse"],
+    *,
+    default_provider: ProviderName = "copilot",
+    agent_providers: tuple[ProviderName | None, ...] = (None,),
+    env_delivery: bool = True,
+) -> WorkflowConfig:
+    secret = (
+        _secret("alpha", "mcp", env="REMOTE_TOKEN")
+        if env_delivery
+        else _secret("alpha", "mcp", header="Authorization")
+    )
+    return WorkflowConfig(
+        workflow=WorkflowDef(
+            name="remote-mcp-secrets",
+            entry_point="agent-0",
+            runtime=RuntimeConfig(
+                provider=default_provider,
+                mcp_servers={
+                    "server": MCPServerDef(
+                        type=server_type,
+                        url="https://example.test/mcp",
+                        secrets=[secret],
+                    )
+                },
+            ),
+        ),
+        agents=[
+            AgentDef(
+                name=f"agent-{index}",
+                provider=provider,
+                prompt="test",
+                routes=[RouteDef(to="$end")],
+            )
+            for index, provider in enumerate(agent_providers)
+        ],
     )
 
 
@@ -320,6 +361,231 @@ class TestDeliveryCollisions:
             monkeypatch.setenv("CONDUCTOR_TEST_TASK10_BETA", "x")
             warnings = _validate_explicit(config, _alpha_beta_environment(), tmp_path)
         assert warnings == []
+
+
+class TestEffectiveMcpConsumerProviders:
+    """Provider transport checks use agents that can actually consume workflow MCP servers."""
+
+    @pytest.mark.parametrize("server_type", ["http", "sse"])
+    def test_default_claude_agent_sdk_with_only_copilot_consumers_passes(
+        self,
+        server_type: Literal["http", "sse"],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Requirement: explicit Copilot overrides replace an unused Claude Agent SDK default.
+        config = _remote_mcp_config(
+            server_type,
+            default_provider="claude-agent-sdk",
+            agent_providers=("copilot", "copilot"),
+        )
+        monkeypatch.setenv("CONDUCTOR_TEST_TASK10_ALPHA", "x")
+        monkeypatch.setenv("CONDUCTOR_TEST_TASK10_BETA", "x")
+
+        assert _validate_explicit(config, _alpha_beta_environment(), tmp_path) == []
+
+    @pytest.mark.parametrize("server_type", ["http", "sse"])
+    def test_claude_agent_sdk_override_rejects_remote_env_delivery(
+        self,
+        server_type: Literal["http", "sse"],
+        tmp_path: Path,
+    ) -> None:
+        # Requirement: one effective Claude Agent SDK override rejects remote env delivery.
+        config = _remote_mcp_config(
+            server_type,
+            agent_providers=(None, "claude-agent-sdk"),
+        )
+
+        with pytest.raises(ConfigurationError, match="cannot deliver environment variables"):
+            _validate_explicit(config, _alpha_beta_environment(), tmp_path)
+
+    def test_for_each_claude_agent_sdk_override_rejects_remote_env_delivery(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        # Requirement: provider-backed inline for-each agents count as MCP consumers.
+        config = _remote_mcp_config("http")
+        config.for_each = [
+            ForEachDef.model_validate(
+                {
+                    "name": "batch",
+                    "type": "for_each",
+                    "source": "workflow.input.items",
+                    "agent": {
+                        "name": "worker",
+                        "provider": "claude-agent-sdk",
+                        "prompt": "work",
+                    },
+                    "as": "item",
+                }
+            )
+        ]
+
+        with pytest.raises(ConfigurationError, match="cannot deliver environment variables"):
+            _validate_explicit(config, _alpha_beta_environment(), tmp_path)
+
+    def test_remote_env_delivery_without_provider_backed_agents_passes(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Requirement: scripts and direct MCP steps do not make the workflow default a consumer.
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="script-only",
+                entry_point="run",
+                runtime=RuntimeConfig(
+                    provider="claude-agent-sdk",
+                    mcp_servers={
+                        "server": MCPServerDef(
+                            type="http",
+                            url="https://example.test/mcp",
+                            secrets=[_secret("alpha", "mcp", env="REMOTE_TOKEN")],
+                        )
+                    },
+                ),
+            ),
+            agents=[ScriptStepDef(name="run", command="echo", routes=[RouteDef(to="$end")])],
+        )
+        monkeypatch.setenv("CONDUCTOR_TEST_TASK10_ALPHA", "x")
+        monkeypatch.setenv("CONDUCTOR_TEST_TASK10_BETA", "x")
+
+        assert _validate_explicit(config, _alpha_beta_environment(), tmp_path) == []
+
+    @pytest.mark.parametrize("server_type", ["http", "sse"])
+    @pytest.mark.parametrize("provider", ["claude", "openai"])
+    def test_stdio_only_consumer_rejects_remote_server(
+        self,
+        server_type: Literal["http", "sse"],
+        provider: ProviderName,
+        tmp_path: Path,
+    ) -> None:
+        # Requirement: Claude and OpenAI reject each remote transport at the server level.
+        config = _remote_mcp_config(
+            server_type,
+            agent_providers=(provider,),
+            env_delivery=False,
+        )
+
+        with pytest.raises(ConfigurationError) as exc_info:
+            _validate_explicit(config, _alpha_beta_environment(), tmp_path)
+
+        assert (
+            f"MCP server 'server' uses remote transport '{server_type}', but provider "
+            f"'{provider}' supports only stdio MCP."
+        ) in exc_info.value.args[0]
+
+    @pytest.mark.parametrize("default_provider", ["claude", "openai"])
+    def test_unused_stdio_only_default_does_not_reject_remote_server(
+        self,
+        default_provider: ProviderName,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Requirement: an unused stdio-only workflow default does not constrain Copilot agents.
+        config = _remote_mcp_config(
+            "http",
+            default_provider=default_provider,
+            agent_providers=("copilot",),
+            env_delivery=False,
+        )
+        monkeypatch.setenv("CONDUCTOR_TEST_TASK10_ALPHA", "x")
+        monkeypatch.setenv("CONDUCTOR_TEST_TASK10_BETA", "x")
+
+        assert _validate_explicit(config, _alpha_beta_environment(), tmp_path) == []
+
+    def test_mixed_consumers_allow_remote_header(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Requirement: Claude Agent SDK restricts remote env delivery, not remote headers.
+        config = _remote_mcp_config(
+            "http",
+            agent_providers=("copilot", "claude-agent-sdk"),
+            env_delivery=False,
+        )
+        monkeypatch.setenv("CONDUCTOR_TEST_TASK10_ALPHA", "x")
+        monkeypatch.setenv("CONDUCTOR_TEST_TASK10_BETA", "x")
+
+        assert _validate_explicit(config, _alpha_beta_environment(), tmp_path) == []
+
+    def test_mixed_consumers_reject_remote_env(self, tmp_path: Path) -> None:
+        # Requirement: any effective Claude Agent SDK consumer makes remote env delivery invalid.
+        config = _remote_mcp_config(
+            "http",
+            agent_providers=("copilot", "claude-agent-sdk"),
+        )
+
+        with pytest.raises(ConfigurationError, match="cannot deliver environment variables"):
+            _validate_explicit(config, _alpha_beta_environment(), tmp_path)
+
+
+class TestRemoteTransportWithoutSecrets:
+    """The remote-transport check runs with or without secret references."""
+
+    @pytest.mark.parametrize("server_type", ["http", "sse"])
+    @pytest.mark.parametrize("provider", ["claude", "openai"])
+    def test_plain_validate_rejects_remote_server_without_secrets(
+        self,
+        server_type: Literal["http", "sse"],
+        provider: ProviderName,
+        tmp_path: Path,
+    ) -> None:
+        # Requirement: a remote server with no secrets is still rejected on the
+        # plain validate path when an effective consumer is stdio-only.
+        config = _remote_mcp_config(server_type, agent_providers=(provider,))
+        config.workflow.runtime.mcp_servers["server"].secrets = []
+
+        with pytest.raises(ConfigurationError) as exc_info:
+            validate_workflow_config(config, workflow_path=tmp_path / "workflow.yaml")
+
+        assert (
+            f"MCP server 'server' uses remote transport '{server_type}', but provider "
+            f"'{provider}' supports only stdio MCP."
+        ) in exc_info.value.args[0]
+
+    @pytest.mark.parametrize("default_provider", ["claude", "openai"])
+    def test_unused_stdio_only_default_passes_remote_server_without_secrets(
+        self,
+        default_provider: ProviderName,
+        tmp_path: Path,
+    ) -> None:
+        # Requirement: an unused stdio-only default does not reject a remote
+        # server without secrets when every consumer overrides to Copilot.
+        config = _remote_mcp_config(
+            "http",
+            default_provider=default_provider,
+            agent_providers=("copilot",),
+            env_delivery=False,
+        )
+        config.workflow.runtime.mcp_servers["server"].secrets = []
+
+        validate_workflow_config(config, workflow_path=tmp_path / "workflow.yaml")
+
+    def test_compile_and_validate_share_remote_transport_error_text(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        # Requirement: compilation and validation use one remote-transport
+        # error formatter, with deterministically sorted provider lists.
+        config = _remote_mcp_config(
+            "http",
+            agent_providers=("openai", "claude"),
+            env_delivery=False,
+        )
+
+        with pytest.raises(ConfigurationError) as exc_info:
+            compile_run_manifest(config, workflow_path=None, environment=_alpha_beta_environment())
+        with pytest.raises(ConfigurationError) as validate_info:
+            validate_workflow_config(config, workflow_path=tmp_path / "workflow.yaml")
+
+        message = (
+            "MCP server 'server' uses remote transport 'http', but providers "
+            "['claude', 'openai'] support only stdio MCP."
+        )
+        assert exc_info.value.args[0] == message
+        assert message in validate_info.value.args[0]
 
 
 class TestExplicitEnvironment:
