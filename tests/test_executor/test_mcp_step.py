@@ -139,6 +139,38 @@ class TestArgumentRendering:
         await executor.execute(agent, {}, manager)  # type: ignore[arg-type]
         assert manager.calls[0][2] == {"q": ""}
 
+    async def test_fromjson_parses_prior_step_text_into_native_argument(
+        self, executor: McpStepExecutor
+    ) -> None:
+        # Requirement: the issue #579 read-modify-write pattern — a prior MCP
+        # step's content[0].text JSON string is parsed with ``fromjson``,
+        # merged, serialized with ``tojson``, and auto-coercion delivers a
+        # native list argument to the tool.
+        manager = FakeMCPManager()
+        agent = make_agent(
+            arguments={
+                "labels": (
+                    "{{ (((steps.get_mr.output.content[0].text | fromjson).labels"
+                    " | default([])) + ['Conductor::Need human']) | list | tojson }}"
+                )
+            }
+        )
+        context = {
+            "steps": {
+                "get_mr": {
+                    "output": {
+                        "content": [{"type": "text", "text": '{"labels": ["renovate"]}'}],
+                        "structured": None,
+                        "is_error": False,
+                    }
+                }
+            }
+        }
+        await executor.execute(agent, context, manager)  # type: ignore[arg-type]
+        labels = manager.calls[0][2]["labels"]
+        assert labels == ["renovate", "Conductor::Need human"]
+        assert isinstance(labels, list)
+
     async def test_no_arguments_sends_empty_dict(self, executor: McpStepExecutor) -> None:
         # Requirement: steps without arguments call the tool with an empty dict.
         manager = FakeMCPManager()

@@ -1473,6 +1473,18 @@ When the tool returns structured content (a dictionary under `structured`), its 
 {{ read_spec.output.record_id }}       # Merged structured field
 ```
 
+Many widely used MCP servers return data **only** as a JSON string in
+`content[0].text` and never populate `structuredContent` (`structured` stays
+`null`). Use the `fromjson` filter — the inverse of `json` — to parse that
+text into native data for downstream arguments and route conditions:
+
+```jinja2
+{{ (get_mr.output.content[0].text | fromjson).labels }}    # Parse text JSON, access a field
+```
+
+`fromjson` raises a `TemplateError` explaining whether the value was not a
+string or did not hold valid JSON.
+
 The base keys `content`, `structured`, and `is_error` are reserved by the envelope, and `outputs` / `errors` are additionally reserved because the workflow engine recognizes parallel/for-each group outputs by exactly those two top-level keys — a structured result flattening them would make the step's output indistinguishable from a group output. If the structured dictionary contains colliding keys, the envelope wins, the colliding keys are omitted from the merge with a debug-level log message, and they stay reachable under `output.structured.<key>`.
 
 **`is_error` semantics and routing:**

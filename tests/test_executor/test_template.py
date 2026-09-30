@@ -11,6 +11,8 @@ Tests cover:
 - Condition evaluation
 """
 
+import json
+
 import pytest
 
 from conductor.exceptions import TemplateError
@@ -88,6 +90,72 @@ class TestTemplateRendererJsonFilter:
             {"data": {"date": "2024-01-01"}},
         )
         assert "2024-01-01" in result
+
+
+class TestTemplateRendererFromjsonFilter:
+    """Tests for the fromjson filter (JSON text to native values)."""
+
+    def test_fromjson_parses_object(self) -> None:
+        """Test parsing a JSON object string for key access."""
+        renderer = TemplateRenderer()
+        result = renderer.render(
+            "{{ (text | fromjson).labels }}",
+            {"text": '{"labels": ["renovate", "dependencies"]}'},
+        )
+        assert result == "['renovate', 'dependencies']"
+
+    def test_fromjson_parses_array_with_index(self) -> None:
+        """Test parsing a JSON array string for element access."""
+        renderer = TemplateRenderer()
+        result = renderer.render(
+            "{{ (items | fromjson)[1] }}",
+            {"items": '["first", "second"]'},
+        )
+        assert result == "second"
+
+    def test_fromjson_scalars(self) -> None:
+        """Test parsing JSON scalar strings."""
+        renderer = TemplateRenderer()
+        assert renderer.render("{{ n | fromjson }}", {"n": "42"}) == "42"
+        assert renderer.render("{{ b | fromjson }}", {"b": "true"}) == "True"
+        assert renderer.render("{{ s | fromjson }}", {"s": '"hello"'}) == "hello"
+
+    def test_fromjson_composes_with_default_and_concat(self) -> None:
+        """Test the MCP-step argument pattern: parse text, default, append."""
+        renderer = TemplateRenderer()
+        result = renderer.render(
+            "{{ ((text | fromjson).labels | default([])) + ['Conductor::Need human'] }}",
+            {"text": '{"labels": ["renovate"]}'},
+        )
+        assert result == "['renovate', 'Conductor::Need human']"
+
+    def test_fromjson_invalid_json_raises(self) -> None:
+        """Test that invalid JSON raises a TemplateError.
+
+        Requirement: the filter's own error contract (specific suggestion,
+        original template, and the JSONDecodeError cause) must survive the
+        renderer's exception wrapping unchanged.
+        """
+        renderer = TemplateRenderer()
+        with pytest.raises(TemplateError, match="invalid JSON") as exc_info:
+            renderer.render("{{ text | fromjson }}", {"text": "not json"})
+        error = exc_info.value
+        assert error.suggestion == "Check that the source field holds a JSON document"
+        assert error.template_string == "{{ text | fromjson }}"
+        assert isinstance(error.__cause__, json.JSONDecodeError)
+
+    def test_fromjson_non_string_raises(self) -> None:
+        """Test that applying fromjson to a non-string raises a TemplateError.
+
+        Requirement: the filter's specific suggestion must reach the caller
+        rather than the renderer's generic "Check template and context" one.
+        """
+        renderer = TemplateRenderer()
+        with pytest.raises(TemplateError, match="expects a JSON string") as exc_info:
+            renderer.render("{{ value | fromjson }}", {"value": 42})
+        error = exc_info.value
+        assert error.suggestion == ("Apply fromjson to a text field such as output.content[0].text")
+        assert error.template_string == "{{ value | fromjson }}"
 
 
 class TestTemplateRendererDefaultFilter:
