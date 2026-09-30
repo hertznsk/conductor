@@ -2,7 +2,7 @@
 
 ``compile_run_manifest`` resolves every executable step of the *root* workflow
 configuration to a concrete runner backend through an execution environment
-document and pins the result in a :class:`ResolvedRunManifest`. The manifest is
+document and records the result in a :class:`ResolvedRunManifest`. The manifest is
 **run-invariant**: it deliberately contains no run id, no timestamps, no
 inputs, no CLI overrides, and no absolute paths, so two compilations of the
 same inputs produce byte-identical ``model_dump(mode="json")`` output and the
@@ -34,13 +34,15 @@ claims resolution authority over configuration it has not read.
 
 **Audit posture.** Every manifest carries an :class:`AuditInfo` classifying
 itself as ``non-hermetic-compatibility``: resolved profiles and backends may
-depend on machine-local environment documents, so the manifest pins what was
+depend on machine-local environment documents, so the manifest records what was
 resolved (names, digests, content hashes) rather than pretending the
 resolution was hermetic.
 
 **Versioning.** Version 1 is additive: new fields may be added without a
 version bump, and consumers are expected to ignore unknown keys. Defaults on
 new model fields preserve reads of manifests written by earlier v1 producers.
+The optional per-profile ``execution`` field follows this rule: consumers must
+ignore it when unknown or ``None``.
 """
 
 from __future__ import annotations
@@ -50,16 +52,17 @@ import sys
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, field_serializer, field_validator
 
-from conductor.config.environment import ResolvedEnvironment
+from conductor.config.environment import ProfileDefinition, ResolvedEnvironment
 from conductor.config.schema import (
     ExecutableStepBase,
     ScriptStepDef,
     StepSecretRef,
     WorkflowConfig,
+    WorkflowDefaults,
 )
 from conductor.exceptions import ConfigurationError
 from conductor.execution import LocalRunnerBackend, RunnerBackend
@@ -104,6 +107,31 @@ class EnvironmentIdentity(BaseModel):
     digest: str
 
 
+class ManifestExecutionSpec(BaseModel):
+    """Normalized requested container configuration recorded for audit.
+
+    An image tag records the requested reference but does not identify the
+    bytes selected by the daemon. An image digest identifies those bytes. All
+    fields remain present in serialized output, including explicit nulls, so
+    an audit consumer sees a stable key set for every recorded execution.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    image: str
+    platform: str | None = None
+    network: str | None = None
+    user: str | None = None
+    init: bool = False
+    read_only: bool = False
+    cap_drop_all: bool = False
+    no_new_privileges: bool = False
+    tmpfs: bool | str = False
+    cpu: float | None = None
+    memory: str | None = None
+    pids: int | None = None
+
+
 class ResolvedStepProfile(BaseModel):
     """One executable step's resolved execution profile and backend."""
 
@@ -112,6 +140,13 @@ class ResolvedStepProfile(BaseModel):
     profile: str
     backend: str
     inherit_control_environment: bool = True
+    execution: ManifestExecutionSpec | None = None
+
+    def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        dump = super().model_dump(*args, **kwargs)
+        if dump.get("execution") is None:
+            dump.pop("execution", None)
+        return dump
 
 
 class ResolvedSecretUse(BaseModel):
@@ -128,7 +163,7 @@ class AuditInfo(BaseModel):
     """Self-classification of the manifest's hermetic posture.
 
     ``hermetic`` is a literal ``False``: resolution depends on machine-local
-    environment documents, so the manifest pins resolved names and digests
+    environment documents, so the manifest records resolved names and digests
     instead of claiming hermetic reproducibility. ``classification`` is the
     stable label downstream tooling keys on.
     """
@@ -182,6 +217,13 @@ class ResolvedRunManifest(BaseModel):
         the manifest's byte-deterministic dump contract.
         """
         return dict(value)
+
+    def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        dump = super().model_dump(*args, **kwargs)
+        for profile in dump.get("profiles", {}).values():
+            if isinstance(profile, dict) and profile.get("execution") is None:
+                profile.pop("execution", None)
+        return dump
 
 
 def executable_step_identity(name: str, *, for_each_group: str | None = None) -> str:
@@ -269,10 +311,10 @@ def _iter_executable_steps(config: WorkflowConfig) -> list[tuple[str, Executable
     return steps
 
 
-def _resolve_profile_name(
-    key: str,
+def effective_profile_name(
     step: ExecutableStepBase,
-    config: WorkflowConfig,
+    key: str,
+    workflow_defaults: WorkflowDefaults,
     environment: ResolvedEnvironment,
 ) -> str:
     """Resolve the profile name for one step through the precedence chain.
@@ -280,7 +322,7 @@ def _resolve_profile_name(
     Chain, first hit wins:
 
     1. ``step.execution.profile``
-    2. ``config.workflow.defaults.execution.profile``
+    2. ``workflow_defaults.execution.profile``
     3. ``environment.document.default``
 
     A complete miss is a configuration error naming the step and the full
@@ -290,7 +332,7 @@ def _resolve_profile_name(
     if step_profile is not None:
         return step_profile
 
-    defaults = config.workflow.defaults.execution
+    defaults = workflow_defaults.execution
     workflow_profile = defaults.profile if defaults is not None else None
     if workflow_profile is not None:
         return workflow_profile
@@ -308,6 +350,38 @@ def _resolve_profile_name(
         "'workflow.defaults.execution.profile', or give the environment "
         "document a 'default' profile.",
     )
+
+
+def resolve_execution_spec(definition: ProfileDefinition) -> ManifestExecutionSpec | None:
+    """Copy a profile's normalized requested container configuration.
+
+    Environment schema validation has already normalized every value. This
+    function deliberately performs no daemon lookup or further interpretation.
+    """
+    if definition.backend != "docker":
+        return None
+    docker = definition.docker
+    assert docker is not None
+    resources = docker.resources
+    return ManifestExecutionSpec(
+        image=docker.image,
+        platform=docker.platform,
+        network=docker.network,
+        user=docker.user,
+        init=docker.init,
+        read_only=docker.read_only,
+        cap_drop_all=docker.cap_drop_all,
+        no_new_privileges=docker.no_new_privileges,
+        tmpfs=docker.tmpfs,
+        cpu=resources.cpu,
+        memory=resources.memory,
+        pids=resources.pids,
+    )
+
+
+def script_step_backends(manifest: ResolvedRunManifest) -> frozenset[str]:
+    """Return backends used by script-step profiles in a compiled manifest."""
+    return frozenset(profile.backend for profile in manifest.profiles.values())
 
 
 def _require_script_backend_capability(key: str, backend_name: str) -> None:
@@ -528,7 +602,7 @@ def compile_run_manifest(
 
     Pure function: the same inputs always produce the same manifest. Each
     executable step of the root config is resolved through the precedence
-    chain (see :func:`_resolve_profile_name`) to a profile defined in
+    chain (see :func:`effective_profile_name`) to a profile defined in
     ``environment.document.profiles``; script steps are additionally checked
     against the backend's batch capability (see
     :func:`_require_script_backend_capability`).
@@ -552,7 +626,12 @@ def compile_run_manifest(
     profiles: dict[str, ResolvedStepProfile] = {}
     secrets: list[ResolvedSecretUse] = []
     for key, step in _iter_executable_steps(config):
-        profile_name = _resolve_profile_name(key, step, config, environment)
+        profile_name = effective_profile_name(
+            step,
+            key,
+            config.workflow.defaults,
+            environment,
+        )
         definition = environment.document.profiles.get(profile_name)
         if definition is None:
             available = ", ".join(sorted(environment.document.profiles))
@@ -566,6 +645,16 @@ def compile_run_manifest(
         backend_name = definition.backend
         if isinstance(step, ScriptStepDef):
             _require_script_backend_capability(key, backend_name)
+            execution = resolve_execution_spec(definition)
+        else:
+            if backend_name != "local":
+                raise ConfigurationError(
+                    f"Step '{key}' resolves to backend '{backend_name}', but backend "
+                    f"'{backend_name}' is available for script steps only; agent execution "
+                    "realms arrive in step 7.",
+                    suggestion="Move the step to a local profile or remove execution.profile.",
+                )
+            execution = None
         inherit_control_environment = (
             definition.inherit_control_environment
             if definition.inherit_control_environment is not None
@@ -575,6 +664,7 @@ def compile_run_manifest(
             profile=profile_name,
             backend=backend_name,
             inherit_control_environment=inherit_control_environment,
+            execution=execution,
         )
         secrets.extend(_compile_step_secret_uses(key, step, environment))
 
