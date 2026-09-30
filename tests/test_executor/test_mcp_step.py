@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 
 from conductor.config.schema import MCPStepDef
+from conductor.engine.context import WorkflowContext
 from conductor.exceptions import ExecutionError
 from conductor.executor.mcp_step import McpStepExecutor, mcp_result_bytes
 from conductor.file_string import FileString
@@ -145,27 +146,28 @@ class TestArgumentRendering:
         # Requirement: the issue #579 read-modify-write pattern — a prior MCP
         # step's content[0].text JSON string is parsed with ``fromjson``,
         # merged, serialized with ``tojson``, and auto-coercion delivers a
-        # native list argument to the tool.
+        # native list argument to the tool. The context is built through the
+        # real WorkflowContext API so the test pins the access path the
+        # engine actually exposes (<step>.output..., no steps. prefix).
         manager = FakeMCPManager()
         agent = make_agent(
             arguments={
                 "labels": (
-                    "{{ (((steps.get_mr.output.content[0].text | fromjson).labels"
+                    "{{ (((get_mr.output.content[0].text | fromjson).labels"
                     " | default([])) + ['Conductor::Need human']) | list | tojson }}"
                 )
             }
         )
-        context = {
-            "steps": {
-                "get_mr": {
-                    "output": {
-                        "content": [{"type": "text", "text": '{"labels": ["renovate"]}'}],
-                        "structured": None,
-                        "is_error": False,
-                    }
-                }
-            }
-        }
+        workflow_context = WorkflowContext()
+        workflow_context.store(
+            "get_mr",
+            {
+                "content": [{"type": "text", "text": '{"labels": ["renovate"]}'}],
+                "structured": None,
+                "is_error": False,
+            },
+        )
+        context = workflow_context.build_for_agent("update_mr", [])
         await executor.execute(agent, context, manager)  # type: ignore[arg-type]
         labels = manager.calls[0][2]["labels"]
         assert labels == ["renovate", "Conductor::Need human"]
