@@ -442,6 +442,10 @@ class DockerRunnerBackend:
 
     @staticmethod
     def _create_environment(spec: CommandSpec, snapshot: Mapping[str, str]) -> dict[str, str]:
+        # On Windows the host env is case-insensitive while the container's
+        # Linux env is case-sensitive; a spec.env key differing from a host
+        # variable only by case replaces it here (see the Windows environment
+        # case-semantics section of docs/design/docker-backend.md).
         env = dict(snapshot)
         if sys.platform == "win32":
             overridden = {key.casefold() for key in spec.env}

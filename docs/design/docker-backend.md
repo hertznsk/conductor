@@ -88,7 +88,7 @@ Conductor stages the run bundle before executing the first Docker step in a run.
 2. **Volume creation**: `docker volume create conductor-ws-<run_id>` initializes the volume with Conductor tracking labels.
 3. **Scratch container**: Conductor creates a stopped scratch container mounting the volume:
    ```bash
-   docker create --name conductor-stage-<run_id>-<incarnation> \
+   docker create --name conductor-stage-<run_id[:8]>-<uuid6> \
      --user <resolved_user> \
      -v conductor-ws-<run_id>:/workspace \
      <image>
@@ -204,6 +204,13 @@ The profile schema enforces these exclusions with strict Pydantic models (`extra
 * **Inspect visibility**: Environment variables passed to containers are visible in `docker inspect` output to authorized daemon administrators.
 * **Volume quotas**: Enforcing disk storage quotas on `/workspace` named volumes is the responsibility of the host operator and storage driver.
 
+### Windows Environment Variable Case Semantics
+
+Environment variable names are case-insensitive on a Windows host but case-sensitive inside the Linux container. When a script step's `env:` key differs from an inherited host variable only by case (for example `path` versus `PATH`), Conductor's environment overlay drops the host variable from the Docker CLI subprocess environment before applying the step's value, so the declared key deterministically wins the collision. Two consequences follow:
+
+* Both case variants can never reach the same container from a Windows host — the declared `env:` key replaces the host variable rather than coexisting with it the way the two names would inside the container.
+* The same workflow on a POSIX host forwards both variants independently, so a workflow relying on case-distinct variable names behaves differently across host platforms. Declare `env:` keys in the exact casing the container payload reads, and avoid case-only duplicates of host variables.
+
 ## Lifecycle, Finalization, and Garbage Collection
 
 Conductor manages the complete lifecycle of temporary containers and volumes created during a workflow run.
@@ -213,15 +220,21 @@ Conductor manages the complete lifecycle of temporary containers and volumes cre
 All Docker resources created by Conductor use predictable naming patterns and metadata labels:
 
 * **Named volume**: `conductor-ws-<run_id>`
-* **Command container**: `conductor-cmd-<run_id>-<step>-<incarnation>-<attempt>`
-* **Scratch container**: `conductor-stage-<run_id>-<incarnation>`
+* **Execution container**: `conductor-<run_id[:8]>-<sha1(step name or command)[:8]>-<attempt>`
+* **Scratch container**: `conductor-stage-<run_id[:8]>-<uuid6>`
 
-Every resource carries tracking labels:
+The run incarnation is carried as a label rather than a name segment, and the
+step identity travels as a hash so step names cannot inject unsafe characters
+into a container name. Every resource carries tracking labels:
 * `io.conductor.managed = "true"`
 * `io.conductor.run_id = "<run_id>"`
 * `io.conductor.workspace = "<run_id>"`
-* `io.conductor.resource = "container" | "volume"`
+* `io.conductor.resource = "exec" | "scratch" | "workspace"`
 * `io.conductor.incarnation = "<incarnation>"`
+
+Execution containers additionally carry:
+* `io.conductor.step = "<step name or command>"`
+* `io.conductor.attempt = "<attempt>"`
 
 ### Finalization Protocol
 
