@@ -16,6 +16,7 @@ import json
 import pytest
 
 from conductor.exceptions import TemplateError
+from conductor.executor.set_step import _yaml_load
 from conductor.executor.template import TemplateRenderer
 
 
@@ -128,6 +129,36 @@ class TestTemplateRendererFromjsonFilter:
             {"text": '{"labels": ["renovate"]}'},
         )
         assert result == "['renovate', 'Conductor::Need human']"
+
+    def test_fromjson_collection_round_trips_through_tojson_not_bare_repr(self) -> None:
+        """Test that a parsed collection must be re-serialized, not interpolated bare.
+
+        Requirement: MCP-step argument coercion YAML-parses the rendered
+        string, so a bare ``{{ ... }}`` interpolation of a Python collection
+        corrupts it (``None`` becomes the string "None", embedded newlines
+        stay repr-escaped), while ``tojson`` emits JSON that parses back into
+        the same native value.
+        """
+        renderer = TemplateRenderer()
+        text = '{"labels": [null, "a\\nb"]}'
+        bare = renderer.render("{{ (text | fromjson).labels }}", {"text": text})
+        assert _yaml_load(bare) == ["None", "a\\nb"]
+        via_tojson = renderer.render("{{ (text | fromjson).labels | tojson }}", {"text": text})
+        assert _yaml_load(via_tojson) == [None, "a\nb"]
+
+    def test_fromjson_empty_collection_is_truthy_when_interpolated_bare(self) -> None:
+        """Test that route conditions must test a collection, not interpolate it.
+
+        Requirement: an empty list rendered bare produces the string "[]",
+        which a route condition reads as truthy — conditions must use a
+        predicate such as ``length > 0`` on the parsed collection instead.
+        """
+        renderer = TemplateRenderer()
+        text = '{"labels": []}'
+        assert renderer.evaluate_condition("{{ (text | fromjson).labels }}", {"text": text})
+        assert not renderer.evaluate_condition(
+            "{{ (text | fromjson).labels | length > 0 }}", {"text": text}
+        )
 
     def test_fromjson_invalid_json_raises(self) -> None:
         """Test that invalid JSON raises a TemplateError.
