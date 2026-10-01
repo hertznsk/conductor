@@ -66,6 +66,7 @@ from conductor.config.schema import (
 )
 from conductor.exceptions import ConfigurationError
 from conductor.execution import LocalRunnerBackend, RunnerBackend
+from conductor.execution.docker import DockerRunnerBackend
 from conductor.providers.resolution import (
     effective_mcp_consumer_providers,
     format_claude_agent_sdk_remote_env_error,
@@ -80,6 +81,10 @@ from conductor.providers.resolution import (
 # has no instance state at all); any future backend registered here must too.
 BACKEND_CAPABILITY_PROVIDERS: dict[str, RunnerBackend] = {
     "local": LocalRunnerBackend(),
+    # DockerRunnerBackend's constructor is I/O-free (it only stores the binary
+    # name and an environment snapshot), so a module-level instance is safe to
+    # keep here for static capability introspection at compile time.
+    "docker": DockerRunnerBackend(),
 }
 
 

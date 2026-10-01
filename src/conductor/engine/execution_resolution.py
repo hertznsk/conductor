@@ -19,6 +19,7 @@ from conductor.config.environment import ResolvedEnvironment
 from conductor.config.schema import WorkflowConfig
 from conductor.engine.bundle_prep import materialize_run_bundle
 from conductor.engine.run_manifest import (
+    ManifestExecutionSpec,
     ResolvedRunManifest,
     compile_run_manifest,
     executable_step_identity,
@@ -32,11 +33,13 @@ from conductor.engine.secrets import (
 from conductor.exceptions import ConfigurationError
 from conductor.execution import (
     LocalRunnerBackend,
+    ResolvedExecutionSpec,
     RunnerBackend,
     RunOutcome,
     RunSpec,
     WorkspaceLease,
 )
+from conductor.execution.docker import DockerRunnerBackend
 from conductor.redaction import RunRedactor
 
 logger = logging.getLogger(__name__)
@@ -44,7 +47,34 @@ logger = logging.getLogger(__name__)
 
 BACKEND_FACTORIES: dict[str, Callable[[], RunnerBackend]] = {
     "local": LocalRunnerBackend,
+    # The Docker backend construction is I/O-free (it only stores the binary
+    # name and an environment snapshot), so registering the factory here is
+    # safe: no daemon contact happens until a docker-backed command runs.
+    "docker": DockerRunnerBackend,
 }
+
+
+def _spec_to_contract(spec: ManifestExecutionSpec) -> ResolvedExecutionSpec:
+    """Adapt the manifest audit model to the stdlib-only execution contract.
+
+    The ``conductor.execution`` leaf must not import the manifest's Pydantic
+    models, so this adapter — living at the engine layer that owns both sides —
+    copies the normalized requested configuration field by field.
+    """
+    return ResolvedExecutionSpec(
+        image=spec.image,
+        platform=spec.platform,
+        network=spec.network,
+        user=spec.user,
+        init=spec.init,
+        read_only=spec.read_only,
+        cap_drop_all=spec.cap_drop_all,
+        no_new_privileges=spec.no_new_privileges,
+        tmpfs=spec.tmpfs,
+        cpu=spec.cpu,
+        memory=spec.memory,
+        pids=spec.pids,
+    )
 
 
 class ExecutionResolverSession:
@@ -281,6 +311,25 @@ class ExecutionResolver:
         """Return the compiled control-environment inheritance policy."""
         key = executable_step_identity(name, for_each_group=for_each_group)
         return self._manifest.profiles[key].inherit_control_environment
+
+    def execution_spec_for_step(
+        self,
+        name: str,
+        *,
+        for_each_group: str | None = None,
+    ) -> ResolvedExecutionSpec | None:
+        """Return the compiled container execution payload for one step.
+
+        ``None`` means the step runs on its backend's default execution (the
+        local path). The manifest guarantees backend/payload consistency: a
+        payload is only present when the step's profile resolved to a
+        container backend at compile time.
+        """
+        key = executable_step_identity(name, for_each_group=for_each_group)
+        execution = self._manifest.profiles[key].execution
+        if execution is None:
+            return None
+        return _spec_to_contract(execution)
 
     def secret_env_for_step(
         self,

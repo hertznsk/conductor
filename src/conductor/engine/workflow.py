@@ -1899,6 +1899,10 @@ class WorkflowEngine:
                 lease=lease,
                 backend=backend,
                 secret_env=secret_env,
+                execution=self._execution_resolver.execution_spec_for_step(
+                    agent.name,
+                    for_each_group=for_each_group,
+                ),
                 inherit_control_environment=self._execution_resolver.inherit_env_for_step(
                     agent.name,
                     for_each_group=for_each_group,
