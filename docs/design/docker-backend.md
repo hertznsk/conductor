@@ -98,7 +98,7 @@ Conductor stages the run bundle before executing the first Docker step in a run.
 
 ### Spike Findings and Ownership Mechanism
 
-During development, an ordered spike evaluated three candidate mechanisms for staging file ownership (documented in `.omo/evidence/spike-docker-cp.txt`):
+During development, an ordered spike evaluated three candidate mechanisms for staging file ownership:
 
 * **Candidate 1 (Plain `docker cp` + scratch container `--user 65532:65532`)**: Failed. The Docker daemon unpacked the archive with default root ownership, leaving non-root container users unable to write to `/workspace` (exit code 1, `Permission denied`).
 * **Candidate 2 (`docker cp -a` + scratch container `--user 65532:65532`)**: Succeeded. The `-a` archive flag instructed the daemon to copy ownership and permissions matching the scratch container's configured user (exit code 0, writable).

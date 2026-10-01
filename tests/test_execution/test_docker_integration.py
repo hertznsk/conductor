@@ -171,8 +171,8 @@ async def test_spike2_non_root_writability_matrix_and_staging_mode(
     # test fails rather than letting the staging mechanism change silently.
     del docker_daemon
     assert _STAGING_COPY_MODE == "archive-to-container-user", (
-        "_STAGING_COPY_MODE drifted from the spike result recorded in "
-        ".omo/evidence/spike-docker-cp.txt (candidate 2: docker cp -a + scratch "
+        "_STAGING_COPY_MODE drifted from the spike finding recorded in "
+        "docs/design/docker-backend.md (candidate 2: docker cp -a + scratch "
         "--user). Re-run the spike before changing the mechanism constant."
     )
     source = tmp_path / "src"

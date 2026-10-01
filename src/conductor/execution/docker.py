@@ -50,13 +50,15 @@ _WINDOWS_SHARING_ERRORS = {errno.EACCES, errno.EPERM}
 _CONTAINER_NAME = re.compile(r"\A/?conductor-[A-Za-z0-9_-]+\Z")
 _WINDOWS_PATH = re.compile(r"\A([A-Za-z]:|\\\\)")
 
-# Spike evidence: .omo/evidence/spike-docker-cp.txt. Candidate 1 (plain cp)
-# left uid 65532 unable to write; candidate 2 succeeded.
+# Spike finding (see docs/design/docker-backend.md, "Spike Findings and
+# Ownership Mechanism"): candidate 1 (plain cp) left uid 65532 unable to
+# write; candidate 2 (docker cp -a) succeeded.
 _STAGING_COPY_MODE = "archive-to-container-user"
 """Use ``docker cp -a`` with the scratch container's resolved ``--user``.
 
-The ordered real-daemon spike in ``.omo/evidence/spike-docker-cp.txt`` proved
-this is the first candidate that lets uid 65532 write the staged volume.
+An ordered real-daemon spike proved this is the first candidate that lets
+uid 65532 write the staged volume (the findings are summarized in
+docs/design/docker-backend.md).
 """
 
 
