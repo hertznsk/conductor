@@ -1479,7 +1479,19 @@ Many widely used MCP servers return data **only** as a JSON string in
 text into native data for downstream arguments and route conditions:
 
 ```jinja2
-{{ (get_mr.output.content[0].text | fromjson).labels }}    # Parse text JSON, access a field
+{{ (get_mr.output.content[0].text | fromjson).labels | tojson }}    # Parse, then re-serialize for an arguments value
+```
+
+When the parsed value feeds an `arguments` mapping, keep it JSON: a bare
+`{{ ... }}` interpolation stringifies the collection with Python `repr`
+(single quotes, `None` instead of `null`, escaped newlines) before the YAML
+coercion pass, corrupting values, while `tojson` emits valid JSON that the
+coercion pass parses back into the same native value. In route conditions,
+test the collection itself rather than interpolating it — an empty list
+renders as the truthy string `"[]"`:
+
+```jinja2
+{{ (get_mr.output.content[0].text | fromjson).labels | length > 0 }}    # Route condition: fire only when labels exist
 ```
 
 `fromjson` raises a `TemplateError` explaining whether the value was not a
