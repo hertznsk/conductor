@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -14,8 +15,11 @@ from conductor.config.environment import (
     ResolvedEnvironment,
 )
 from conductor.config.schema import (
+    AgentDef,
+    OutputField,
     RouteDef,
     ScriptStepDef,
+    StepDef,
     StepExecutionConfig,
     WorkflowConfig,
     WorkflowDef,
@@ -31,6 +35,7 @@ from conductor.execution.types import (
     RunSpec,
     WorkspaceLease,
 )
+from conductor.providers.base import AgentOutput, AgentProvider
 
 
 class _DockerBackend:
@@ -121,3 +126,95 @@ async def test_root_run_logs_mixed_backend_warning(
 
     messages = [record.getMessage() for record in caplog.records]
     assert messages.count("Workflow uses mixed script execution backends: docker, local") == 1
+
+
+class _StubProvider(AgentProvider, abstract=True):
+    """Minimal provider returning one structured field per declared output key."""
+
+    async def execute(
+        self,
+        agent: AgentDef,
+        context: dict[str, Any],
+        rendered_prompt: str,
+        **kwargs: Any,
+    ) -> AgentOutput:
+        del context, rendered_prompt, kwargs
+        return AgentOutput(
+            content=dict.fromkeys(agent.output or {}, f"{agent.name}-ok"),
+            raw_response=None,
+            model=agent.model,
+            input_tokens=1,
+            output_tokens=1,
+        )
+
+    async def validate_connection(self) -> bool:
+        return True
+
+    async def close(self) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_agent_plus_docker_script_is_not_mixed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Requirement: agent steps are compile-time pinned to the local backend, so
+    # an agent(local) + script(docker) workflow must NOT raise the mixed
+    # script-backend warning — its scripts uniformly run on Docker.
+    workflow_path = tmp_path / "workflow.yaml"
+    workflow_path.write_text("workflow: uniform\n", encoding="utf-8")
+    environment = ResolvedEnvironment(
+        document=EnvironmentDocument(
+            profiles={
+                "local": ProfileDefinition(backend="local"),
+                "container": ProfileDefinition(
+                    backend="docker",
+                    docker=DockerProfileOptions(image="busybox@sha256:" + "a" * 64),
+                ),
+            }
+        ),
+        name="test",
+        source="path",
+        path=None,
+        digest="sha256:test",
+    )
+    steps: list[StepDef] = [
+        AgentDef(
+            name="researcher",
+            model="gpt-4",
+            prompt="Research.",
+            output={"answer": OutputField(type="string")},
+            timeout_seconds=None,
+            max_session_seconds=None,
+            max_agent_iterations=None,
+            execution=StepExecutionConfig(profile="local"),
+            routes=[RouteDef(to="box")],
+        ),
+        _script("box", "container", "$end"),
+    ]
+    config = WorkflowConfig(
+        workflow=WorkflowDef(name="uniform", entry_point="researcher"),
+        agents=steps,
+    )
+    backend = _DockerBackend()
+    monkeypatch.setitem(BACKEND_CAPABILITY_PROVIDERS, "docker", backend)
+    monkeypatch.setitem(BACKEND_FACTORIES, "docker", lambda: backend)
+
+    async def fake_prepare(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr("conductor.engine.workflow.prepare_run_bundle", fake_prepare)
+    caplog.set_level(logging.WARNING, logger="conductor.engine.workflow")
+
+    engine = WorkflowEngine(
+        config,
+        _StubProvider(),
+        workflow_path=workflow_path,
+        execution_environment=environment,
+    )
+    await engine.run({})
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert not any("mixed script execution backends" in message for message in messages)

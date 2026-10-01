@@ -239,6 +239,101 @@ def test_script_step_backends_reports_local_docker_and_mixed(docker_backend: Non
     assert script_step_backends(mixed) == frozenset({"local", "docker"})
 
 
+def test_script_step_backends_ignores_non_script_profiles(docker_backend: None) -> None:
+    # Requirement: agent/workflow/MCP steps are compile-time pinned to the local
+    # backend, so their profiles must not pollute script-backend detection —
+    # an agent(local) + script(docker) workflow is NOT mixed.
+    manifest = compile_run_manifest(
+        _config(
+            AgentDef(
+                name="agent",
+                model="gpt-4",
+                prompt="test",
+                timeout_seconds=None,
+                max_session_seconds=None,
+                max_agent_iterations=None,
+                execution=StepExecutionConfig(profile="local"),
+                routes=[RouteDef(to="build")],
+            ),
+            _script("build", "container"),
+            entry_point="agent",
+        ),
+        workflow_path=None,
+        environment=_environment(docker=DockerProfileOptions(image="busybox")),
+    )
+    assert script_step_backends(manifest) == frozenset({"docker"})
+
+
+def test_script_steps_identities_are_never_serialized(docker_backend: None) -> None:
+    # Requirement: the script-identity list is an in-memory discrimination aid
+    # and never enters the audit dump — serialized key sets stay identical to
+    # pre-recording v1 producers (three keys per profile, plus execution on
+    # Docker, and no top-level script_steps key).
+    manifest = compile_run_manifest(
+        _config(
+            AgentDef(
+                name="agent",
+                model="gpt-4",
+                prompt="test",
+                timeout_seconds=None,
+                max_session_seconds=None,
+                max_agent_iterations=None,
+                execution=StepExecutionConfig(profile="local"),
+                routes=[RouteDef(to="build")],
+            ),
+            _script("build", "container"),
+            entry_point="agent",
+        ),
+        workflow_path=None,
+        environment=_environment(docker=DockerProfileOptions(image="busybox")),
+    )
+    assert manifest.script_steps == ("build",)
+    dump = manifest.model_dump(mode="json")
+    assert "script_steps" not in dump
+    assert set(dump["profiles"]["agent"]) == {
+        "profile",
+        "backend",
+        "inherit_control_environment",
+    }
+    assert set(dump["profiles"]["build"]) == {
+        "profile",
+        "backend",
+        "inherit_control_environment",
+        "execution",
+    }
+
+
+def test_legacy_payload_without_script_steps_uses_all_backends_fallback() -> None:
+    # Requirement: a v1 payload written before script-identity recording (or any
+    # manifest revalidated from its dump, since script_steps never serializes)
+    # cannot distinguish script steps, so script_step_backends conservatively
+    # answers as the pre-recording implementation did — backends of ALL
+    # profiles — rather than silently dropping the mixed-backend diagnostic.
+    payload: dict[str, Any] = {
+        "version": 1,
+        "workflow": {"name": "old", "digest": None},
+        "environment": {"name": "test", "source": "path", "digest": "sha256:x"},
+        "profiles": {
+            "agent": {
+                "profile": "default",
+                "backend": "local",
+                "inherit_control_environment": True,
+            },
+            "build": {
+                "profile": "container",
+                "backend": "docker",
+                "inherit_control_environment": False,
+            },
+        },
+        "secrets": [],
+        "conductor_version": "old",
+        "audit": {"hermetic": False, "classification": "non-hermetic-compatibility"},
+    }
+    manifest = ResolvedRunManifest.model_validate(payload)
+    assert manifest.script_steps == ()
+    assert script_step_backends(manifest) == frozenset({"local", "docker"})
+
+
 @pytest.mark.parametrize(
     "step",
     [

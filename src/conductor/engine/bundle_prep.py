@@ -190,6 +190,8 @@ async def prepare_run_bundle(
     if not any(profile.backend == "docker" for profile in environment.document.profiles.values()):
         return None
 
+    # Membership-only gate: docker presence in the answer is identical under
+    # both script_step_backends modes (script-only and legacy all-backends).
     needs_bundle = "docker" in script_step_backends(manifest)
     if not needs_bundle:
         if workflow_path is None:

@@ -42,7 +42,10 @@ resolution was hermetic.
 version bump, and consumers are expected to ignore unknown keys. Defaults on
 new model fields preserve reads of manifests written by earlier v1 producers.
 The optional per-profile ``execution`` field follows this rule: consumers must
-ignore it when unknown or ``None``.
+ignore it when unknown or ``None``. The ``script_steps`` identity list is the
+exception that proves the rule: it is an in-memory aid for script-step
+discrimination (see :func:`script_step_backends`), excluded from serialization
+entirely so dumps stay byte-identical to pre-recording producers.
 """
 
 from __future__ import annotations
@@ -54,7 +57,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, field_serializer, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
 from conductor.config.environment import ProfileDefinition, ResolvedEnvironment
 from conductor.config.schema import (
@@ -196,6 +199,15 @@ class ResolvedRunManifest(BaseModel):
     secrets: tuple[ResolvedSecretUse, ...] = ()
     conductor_version: str
     audit: AuditInfo
+    script_steps: tuple[str, ...] = Field(default=(), exclude=True)
+    """Identities (``profiles`` keys) of the steps the compiler resolved as
+    :class:`ScriptStepDef`, captured during compilation so
+    :func:`script_step_backends` can restrict mixed-backend detection to
+    script steps. An in-memory aid, never part of the audit dump:
+    ``exclude=True`` keeps serialized manifests byte-identical to
+    pre-recording v1 producers, at the cost that a manifest revalidated from
+    its own dump carries no identities (the helper's documented fallback
+    covers that case)."""
 
     @field_validator("profiles", mode="after")
     @classmethod
@@ -385,7 +397,30 @@ def resolve_execution_spec(definition: ProfileDefinition) -> ManifestExecutionSp
 
 
 def script_step_backends(manifest: ResolvedRunManifest) -> frozenset[str]:
-    """Return backends used by script-step profiles in a compiled manifest."""
+    """Return the distinct backends the run's script steps resolve to.
+
+    Only profiles whose step identity the compiler recorded in
+    ``ResolvedRunManifest.script_steps`` count. Agent, workflow, and MCP steps
+    are compile-time pinned to ``local`` (a non-local backend there is a
+    reserved error), so reading backends off *every* profile would pollute
+    mixed-backend detection with a backend no script step uses — the dominant
+    shape, an agent-plus-Docker-script workflow, would always look "mixed".
+
+    Legacy fallback: an empty ``script_steps`` means either a genuinely
+    script-free compilation or a manifest without recorded identities — a v1
+    payload written by an earlier producer, or any manifest revalidated from
+    its serialized dump (``script_steps`` is never serialized). The two are
+    indistinguishable, and the second cannot afford a wrong "no": this
+    helper's only consumers are the mixed-backend run warning and the bundle
+    docker-presence gate, where silently dropping a diagnostic the run used
+    to emit is worse than the old over-inclusive answer. An empty set
+    therefore answers as the pre-recording implementation did — the backends
+    of ALL profiles. That fallback is exact for the script-free case anyway:
+    non-script steps pin to ``local``, so no Docker backend can appear in a
+    manifest that compiled no script steps.
+    """
+    if manifest.script_steps:
+        return frozenset(manifest.profiles[key].backend for key in manifest.script_steps)
     return frozenset(profile.backend for profile in manifest.profiles.values())
 
 
@@ -629,6 +664,7 @@ def compile_run_manifest(
             resolves to a backend without batch capability.
     """
     profiles: dict[str, ResolvedStepProfile] = {}
+    script_keys: list[str] = []
     secrets: list[ResolvedSecretUse] = []
     for key, step in _iter_executable_steps(config):
         profile_name = effective_profile_name(
@@ -671,6 +707,8 @@ def compile_run_manifest(
             inherit_control_environment=inherit_control_environment,
             execution=execution,
         )
+        if isinstance(step, ScriptStepDef):
+            script_keys.append(key)
         secrets.extend(_compile_step_secret_uses(key, step, environment))
 
     secrets.extend(_compile_mcp_secret_uses(config, environment))
@@ -691,4 +729,5 @@ def compile_run_manifest(
         secrets=tuple(secrets),
         conductor_version=_conductor_version(),
         audit=AuditInfo(hermetic=False, classification="non-hermetic-compatibility"),
+        script_steps=tuple(script_keys),
     )
