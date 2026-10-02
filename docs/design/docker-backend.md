@@ -151,7 +151,7 @@ profiles:
   hardened:
     backend: docker
     docker:
-      image: alpine@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e
+      image: alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
       platform: linux/amd64
       user: "65532:65532"
       network: none
