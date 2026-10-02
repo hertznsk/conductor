@@ -340,11 +340,39 @@ def test_staging_walker_preserves_main_to_additional_root_link(tmp_path: Path) -
     main.mkdir(parents=True)
     root.mkdir(parents=True)
     (root / "shared.txt").write_text("shared", encoding="utf-8")
+    # Native separators keep the source link traversable on every host; the
+    # staged copy must preserve the stored target verbatim, so the staged
+    # readlink is pinned against the source link's own stored target rather
+    # than a literal (a host's symlink readback spelling is not portable).
+    target = os.path.normpath("../roots/00/shared.txt")
+    (main / "shared").symlink_to(target)
+    staging = tmp_path / "staging"
+    DockerRunnerBackend._build_staging_tree(BundleRef("sha256:test", str(tmp_path)), staging)
+    assert (staging / "main/shared").is_symlink()
+    assert os.readlink(staging / "main/shared") == os.readlink(main / "shared")
+    assert (staging / "main/shared").read_text(encoding="utf-8") == "shared"
+
+
+def test_staging_walker_preserves_forward_slash_link_without_following_it(
+    tmp_path: Path,
+) -> None:
+    # Requirement: a Linux-authored relative link (forward-slash target) is
+    # staged verbatim even where the host cannot traverse such a link
+    # (Windows stat-through fails with WinError 123) -- the walker resolves
+    # the target lexically and must never os.stat through the link object.
+    tree = tmp_path / "tree"
+    main = tree / "main"
+    root = tree / "roots/00"
+    main.mkdir(parents=True)
+    root.mkdir(parents=True)
+    (root / "shared.txt").write_text("shared", encoding="utf-8")
     (main / "shared").symlink_to("../roots/00/shared.txt")
     staging = tmp_path / "staging"
     DockerRunnerBackend._build_staging_tree(BundleRef("sha256:test", str(tmp_path)), staging)
     assert (staging / "main/shared").is_symlink()
-    assert (staging / "main/shared").read_text(encoding="utf-8") == "shared"
+    assert os.readlink(staging / "main/shared") == os.readlink(main / "shared")
+    if sys.platform != "win32":
+        assert (staging / "main/shared").read_text(encoding="utf-8") == "shared"
 
 
 @pytest.mark.asyncio

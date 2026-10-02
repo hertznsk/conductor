@@ -119,8 +119,12 @@ def main() -> int:
         if scenario == "startfail":
             print("working directory does not exist", file=sys.stderr)
             return 1
-        sys.stdout.write(os.environ.get("FAKE_DOCKER_STDOUT", "command output"))
-        sys.stderr.write(os.environ.get("FAKE_DOCKER_STDERR", ""))
+        # Canned output goes out as raw UTF-8 bytes, mirroring a real
+        # container's byte stream: a text-mode write would translate newlines
+        # (\n -> \r\n) and fail on characters the pipe's encoding cannot
+        # represent (cp1252 on Windows, e.g. U+FFFD).
+        sys.stdout.buffer.write(os.environ.get("FAKE_DOCKER_STDOUT", "command output").encode())
+        sys.stderr.buffer.write(os.environ.get("FAKE_DOCKER_STDERR", "").encode())
         return int(os.environ.get("FAKE_DOCKER_START_RC", "0"))
     if argv and argv[0] == "inspect":
         name = argv[-1]

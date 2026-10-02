@@ -211,7 +211,11 @@ class TestLocalDockerCommandResultParity:
         )
         assert local.outcome == docker.outcome == "completed"
         assert local.exit_code == docker.exit_code == 0
-        assert local.stdout == docker.stdout == "parity-payload\n"
+        # The local child emits the platform-native text newline (\r\n on
+        # Windows) while the fake container's byte stream carries \n verbatim;
+        # the parity requirement concerns the payload, not LF versus CRLF --
+        # same convention as the splitlines comparison above.
+        assert local.stdout.replace("\r\n", "\n") == docker.stdout == "parity-payload\n"
         assert local.stderr == docker.stderr == ""
         assert local.start_error is None and docker.start_error is None
         assert local.resolved_command and docker.resolved_command

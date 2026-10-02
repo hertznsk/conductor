@@ -17,6 +17,7 @@ import os
 import posixpath
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -46,6 +47,7 @@ _BOUNDED_OUTPUT_CHARS = 2_000
 _CLI_TIMEOUT_RC = -124
 _WINDOWS_SHARING_RETRIES = 6
 _WINDOWS_SHARING_DELAY_SECONDS = 0.05
+_WINDOWS_TREE_KILL_TIMEOUT_SECONDS = 5.0
 _WINDOWS_SHARING_ERRORS = {errno.EACCES, errno.EPERM}
 _CONTAINER_NAME = re.compile(r"\A/?conductor-[A-Za-z0-9_-]+\Z")
 _WINDOWS_PATH = re.compile(r"\A([A-Za-z]:|\\\\)")
@@ -86,6 +88,21 @@ async def _kill_and_reap(
     communicate_task: asyncio.Task[tuple[bytes, bytes]],
 ) -> bool:
     """Kill a Docker CLI process and drain/reap it despite racing cancellation."""
+    if sys.platform == "win32":
+        # A wrapper-shim CLI (e.g. docker.cmd run through cmd.exe) puts the
+        # real workload in a grandchild whose inherited pipe handles stay open
+        # after the direct child dies, wedging the drain below until that
+        # grandchild exits on its own. Best-effort tree kill first, bounded so
+        # the event loop is never blocked unboundedly; any failure falls
+        # through to the plain kill of the direct child.
+        with contextlib.suppress(Exception):
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=_WINDOWS_TREE_KILL_TIMEOUT_SECONDS,
+                check=False,
+            )
     with contextlib.suppress(ProcessLookupError):
         process.kill()
     absorbed_cancel = False
@@ -139,15 +156,18 @@ def _remove_tree_with_retry(path: Path) -> None:
             time.sleep(_WINDOWS_SHARING_DELAY_SECONDS * (attempt + 1))
 
 
-def _symlink_stays_within_root(source: Path, root: Path, target: str) -> bool:
+def _resolve_symlink_within_root(source: Path, root: Path, target: str) -> str | None:
+    """Resolve a link target lexically, returning None when it escapes root."""
     if os.path.isabs(target):
-        return False
+        return None
     resolved = os.path.abspath(os.path.normpath(source.parent / target))
     root_path = os.path.abspath(root)
     try:
-        return os.path.commonpath((resolved, root_path)) == root_path
+        if os.path.commonpath((resolved, root_path)) != root_path:
+            return None
     except ValueError:
-        return False
+        return None
+    return resolved
 
 
 def _copy_tree_preserving_symlinks(
@@ -164,11 +184,20 @@ def _copy_tree_preserving_symlinks(
         dst = destination / entry.name
         if entry.is_symlink():
             target = os.readlink(src)
-            if not _symlink_stays_within_root(src, root, target):
+            resolved = _resolve_symlink_within_root(src, root, target)
+            if resolved is None:
                 raise ExecutionSpecError(
                     f"staging symlink escapes its declared root: {src} -> {target!r}"
                 )
-            os.symlink(target, dst, target_is_directory=entry.is_dir(follow_symlinks=True))
+            # The directory bit is read from the lexically resolved target,
+            # never by following the link object: a Linux-authored
+            # forward-slash target must be staged verbatim even on hosts that
+            # cannot traverse such a link (Windows stat-through fails with
+            # WinError 123). A target that cannot be stat'ed (dangling or
+            # otherwise unreadable) is treated as a non-directory; for a
+            # dangling target that matches the previous follow-the-link
+            # behavior.
+            os.symlink(target, dst, target_is_directory=os.path.isdir(resolved))
         elif entry.is_dir(follow_symlinks=False):
             _copy_tree_preserving_symlinks(src, dst, allowed_root=root)
         elif entry.is_file(follow_symlinks=False):
