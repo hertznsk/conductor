@@ -154,10 +154,13 @@ The points that bear on this provider's experimental status:
   Console login). `apiProvider` is used only to exclude a non-first-party
   backend; it never identifies how the CLI authenticated. Subscription usage
   is shown as an **API-equivalent estimate**: token counts priced at API rates,
-  not an invoice or an additional charge. This detection currently relies on
-  CLI-reported `apiProvider` / `subscriptionType` evidence that has not yet
-  been validated against a live Claude CLI session; missing or different
-  evidence degrades safely to `unknown`. See
+  not an invoice or an additional charge. This detection relies on CLI-reported
+  `apiProvider` / `subscriptionType` evidence; a prior readiness-plus-inference
+  run observed a first-party subscription login and subscription billing
+  provenance, but that observation is provisional until it is revalidated, and
+  fake-key behavior, auto-mode or API-key precedence, fallback, wider
+  compatibility and broader environment coverage remain unvalidated; missing
+  or different evidence degrades safely to `unknown`. See
   [Cost labels and billing source](../workflow-syntax.md#cost-labels-and-billing-source).
 - **Doctor scope.** `conductor doctor --check` builds the provider with its
   default configuration (`auth_mode: auto`) and does not read workflows, so it
@@ -165,11 +168,19 @@ The points that bear on this provider's experimental status:
   `apiProvider` in that output names the API backend and is reported
   separately from `authMethod`.
 
-Tests never launch a real Claude CLI process. By default, a repository-wide
-autouse fixture in `tests/conftest.py` stubs the readiness check to ready.
-Tests marked `claude_auth_readiness_mocked` execute the real readiness method
-instead, but must mock process creation themselves — the fixture replaces
-process creation with a guard that fails the test if it is reached.
+Tests do not launch a real Claude CLI process, with one exception: the opt-in
+`tests/test_integration/test_claude_agent_sdk_subscription_real.py`. It is
+skipped in every default, CI and release run and proceeds only when **both**
+`-m real_api` and `CONDUCTOR_REAL_CLAUDE_SUBSCRIPTION=1` are supplied to the
+same command; once both are supplied, any unmet prerequisite fails rather than
+skips. Its readiness check legitimately runs `claude auth status --json`. See
+[Claude Subscription Billing Mode](./claude-subscription.md) for the runbook.
+
+By default, a repository-wide autouse fixture in `tests/conftest.py` stubs the
+readiness check to ready. Tests marked `claude_auth_readiness_mocked` execute
+the real readiness method instead, but must mock process creation themselves —
+the fixture replaces process creation with a guard that fails the test if it is
+reached.
 
 ## Native tools (`claude-agent-sdk`)
 

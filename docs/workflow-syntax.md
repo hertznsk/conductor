@@ -735,9 +735,13 @@ the console usage summary, per-execution progress lines, budget messages,
 screens, and as `billing_mode` on agent completion events and `billing` in
 `conductor status --json` and MCP run-status payloads.
 
-Subscription detection currently relies on CLI-reported `apiProvider` /
-`subscriptionType` evidence that has not yet been validated against a live
-Claude CLI session. Missing or different evidence degrades safely to `unknown`.
+Subscription detection relies on CLI-reported `apiProvider` /
+`subscriptionType` evidence. A prior readiness-plus-inference run observed a
+first-party subscription login and subscription billing provenance; that
+observation is provisional until it is revalidated, and fake-key behavior,
+auto-mode or API-key precedence, fallback, wider compatibility and broader
+environment coverage remain unvalidated. Missing or different evidence degrades
+safely to `unknown`.
 
 ### Native Tools (`native_tools`)
 
