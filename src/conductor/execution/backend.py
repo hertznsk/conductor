@@ -20,6 +20,7 @@ from conductor.execution.types import (
     RunnerCapabilities,
     RunOutcome,
     RunSpec,
+    WorkspaceIdentity,
     WorkspaceLease,
 )
 
@@ -40,6 +41,7 @@ class RunnerBackend(Protocol):
             The capability set; ``batch`` is required for any backend the
             script executor will delegate to.
         """
+        ...
 
     async def prepare_run(self, run: RunSpec) -> WorkspaceLease:
         """Acquire the workspace handle for a run.
@@ -55,6 +57,7 @@ class RunnerBackend(Protocol):
         Returns:
             An opaque, backend-owned workspace lease.
         """
+        ...
 
     async def run_command(
         self,
@@ -81,8 +84,19 @@ class RunnerBackend(Protocol):
         Returns:
             The command's outcome, output, and timing as data.
         """
+        ...
 
-    async def finalize_run(self, lease: WorkspaceLease, outcome: RunOutcome) -> None:
+    async def attach_run(self, run: RunSpec, identity: WorkspaceIdentity) -> WorkspaceLease:
+        """Verify a retained workspace and return its process-local lease.
+
+        This operation checks existence, labels, and incarnation only. It must not
+        create, stage, delete, or replace any resource.
+        """
+        ...
+
+    async def finalize_run(
+        self, lease: WorkspaceLease, outcome: RunOutcome, *, retain: bool = False
+    ) -> None:
         """Release the workspace held by a finished run.
 
         Idempotent cleanup keyed by the lease: safe to call exactly once per
@@ -90,3 +104,4 @@ class RunnerBackend(Protocol):
         cancellation has already propagated). Remote backends reclaim realm
         resources here.
         """
+        ...
