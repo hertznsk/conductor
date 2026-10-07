@@ -97,6 +97,8 @@ class ScriptExecutor:
         secret_env: dict[str, str] | None = None,
         execution: ResolvedExecutionSpec | None = None,
         inherit_control_environment: bool = True,
+        attempt_id: str | None = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> ScriptOutput:
         """Execute a script step.
 
@@ -208,8 +210,11 @@ class ScriptExecutor:
             # must produce the byte-identical legacy spec (name=None), while a
             # container run gets the step name for realm-side labels/names.
             name=agent.name if execution is not None else None,
+            attempt_id=attempt_id,
         )
         try:
+            if on_dispatch is not None:
+                on_dispatch()
             result = await execution_backend.run_command(
                 spec,
                 lease,

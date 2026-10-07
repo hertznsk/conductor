@@ -99,3 +99,52 @@ async def test_kill_mid_step_writes_checkpoint(tmp_path: Path) -> None:
     # The checkpoint resumes from the in-flight wait step.
     cp = CheckpointManager.load_checkpoint(engine._last_checkpoint_path)
     assert cp.current_agent == "pause"
+
+
+@pytest.mark.asyncio
+async def test_retained_cancel_finalizes_before_failed_checkpoint_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Requirement: a failed stop checkpoint warns after retaining, regardless of a stale path.
+    wf_path = tmp_path / "workflow.yaml"
+    wf_path.write_text("name: kill-checkpoint\n", encoding="utf-8")
+    engine = WorkflowEngine(
+        _wait_workflow(),
+        CopilotProvider(mock_handler=lambda a, p, c: {}),
+        workflow_path=wf_path,
+    )
+    engine._run_id = "retain-on-cancel"
+    engine._last_checkpoint_path = tmp_path / "stale.json"
+    started = asyncio.Event()
+    order: list[str] = []
+
+    async def pause(*_args: object) -> None:
+        started.set()
+        await asyncio.Future()
+
+    async def finalize(_outcome: str, *, retain: bool = False) -> None:
+        assert retain is True
+        order.append("finalize")
+
+    def failed_write(_error: BaseException) -> None:
+        order.append("checkpoint")
+        return None
+
+    class StopOnStart:
+        async def wait_for_stop(self) -> None:
+            await started.wait()
+
+    with (
+        patch.object(engine, "_workspace_persistence", return_value="on-failure"),
+        patch.object(engine, "_execute_wait", side_effect=pause),
+        patch.object(engine._execution_session, "finalize_leases", side_effect=finalize),
+        patch.object(engine, "_save_checkpoint_on_failure", side_effect=failed_write),
+        patch("conductor.engine.workflow.acquire_workspace_claim") as claim,
+        pytest.raises(ExecutionError, match="stopped by user"),
+    ):
+        await _run_with_stop_signal(engine, {}, StopOnStart())
+
+    assert order == ["finalize", "checkpoint"]
+    assert "retain-on-cancel" in caplog.text
+    assert "docker volume rm conductor-ws-retain-on-cancel" in caplog.text
+    claim.return_value.release.assert_called_once()
