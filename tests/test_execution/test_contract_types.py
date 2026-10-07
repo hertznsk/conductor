@@ -9,6 +9,7 @@ exact ``StartError`` fill-in/reconstruction rule the executor relies on for
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import subprocess
 import sys
@@ -33,7 +34,7 @@ from conductor.execution import (
     WorkspaceLease,
 )
 from conductor.execution.docker import DockerRunnerBackend
-from conductor.execution.errors import ExecutionSpecError
+from conductor.execution.errors import ExecutionSpecError, WorkspaceAttachError
 from conductor.execution.local import LocalRunnerBackend
 
 
@@ -253,24 +254,42 @@ class TestLeafPurity:
             await backend.prepare_run(RunSpec("x", workspace_persistence="durable"))
 
     @pytest.mark.asyncio
-    async def test_docker_retained_workspace_stubs_fail_closed(self) -> None:
-        # Requirement: Docker never creates or attaches a retained workspace in this contract stage.
-        backend = DockerRunnerBackend()
-        identity = WorkspaceIdentity("docker", "x", "i")
-        with pytest.raises(
-            ExecutionSpecError,
-            match="^docker workspace attach arrives in the docker backend commit$",
-        ):
-            await backend.attach_run(RunSpec("x"), identity)
-        with pytest.raises(
-            ExecutionSpecError, match="^docker workspace retention is not implemented yet$"
-        ):
-            await backend.prepare_run(RunSpec("x", workspace_persistence="durable"))
-        lease = await backend.prepare_run(RunSpec("x"))
-        with pytest.raises(
-            ExecutionSpecError, match="^docker workspace retention is not implemented yet$"
-        ):
-            await backend.finalize_run(lease, "succeeded", retain=True)
+    async def test_docker_retained_workspace_verifies_and_preserves_volume(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Requirement: attach verifies without allocation; retained preparation and finalization
+        # create an owned volume eagerly and leave it in place without staging.
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        helper = Path(__file__).with_name("docker_fake_stateful.py")
+        wrapper = bin_dir / ("docker.cmd" if sys.platform == "win32" else "docker")
+        if sys.platform == "win32":
+            wrapper.write_text(f'@"{sys.executable}" "{helper}" %*\n', encoding="utf-8")
+        else:
+            wrapper.write_text(
+                f"#!{sys.executable}\nexec(open({str(helper)!r}).read())\n", encoding="utf-8"
+            )
+            wrapper.chmod(wrapper.stat().st_mode | 0o100)
+        log = tmp_path / "docker.jsonl"
+        store = tmp_path / "daemon"
+        monkeypatch.setenv("PATH", str(bin_dir))
+        monkeypatch.setenv("FAKE_DOCKER_LOG", str(log))
+        monkeypatch.setenv("FAKE_DOCKER_STORE", str(store))
+        backend = DockerRunnerBackend(wrapper.name)
+        with pytest.raises(WorkspaceAttachError, match="missing"):
+            await backend.attach_run(
+                RunSpec("missing"), WorkspaceIdentity("docker", "missing", "incarnation")
+            )
+        lease = await backend.prepare_run(RunSpec("retained", workspace_persistence="durable"))
+        volume = store / "volumes/conductor-ws-retained"
+        labels = json.loads((volume / "labels.json").read_text(encoding="utf-8"))
+        assert labels["io.conductor.retention"] == "durable"
+        assert labels["io.conductor.incarnation"] == lease.incarnation
+        await backend.finalize_run(lease, "succeeded", retain=True)
+        assert volume.exists()
+        commands = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        assert not any(argv[0] == "cp" or argv[:2] == ["volume", "rm"] for argv in commands)
+        assert sum(argv[:2] == ["volume", "create"] for argv in commands) == 1
 
 
 class TestLiteralVocabularies:

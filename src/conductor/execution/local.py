@@ -11,7 +11,7 @@ from collections.abc import Callable
 from typing import cast
 from uuid import uuid4
 
-from conductor.execution.errors import ExecutionSpecError
+from conductor.execution.errors import ExecutionSpecError, WorkspaceAttachError
 from conductor.execution.types import (
     CommandResult,
     CommandSpec,
@@ -97,10 +97,12 @@ class LocalRunnerBackend:
             location=None,
         )
 
-    async def attach_run(self, run: RunSpec, identity: WorkspaceIdentity) -> WorkspaceLease:
-        """Reject retained workspaces, which local execution cannot attach."""
-        del run, identity
-        raise ExecutionSpecError("local backend does not support retained workspaces")
+    async def attach_run(
+        self, run: RunSpec, identity: WorkspaceIdentity, *, expect_staged: bool = False
+    ) -> WorkspaceLease:
+        """Reject attach without mutating anything; local workspaces cannot be retained."""
+        del run, identity, expect_staged
+        raise WorkspaceAttachError("local backend does not support retained workspaces")
 
     async def finalize_run(
         self, lease: WorkspaceLease, outcome: RunOutcome, *, retain: bool = False
