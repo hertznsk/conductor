@@ -37,6 +37,7 @@ from conductor.execution.types import (
     RunOutcome,
     RunSpec,
     StartError,
+    WorkspaceIdentity,
     WorkspaceLease,
 )
 
@@ -280,6 +281,8 @@ class DockerRunnerBackend:
 
     async def prepare_run(self, run: RunSpec) -> WorkspaceLease:
         """Create a cheap lease and retain its bundle reference for lazy staging."""
+        if run.workspace_persistence is not None:
+            raise ExecutionSpecError("docker workspace retention is not implemented yet")
         lease = WorkspaceLease(
             lease_id=run.run_id,
             backend="docker",
@@ -789,8 +792,17 @@ class DockerRunnerBackend:
             )
         return removed or absent
 
-    async def finalize_run(self, lease: WorkspaceLease, outcome: RunOutcome) -> None:
+    async def attach_run(self, run: RunSpec, identity: WorkspaceIdentity) -> WorkspaceLease:
+        """Reject attach until Docker retained-workspace support is implemented."""
+        del run, identity
+        raise ExecutionSpecError("docker workspace attach arrives in the docker backend commit")
+
+    async def finalize_run(
+        self, lease: WorkspaceLease, outcome: RunOutcome, *, retain: bool = False
+    ) -> None:
         """Fail-closed cleanup of containers and the run-scoped workspace volume."""
+        if retain:
+            raise ExecutionSpecError("docker workspace retention is not implemented yet")
         del outcome
         key = self._lease_key(lease)
         self._closed_leases.add(key)

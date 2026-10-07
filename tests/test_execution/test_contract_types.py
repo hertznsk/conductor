@@ -29,8 +29,12 @@ from conductor.execution import (
     RunSpec,
     StartError,
     StartErrorKind,
+    WorkspaceIdentity,
     WorkspaceLease,
 )
+from conductor.execution.docker import DockerRunnerBackend
+from conductor.execution.errors import ExecutionSpecError
+from conductor.execution.local import LocalRunnerBackend
 
 
 def _fill_start_error(e: OSError) -> StartError:
@@ -61,6 +65,7 @@ class TestFrozenContract:
             CommandResult(outcome="completed"),
             StartError(kind="file_not_found", message="missing"),
             WorkspaceLease(lease_id="r1", backend="local", incarnation="i1"),
+            WorkspaceIdentity(backend="local", lease_id="r1", incarnation="i1"),
             RunSpec(run_id="r1"),
             RunnerCapabilities(batch=True, sessions=False, shared_workspace=True, snapshots=False),
         ],
@@ -125,7 +130,13 @@ class TestProtocolShape:
             for name, member in vars(RunnerBackend).items()
             if callable(member) and not name.startswith("_")
         }
-        assert method_names == {"capabilities", "prepare_run", "run_command", "finalize_run"}
+        assert method_names == {
+            "capabilities",
+            "prepare_run",
+            "attach_run",
+            "run_command",
+            "finalize_run",
+        }
 
 
 class TestLeafPurity:
@@ -183,6 +194,83 @@ class TestLeafPurity:
                 if not is_self:
                     offenders.append(f"{source_path.name}:{node.lineno}:{imported}")
         assert offenders == []
+
+    def test_types_module_imports_only_stdlib(self) -> None:
+        # Requirement: serialized contract dataclasses remain independent of Conductor packages.
+        import sys
+
+        package_dir = Path(__file__).resolve().parents[2] / "src" / "conductor" / "execution"
+        stdlib_modules = set(sys.stdlib_module_names)
+        stdlib_modules.update(sys.builtin_module_names)
+        source_path = package_dir / "types.py"
+        import ast
+
+        tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+        imports = [
+            node.names[0].name.split(".")[0]
+            if isinstance(node, ast.Import)
+            else (node.module or "").split(".")[0]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            or isinstance(node, ast.ImportFrom)
+            and node.module is not None
+        ]
+        assert all(name in stdlib_modules for name in imports), imports
+
+    def test_workspace_identity_is_frozen_and_serializable(self) -> None:
+        # Requirement: retained identity is an immutable data-only checkpoint value.
+        identity = WorkspaceIdentity("docker", "lease", "incarnation", "volume")
+        assert dataclasses.asdict(identity) == {
+            "backend": "docker",
+            "lease_id": "lease",
+            "incarnation": "incarnation",
+            "location": "volume",
+        }
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            identity.backend = "local"
+
+    def test_lifecycle_type_defaults_preserve_legacy_construction(self) -> None:
+        # Requirement: additive fields preserve old constructors and ephemeral behavior.
+        assert CommandSpec("echo").attempt_id is None
+        assert RunSpec("x").workspace_persistence is None
+        assert RunnerCapabilities(True, False, True, False).retained_workspace is False
+        assert RunnerCapabilities(
+            batch=True, sessions=False, shared_workspace=True, snapshots=False
+        ) == RunnerCapabilities(True, False, True, False, False)
+
+    @pytest.mark.asyncio
+    async def test_local_rejects_retained_workspaces(self) -> None:
+        # Requirement: local execution must not claim attach or retention support.
+        backend = LocalRunnerBackend()
+        identity = WorkspaceIdentity("local", "x", "i")
+        with pytest.raises(
+            ExecutionSpecError, match="^local backend does not support retained workspaces$"
+        ):
+            await backend.attach_run(RunSpec("x"), identity)
+        with pytest.raises(
+            ExecutionSpecError, match="^local backend does not support retained workspaces$"
+        ):
+            await backend.prepare_run(RunSpec("x", workspace_persistence="durable"))
+
+    @pytest.mark.asyncio
+    async def test_docker_retained_workspace_stubs_fail_closed(self) -> None:
+        # Requirement: Docker never creates or attaches a retained workspace in this contract stage.
+        backend = DockerRunnerBackend()
+        identity = WorkspaceIdentity("docker", "x", "i")
+        with pytest.raises(
+            ExecutionSpecError,
+            match="^docker workspace attach arrives in the docker backend commit$",
+        ):
+            await backend.attach_run(RunSpec("x"), identity)
+        with pytest.raises(
+            ExecutionSpecError, match="^docker workspace retention is not implemented yet$"
+        ):
+            await backend.prepare_run(RunSpec("x", workspace_persistence="durable"))
+        lease = await backend.prepare_run(RunSpec("x"))
+        with pytest.raises(
+            ExecutionSpecError, match="^docker workspace retention is not implemented yet$"
+        ):
+            await backend.finalize_run(lease, "succeeded", retain=True)
 
 
 class TestLiteralVocabularies:
