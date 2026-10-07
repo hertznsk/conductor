@@ -75,7 +75,9 @@ class StubBackend:
             duration_seconds=0.0,
         )
 
-    async def finalize_run(self, lease: WorkspaceLease, outcome: RunOutcome) -> None:
+    async def finalize_run(
+        self, lease: WorkspaceLease, outcome: RunOutcome, *, retain: bool = False
+    ) -> None:
         self.finalize_calls.append((lease, outcome))
 
 

@@ -129,7 +129,9 @@ class _NoBatchBackend:
     ) -> CommandResult:
         raise NotImplementedError
 
-    async def finalize_run(self, lease: WorkspaceLease, outcome: RunOutcome) -> None:
+    async def finalize_run(
+        self, lease: WorkspaceLease, outcome: RunOutcome, *, retain: bool = False
+    ) -> None:
         raise NotImplementedError
 
 

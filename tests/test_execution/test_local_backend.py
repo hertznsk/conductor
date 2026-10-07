@@ -429,7 +429,9 @@ class RecordingBackend:
         self.calls.append((spec, lease, diagnostics))
         return self.result
 
-    async def finalize_run(self, lease: WorkspaceLease, outcome: RunOutcome) -> None:
+    async def finalize_run(
+        self, lease: WorkspaceLease, outcome: RunOutcome, *, retain: bool = False
+    ) -> None:
         del lease, outcome
 
 
