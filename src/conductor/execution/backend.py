@@ -86,7 +86,9 @@ class RunnerBackend(Protocol):
         """
         ...
 
-    async def attach_run(self, run: RunSpec, identity: WorkspaceIdentity) -> WorkspaceLease:
+    async def attach_run(
+        self, run: RunSpec, identity: WorkspaceIdentity, *, expect_staged: bool = False
+    ) -> WorkspaceLease:
         """Verify a retained workspace and return its process-local lease.
 
         This operation checks existence, labels, and incarnation only. It must not

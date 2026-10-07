@@ -26,8 +26,10 @@ from conductor.execution import (
     RunSpec,
     StartError,
     StartErrorKind,
+    WorkspaceIdentity,
     WorkspaceLease,
 )
+from conductor.execution.errors import WorkspaceAttachError
 from conductor.executor.script import ScriptExecutor
 
 
@@ -58,6 +60,19 @@ class TestLocalRunnerBackend:
         assert lease.backend == "local"
         assert len(lease.incarnation) == 12
         assert lease.location is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("expect_staged", [False, True])
+    async def test_attach_rejects_retained_workspace_with_staging_policy(
+        self, expect_staged: bool
+    ) -> None:
+        # Requirement: local attach accepts the shared staging policy but never attaches storage.
+        with pytest.raises(WorkspaceAttachError, match="local backend does not support"):
+            await LocalRunnerBackend().attach_run(
+                RunSpec("run-1"),
+                WorkspaceIdentity("local", "run-1", "token"),
+                expect_staged=expect_staged,
+            )
 
     @pytest.mark.asyncio
     async def test_echo_completed_result(self) -> None:
