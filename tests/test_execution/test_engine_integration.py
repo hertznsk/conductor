@@ -112,7 +112,9 @@ class RecordingBackend:
             return await self.run_command_impl(spec, lease)
         return self.command_result
 
-    async def finalize_run(self, lease: WorkspaceLease, outcome: RunOutcome) -> None:
+    async def finalize_run(
+        self, lease: WorkspaceLease, outcome: RunOutcome, *, retain: bool = False
+    ) -> None:
         self.finalize_calls.append((lease, outcome))
 
 
@@ -466,7 +468,9 @@ class GuardedLeaseBackend(RecordingBackend):
         assert lease not in self._finalized, "run_command received a finalized lease"
         return await super().run_command(spec, lease, diagnostics=diagnostics)
 
-    async def finalize_run(self, lease: WorkspaceLease, outcome: RunOutcome) -> None:
+    async def finalize_run(
+        self, lease: WorkspaceLease, outcome: RunOutcome, *, retain: bool = False
+    ) -> None:
         assert lease not in self._finalized, "lease finalized twice"
         self._finalized.add(lease)
         self.finalize_calls.append((lease, outcome))
@@ -512,7 +516,9 @@ class TestFinalizationUnderCancellation:
         finalize_release = asyncio.Event()
         completed: list[tuple[WorkspaceLease, RunOutcome]] = []
 
-        async def blocking_finalize(lease: WorkspaceLease, outcome: RunOutcome) -> None:
+        async def blocking_finalize(
+            lease: WorkspaceLease, outcome: RunOutcome, *, retain: bool = False
+        ) -> None:
             finalize_started.set()
             await finalize_release.wait()
             completed.append((lease, outcome))
