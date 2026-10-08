@@ -455,6 +455,22 @@ async def _stream_execute(
         for value in (payload.inner_provider_settings or {}).values()
         if isinstance(value, SecretStr)
     )
+    for server in (payload.mcp_servers or {}).values():
+        if not isinstance(server, dict):
+            continue
+        environment = server.get("env")
+        if isinstance(environment, dict):
+            redactor.register(
+                value.get_secret_value() if isinstance(value, SecretStr) else value
+                for value in environment.values()
+            )
+        headers = server.get("headers")
+        if server.get("type") in ("http", "sse") and isinstance(headers, dict):
+            redactor.register(
+                value.get_secret_value() if isinstance(value, SecretStr) else value
+                for name, value in headers.items()
+                if isinstance(name, str) and name.lower() == "authorization"
+            )
 
     def emit(event_type: str, data: dict[str, Any]) -> None:
         queue.put_nowait(_frame(event_type, redactor.scrub(data)))
