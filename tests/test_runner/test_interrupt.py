@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -14,9 +14,30 @@ import pytest
 from fastapi import FastAPI
 
 from conductor.aca_runner import server
-from conductor.config.schema import ProviderSettings
+from conductor.config.schema import (
+    AgentDef,
+    ContextConfig,
+    LimitsConfig,
+    OutputField,
+    ProviderSettings,
+    RouteDef,
+    RuntimeConfig,
+    WorkflowConfig,
+    WorkflowDef,
+)
+from conductor.engine.workflow import AgentRealm, WorkflowEngine
+from conductor.execution import (
+    AgentEventSink,
+    AgentResult,
+    AgentSpec,
+    LocalRunnerBackend,
+    RunnerCapabilities,
+    WorkspaceLease,
+)
+from conductor.gates.interrupt import InterruptAction, InterruptResult
 from conductor.providers.aca import AcaRuntimeProvider
 from conductor.providers.base import AgentOutput
+from conductor.providers.copilot import CopilotProvider
 from conductor.runner.protocol import RunnerHealthResponse
 
 
@@ -92,6 +113,101 @@ def _terminal(response: httpx.Response) -> dict[str, Any]:
     return json.loads(response.text.splitlines()[-1])
 
 
+async def test_main_loop_interrupt_returns_partial_through_remote_realm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Requirement: the real main loop passes its interrupt signal into the
+    # realm seam and receives a partial AgentOutput from the remote result.
+    started = asyncio.Event()
+    interrupt = asyncio.Event()
+    partial_seen: list[bool] = []
+
+    class RemoteBackend(LocalRunnerBackend):
+        def capabilities(self) -> RunnerCapabilities:
+            return RunnerCapabilities(
+                batch=False,
+                sessions=False,
+                shared_workspace=False,
+                snapshots=False,
+                agent=True,
+                interrupt=True,
+            )
+
+        async def run_agent(
+            self,
+            spec: AgentSpec,
+            lease: WorkspaceLease | None,
+            *,
+            on_event: AgentEventSink | None = None,
+            interrupt_signal: asyncio.Event | None = None,
+            execute_local: Callable[[], Awaitable[AgentResult]] | None = None,
+        ) -> AgentResult:
+            assert execute_local is None
+            assert lease is realm.lease
+            assert interrupt_signal is interrupt
+            started.set()
+            assert interrupt_signal is not None
+            await interrupt_signal.wait()
+            return AgentResult(content={"answer": "partial from realm"}, partial=True)
+
+    agent = AgentDef(
+        name="writer",
+        prompt="Write",
+        output={"answer": OutputField(type="string")},
+        routes=[RouteDef(to="$end")],
+    )
+    config = WorkflowConfig(
+        workflow=WorkflowDef(
+            name="interrupt-realm",
+            entry_point="writer",
+            runtime=RuntimeConfig(provider="copilot"),
+            context=ContextConfig(mode="accumulate"),
+            limits=LimitsConfig(max_iterations=10),
+        ),
+        agents=[agent],
+        output={"answer": "{{ writer.output.answer }}"},
+    )
+    backend = RemoteBackend()
+    realm = AgentRealm(
+        backend=backend,
+        lease=WorkspaceLease(lease_id="run", backend="remote", incarnation="first"),
+        execution=None,
+        env_overlay={},
+        credential_resolver=lambda _: {"github_token": "test"},
+        image=None,
+        name="remote",
+    )
+    engine = WorkflowEngine(
+        config,
+        CopilotProvider(mock_handler=lambda *_: {"answer": "host"}),
+        interrupt_event=interrupt,
+    )
+    monkeypatch.setattr(engine, "_agent_realm", lambda *_args, **_kwargs: realm)
+    original = engine._handle_partial_output
+
+    async def capture_partial(*args: Any, **kwargs: Any) -> AgentOutput:
+        partial_seen.append(args[1].partial)
+        interrupt.clear()
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(engine, "_handle_partial_output", capture_partial)
+    handle_interrupt = AsyncMock(return_value=InterruptResult(action=InterruptAction.CANCEL))
+    monkeypatch.setattr(engine._interrupt_handler, "handle_interrupt", handle_interrupt)
+    running = asyncio.create_task(engine.run({}))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        interrupt.set()
+        result = await asyncio.wait_for(running, timeout=5)
+    finally:
+        if not running.done():
+            running.cancel()
+            await asyncio.gather(running, return_exceptions=True)
+
+    assert partial_seen == [True]
+    assert result == {"answer": "partial from realm"}
+    handle_interrupt.assert_awaited_once()
+
+
 async def test_interrupt_targets_only_one_concurrent_agent() -> None:
     # Requirement: main-loop agent calls are interruptible without pausing a sibling;
     # parallel/for-each interrupt propagation is not promised by the engine today (N5).
@@ -151,6 +267,36 @@ async def test_interrupt_late_and_repeated_return_409() -> None:
     assert repeated.status_code == 409
     assert _terminal(result)["data"]["partial"] is True
     assert late.status_code == 409
+
+
+async def test_interrupt_after_terminal_frame_before_stream_drain_returns_409(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Requirement: a terminal execution refuses interruption even if its HTTP
+    # consumer has not drained the final frame and released the registry entry.
+    terminal_ready = asyncio.Event()
+    drain = asyncio.Event()
+    original = server._stream_execute
+
+    async def delayed_stream(*args: Any, **kwargs: Any) -> AsyncIterator[bytes]:
+        async for frame in original(*args, **kwargs):
+            if json.loads(frame)["type"] == "result":
+                terminal_ready.set()
+                await drain.wait()
+            yield frame
+
+    monkeypatch.setattr(server, "_stream_execute", delayed_stream)
+    async with _client(server.create_app()) as client:
+        request = asyncio.create_task(client.post("/execute", json=_body("terminal")))
+        await asyncio.wait_for(_InterruptibleProvider.started["terminal"].wait(), timeout=5)
+        _InterruptibleProvider.finish["terminal"].set()
+        try:
+            await asyncio.wait_for(terminal_ready.wait(), timeout=5)
+            response = await client.post("/interrupt", json={"execution_id": "terminal"})
+            assert response.status_code == 409
+        finally:
+            drain.set()
+            await asyncio.wait_for(request, timeout=5)
 
 
 async def test_interrupt_degraded_handshake(caplog: pytest.LogCaptureFixture) -> None:

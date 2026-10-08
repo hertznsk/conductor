@@ -30,7 +30,7 @@ import logging
 import shutil
 import time
 from collections import OrderedDict
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -429,6 +429,7 @@ async def _stream_execute(
     payload: RunnerAgentRequest,
     provider_cache: _InnerProviderCache,
     interrupt_signal: asyncio.Event | None,
+    mark_terminal: Callable[[], None] | None = None,
 ) -> AsyncIterator[bytes]:
     """Run the inner `execute()` call, yielding NDJSON frames as they arrive.
 
@@ -475,12 +476,16 @@ async def _stream_execute(
             )
         except Exception as exc:  # broad: forwarded as an error frame, never swallowed
             logger.error("runner: execute failed for agent %r (%s)", agent.name, type(exc).__name__)
-            await queue.put(_frame("error", {"message": redactor.scrub(str(exc))}))
+            frame = _frame("error", {"message": redactor.scrub(str(exc))})
+            if mark_terminal is not None:
+                mark_terminal()
+            await queue.put(frame)
         else:
             session_seconds = time.monotonic() - start
-            await queue.put(
-                _frame("result", redactor.scrub(_result_frame_data(output, session_seconds)))
-            )
+            frame = _frame("result", redactor.scrub(_result_frame_data(output, session_seconds)))
+            if mark_terminal is not None:
+                mark_terminal()
+            await queue.put(frame)
         finally:
             await queue.put(sentinel)
 
@@ -640,9 +645,13 @@ def create_app() -> FastAPI:
             active_executions[execution_id] = interrupt_signal
 
         async def stream() -> AsyncIterator[bytes]:
+            def mark_terminal() -> None:
+                if execution_id is not None:
+                    terminal_executions.add(execution_id)
+
             try:
                 async for frame in _stream_execute(
-                    provider, agent, payload, provider_cache, interrupt_signal
+                    provider, agent, payload, provider_cache, interrupt_signal, mark_terminal
                 ):
                     yield frame
             finally:
@@ -685,7 +694,7 @@ def create_app() -> FastAPI:
                 status_code=404,
                 content={"error": {"message": "runner: execution_id not found"}},
             )
-        if signal is None or signal.is_set():
+        if execution_id in terminal_executions or signal is None or signal.is_set():
             return JSONResponse(
                 status_code=409,
                 content={"error": {"message": "runner: execution already interrupted or terminal"}},
