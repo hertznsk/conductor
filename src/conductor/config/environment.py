@@ -189,6 +189,11 @@ class DockerProfileOptions(BaseModel):
     image: str
     """Container image reference (tag or digest)."""
 
+    runner_image: str | None = None
+    """OCI reference of the agent-realm runtime image (an image with the conductor runner
+    installed); when set, the profile is agent-capable; script steps keep using ``image``.
+    """
+
     platform: Literal["linux/amd64", "linux/arm64"] | None = None
     """Target platform for the container image (None = auto-resolved by Docker)."""
 
@@ -222,6 +227,16 @@ class DockerProfileOptions(BaseModel):
         stripped = value.strip()
         if not stripped or bool(re.search(r"\s", stripped)):
             raise ValueError("image must be a non-empty string without whitespace")
+        return stripped
+
+    @field_validator("runner_image")
+    @classmethod
+    def _validate_runner_image(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped or bool(re.search(r"\s", stripped)):
+            raise ValueError("runner_image must be a non-empty string without whitespace")
         return stripped
 
     @field_validator("user")
@@ -379,6 +394,8 @@ class EnvironmentDocument(BaseModel):
                     p.pop("inherit_control_environment", None)
                 if p.get("docker") is None:
                     p.pop("docker", None)
+                elif isinstance(p["docker"], dict) and p["docker"].get("runner_image") is None:
+                    p["docker"].pop("runner_image", None)
         return dump
 
 
@@ -424,6 +441,8 @@ def _document_digest(document: EnvironmentDocument) -> str:
                 p.pop("inherit_control_environment", None)
             if p.get("docker") is None:
                 p.pop("docker", None)
+            elif isinstance(p["docker"], dict) and p["docker"].get("runner_image") is None:
+                p["docker"].pop("runner_image", None)
     return canonical_json_digest(dump)
 
 
