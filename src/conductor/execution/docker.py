@@ -21,14 +21,18 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 from typing import cast
 from uuid import uuid4
 
+from conductor.exceptions import ConfigurationError
 from conductor.execution.errors import ExecutionSpecError
 from conductor.execution.types import (
+    AgentEventSink,
+    AgentResult,
+    AgentSpec,
     BundleRef,
     CommandResult,
     CommandSpec,
@@ -276,6 +280,21 @@ class DockerRunnerBackend:
             sessions=False,
             shared_workspace=True,
             snapshots=False,
+        )
+
+    async def run_agent(
+        self,
+        spec: AgentSpec,
+        lease: WorkspaceLease | None,
+        *,
+        on_event: AgentEventSink | None = None,
+        interrupt_signal: asyncio.Event | None = None,
+        execute_local: Callable[[], Awaitable[AgentResult]] | None = None,
+    ) -> AgentResult:
+        """Reject agent execution until the agent realm is implemented."""
+        del spec, lease, on_event, interrupt_signal, execute_local
+        raise ConfigurationError(
+            "docker agent realm is not available until the docker agent realm change lands"
         )
 
     async def prepare_run(self, run: RunSpec) -> WorkspaceLease:
