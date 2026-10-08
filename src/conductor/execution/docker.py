@@ -759,6 +759,7 @@ class DockerRunnerBackend:
         lease: WorkspaceLease | None,
         *,
         diagnostics: Callable[[str], None] | None = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> CommandResult:
         """Run one command in Docker and return its data-shaped outcome."""
         started_at = time.monotonic()
@@ -796,9 +797,10 @@ class DockerRunnerBackend:
                 await self._ensure_image(execution, diagnostics)
                 create_env = self._create_environment(spec, self._cli_env)
                 with self._container_env_file(create_env) as env_file:
-                    rc, _stdout, stderr = await self._run_docker(
-                        self._create_argv(spec, lease, execution, name, attempt, env_file)
-                    )
+                    create_argv = self._create_argv(spec, lease, execution, name, attempt, env_file)
+                    if on_dispatch is not None:
+                        on_dispatch()
+                    rc, _stdout, stderr = await self._run_docker(create_argv)
                 if rc != 0:
                     return self._start_failed(
                         name, self._version_hint(stderr) or _bounded(stderr), started_at

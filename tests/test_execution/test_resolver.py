@@ -66,8 +66,11 @@ class RecordingBackend:
         lease: WorkspaceLease | None,
         *,
         diagnostics: Any = None,
+        on_dispatch: Any = None,
     ) -> CommandResult:
         del diagnostics
+        if on_dispatch is not None:
+            on_dispatch()
         self.run_calls.append((spec, lease))
         return CommandResult(
             outcome="completed",

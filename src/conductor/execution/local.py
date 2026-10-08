@@ -120,6 +120,7 @@ class LocalRunnerBackend:
         lease: WorkspaceLease | None,
         *,
         diagnostics: Callable[[str], None] | None = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> CommandResult:
         """Run one command locally and return its data-shaped outcome."""
         del lease
@@ -157,6 +158,8 @@ class LocalRunnerBackend:
                 diagnostics(f"  Script stdin: {len(spec.stdin)} bytes")
 
         try:
+            if on_dispatch is not None:
+                on_dispatch()
             process = await asyncio.create_subprocess_exec(
                 resolved_command,
                 *spec.args,

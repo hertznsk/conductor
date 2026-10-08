@@ -63,8 +63,11 @@ class StubBackend:
         lease: WorkspaceLease | None,
         *,
         diagnostics: Any = None,
+        on_dispatch: Any = None,
     ) -> CommandResult:
         del lease, diagnostics
+        if on_dispatch is not None:
+            on_dispatch()
         self.run_calls.append(spec)
         return CommandResult(
             outcome="completed",

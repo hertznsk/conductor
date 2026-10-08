@@ -83,8 +83,11 @@ class RecordingBackend:
         lease: WorkspaceLease | None,
         *,
         diagnostics: Any = None,
+        on_dispatch: Any = None,
     ) -> CommandResult:
         del diagnostics
+        if on_dispatch is not None:
+            on_dispatch()
         self.run_calls.append((spec, lease))
         current = redaction.current()
         self.current_redactor_active.append(current is not None and current.active)

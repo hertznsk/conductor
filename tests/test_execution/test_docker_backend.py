@@ -1378,19 +1378,27 @@ async def test_attached_command_rechecks_marker_after_tampering(
     run = RunSpec("tamper", bundle=_stateful_bundle(tmp_path), workspace_persistence="durable")
     lease = await backend.prepare_run(run)
     spec = CommandSpec("true", execution=_minimal())
-    assert (await backend.run_command(spec, lease)).outcome == "completed"
+    dispatched: list[str] = []
+
+    def notify() -> None:
+        dispatched.append("create")
+
+    assert (await backend.run_command(spec, lease, on_dispatch=notify)).outcome == "completed"
     attached_backend = DockerRunnerBackend(binary)
     attached = await attached_backend.attach_run(
         run,
         WorkspaceIdentity("docker", lease.lease_id, lease.incarnation),
         expect_staged=expect_staged,
     )
-    assert (await attached_backend.run_command(spec, attached)).outcome == "completed"
+    assert (
+        await attached_backend.run_command(spec, attached, on_dispatch=notify)
+    ).outcome == "completed"
     marker = store / "volumes/conductor-ws-tamper/.conductor-staged"
     marker.write_text("sha256:foreign", encoding="utf-8")
     before = len(_stateful_commands(log))
     with pytest.raises(WorkspaceAttachError, match="digest mismatch"):
-        await attached_backend.run_command(spec, attached)
+        await attached_backend.run_command(spec, attached, on_dispatch=notify)
+    assert dispatched == ["create", "create"]
     commands = _stateful_commands(log)[before:]
     assert sum(argv[0] == "cp" and argv[1].endswith("/.conductor-staged") for argv in commands) == 1
     assert not any(argv[0] == "cp" and argv[1] == "-a" for argv in commands)
