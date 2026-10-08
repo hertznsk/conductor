@@ -5,62 +5,18 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
-from fastapi import FastAPI
 
-from conductor.aca_runner import server
 from conductor.config.schema import AgentDef, ProviderSettings
 from conductor.exceptions import ProviderError
 from conductor.providers.aca import AcaRuntimeProvider
-from conductor.providers.base import AgentOutput
+from tests.test_runner.conftest import DeliveryProvider, RunnerClientFactory
 
-
-class _FakeProvider:
-    instances: list[_FakeProvider] = []
-    started = asyncio.Event()
-    release = asyncio.Event()
-
-    def __init__(self, **kwargs: Any) -> None:
-        self.settings = kwargs
-        self.calls: list[dict[str, Any]] = []
-        self.closed = False
-        self.instances.append(self)
-
-    async def execute(self, agent: Any, context: Any, prompt: str, **kwargs: Any) -> AgentOutput:
-        self.calls.append(kwargs)
-        callback = kwargs["event_callback"]
-        callback("agent_turn_start", {"turn": "awaiting_model"})
-        mcp = self.settings["mcp_servers"]
-        if mcp:
-            callback("agent_message", {"content": mcp["echo"]["env"]["MCP_TOKEN"]})
-        if context.get("raise_with_secret"):
-            raise RuntimeError(f"MCP failed: {mcp['echo']['env']['MCP_TOKEN']}")
-        if len(self.instances) >= 2:
-            self.started.set()
-        if mcp:
-            await self.release.wait()
-        return AgentOutput(content={"answer": "done"}, raw_response=None, model="fake")
-
-    async def close(self) -> None:
-        self.closed = True
-
-
-@pytest.fixture(autouse=True)
-def _providers(monkeypatch: pytest.MonkeyPatch) -> None:
-    _FakeProvider.instances = []
-    _FakeProvider.started = asyncio.Event()
-    _FakeProvider.release = asyncio.Event()
-    monkeypatch.delenv("ACA_RUNNER_AUTH_TOKEN", raising=False)
-    monkeypatch.delenv("ACA_RUNNER_ALLOWED_BASE_URLS", raising=False)
-    monkeypatch.delenv("MCP_TOKEN", raising=False)
-    for name in ("CopilotProvider", "OpenAIProvider", "ClaudeProvider"):
-        monkeypatch.setattr(server, name, _FakeProvider)
+pytestmark = pytest.mark.usefixtures("delivery_provider")
 
 
 def _body(provider: str = "copilot", **extra: Any) -> dict[str, Any]:
@@ -76,22 +32,12 @@ def _frames(response: httpx.Response) -> list[dict[str, Any]]:
     return [json.loads(line) for line in response.text.splitlines()]
 
 
-@asynccontextmanager
-async def _running_client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
-    async with (
-        app.router.lifespan_context(app),
-        httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://runner"
-        ) as client,
-    ):
-        yield client
-
-
 @pytest.mark.parametrize("provider", ["copilot", "openai", "claude"])
-async def test_factory_executes_each_supported_provider(provider: str) -> None:
+async def test_factory_executes_each_supported_provider(
+    provider: str, runner_client_factory: RunnerClientFactory
+) -> None:
     # Requirement: all three model SDKs can be selected without a CLI inside the runner.
-    app = server.create_app()
-    async with _running_client(app) as client:
+    async with runner_client_factory() as client:
         response = await client.post(
             "/execute",
             json=_body(
@@ -106,34 +52,34 @@ async def test_factory_executes_each_supported_provider(provider: str) -> None:
         assert [frame["type"] for frame in frames] == ["agent_turn_start", "result"]
         assert sum(frame["type"] in {"result", "error"} for frame in frames) == 1
         assert "model-key" not in response.text
-        instance = _FakeProvider.instances[0]
+        instance = DeliveryProvider.instances[0]
         assert instance.calls[0]["skill_directories"] == ["/workspace/skills/review"]
         assert instance.calls[0]["custom_agents"] == [{"name": "reviewer", "prompt": "Review."}]
         assert instance.calls[0]["interrupt_signal"] is None
         assert instance.settings["mcp_servers"] is None
-    assert _FakeProvider.instances[0].closed
+    assert DeliveryProvider.instances[0].closed
 
 
 @pytest.mark.parametrize("provider", ["claude-agent-sdk", "hermes"])
-async def test_unknown_provider_returns_named_follow_up(provider: str) -> None:
+async def test_unknown_provider_returns_named_follow_up(
+    provider: str, runner_client_factory: RunnerClientFactory
+) -> None:
     # Requirement: unsupported model SDKs fail before opening the event stream.
-    app = server.create_app()
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://runner"
-    ) as client:
+    async with runner_client_factory() as client:
         response = await client.post("/execute", json=_body(provider))
     assert response.status_code == 400
     assert provider in response.json()["error"]["message"]
     assert "follow-up" in response.json()["error"]["message"]
-    assert not _FakeProvider.instances
+    assert not DeliveryProvider.instances
 
 
-async def test_overlapping_overlays_keep_spawn_env_and_provider_isolated() -> None:
+async def test_overlapping_overlays_keep_spawn_env_and_provider_isolated(
+    runner_client_factory: RunnerClientFactory,
+) -> None:
     # Requirement: distinct in-flight overlays cannot close or contaminate each other.
-    app = server.create_app()
     original_env = {"BASE": "base", "MCP_TOKEN": "default"}
     servers: dict[str, dict[str, Any]] = {"echo": {"command": "echo", "env": original_env}}
-    async with _running_client(app) as client:
+    async with runner_client_factory() as client:
         requests = [
             asyncio.create_task(
                 client.post(
@@ -143,20 +89,20 @@ async def test_overlapping_overlays_keep_spawn_env_and_provider_isolated() -> No
             )
             for value in ("secret-one", "secret-two")
         ]
-        await asyncio.wait_for(_FakeProvider.started.wait(), timeout=5)
-        assert len(_FakeProvider.instances) == 2
-        assert not any(instance.closed for instance in _FakeProvider.instances)
+        await asyncio.wait_for(DeliveryProvider.started.wait(), timeout=5)
+        assert len(DeliveryProvider.instances) == 2
+        assert not any(instance.closed for instance in DeliveryProvider.instances)
         assert {
             instance.settings["mcp_servers"]["echo"]["env"]["MCP_TOKEN"]
-            for instance in _FakeProvider.instances
+            for instance in DeliveryProvider.instances
         } == {"secret-one", "secret-two"}
         assert all(
             instance.settings["mcp_servers"]["echo"]["env"]["BASE"] == "base"
-            for instance in _FakeProvider.instances
+            for instance in DeliveryProvider.instances
         )
         assert original_env["MCP_TOKEN"] == "default"
         assert os.environ.get("MCP_TOKEN") is None
-        _FakeProvider.release.set()
+        DeliveryProvider.release.set()
         responses = await asyncio.wait_for(asyncio.gather(*requests), timeout=5)
         assert all(response.status_code == 200 for response in responses)
         assert all(
@@ -164,15 +110,14 @@ async def test_overlapping_overlays_keep_spawn_env_and_provider_isolated() -> No
             for response in responses
         )
         assert all(_frames(response)[-1]["type"] == "result" for response in responses)
-    assert all(instance.closed for instance in _FakeProvider.instances)
+    assert all(instance.closed for instance in DeliveryProvider.instances)
 
 
-async def test_overlay_without_stdio_server_is_an_explicit_error() -> None:
+async def test_overlay_without_stdio_server_is_an_explicit_error(
+    runner_client_factory: RunnerClientFactory,
+) -> None:
     # Requirement: an overlay with no spawn target is rejected, never dropped silently.
-    app = server.create_app()
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://runner"
-    ) as client:
+    async with runner_client_factory() as client:
         response = await client.post("/execute", json=_body(env_overlay={"MCP_TOKEN": "secret"}))
     assert response.status_code == 400
     assert "stdio MCP server" in response.json()["error"]["message"]
@@ -181,10 +126,10 @@ async def test_overlay_without_stdio_server_is_an_explicit_error() -> None:
 
 async def test_error_frames_and_runner_logs_redact_overlay(
     caplog: pytest.LogCaptureFixture,
+    runner_client_factory: RunnerClientFactory,
 ) -> None:
     # Requirement: even an inner SDK error echoing the spawn secret is redacted.
-    app = server.create_app()
-    async with _running_client(app) as client:
+    async with runner_client_factory() as client:
         response = await client.post(
             "/execute",
             json=_body(
@@ -199,38 +144,38 @@ async def test_error_frames_and_runner_logs_redact_overlay(
     assert "private-overlay" not in caplog.text
 
 
-async def test_matching_overlay_reuses_instance_and_idle_lru_is_bounded() -> None:
+async def test_matching_overlay_reuses_instance_and_idle_lru_is_bounded(
+    runner_client_factory: RunnerClientFactory,
+) -> None:
     # Requirement: a changing overlay cannot reuse stale credentials; idle SDKs are bounded.
-    app = server.create_app()
-    _FakeProvider.release.set()
+    DeliveryProvider.release.set()
     servers = {"echo": {"command": "echo"}}
-    async with _running_client(app) as client:
+    async with runner_client_factory() as client:
         for index in range(17):
             response = await client.post(
                 "/execute",
                 json=_body(mcp_servers=servers, env_overlay={"MCP_TOKEN": f"secret-{index}"}),
             )
             assert response.status_code == 200
-        assert len(_FakeProvider.instances) == 17
-        assert _FakeProvider.instances[0].closed
-        assert sum(not instance.closed for instance in _FakeProvider.instances) == 16
+        assert len(DeliveryProvider.instances) == 17
+        assert DeliveryProvider.instances[0].closed
+        assert sum(not instance.closed for instance in DeliveryProvider.instances) == 16
         response = await client.post(
             "/execute",
             json=_body(mcp_servers=servers, env_overlay={"MCP_TOKEN": "secret-16"}),
         )
         assert response.status_code == 200
-        assert len(_FakeProvider.instances) == 17
+        assert len(DeliveryProvider.instances) == 17
 
 
-async def test_malformed_request_is_rejected_before_streaming() -> None:
+async def test_malformed_request_is_rejected_before_streaming(
+    runner_client_factory: RunnerClientFactory,
+) -> None:
     # Requirement: malformed requests cannot report a successful NDJSON stream.
-    app = server.create_app()
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://runner"
-    ) as client:
+    async with runner_client_factory() as client:
         response = await client.post("/execute", json={"agent": {"name": "a"}, "unknown": 1})
     assert response.status_code == 422
-    assert not _FakeProvider.instances
+    assert not DeliveryProvider.instances
 
 
 @pytest.mark.parametrize(

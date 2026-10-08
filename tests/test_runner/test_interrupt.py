@@ -5,13 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
-from fastapi import FastAPI
 
 from conductor.aca_runner import server
 from conductor.config.schema import (
@@ -39,61 +37,9 @@ from conductor.providers.aca import AcaRuntimeProvider
 from conductor.providers.base import AgentOutput
 from conductor.providers.copilot import CopilotProvider
 from conductor.runner.protocol import RunnerHealthResponse
+from tests.test_runner.conftest import InterruptibleProvider, RunnerClientFactory
 
-
-class _InterruptibleProvider:
-    started: dict[str, asyncio.Event] = {}
-    finish: dict[str, asyncio.Event] = {}
-
-    def __init__(self, **kwargs: Any) -> None:
-        pass
-
-    async def execute(
-        self, agent: Any, context: dict[str, Any], prompt: str, **kwargs: Any
-    ) -> AgentOutput:
-        execution_id = context["execution_id"]
-        self.started[execution_id].set()
-        interrupt = kwargs["interrupt_signal"]
-        if interrupt is None:
-            await self.finish[execution_id].wait()
-            partial = False
-        else:
-            completed, pending = await asyncio.wait(
-                [
-                    asyncio.create_task(interrupt.wait()),
-                    asyncio.create_task(self.finish[execution_id].wait()),
-                ],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            partial = interrupt.is_set()
-        return AgentOutput(
-            content={"execution_id": execution_id}, raw_response=None, partial=partial
-        )
-
-    async def close(self) -> None:
-        pass
-
-
-@pytest.fixture(autouse=True)
-def _fake_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    _InterruptibleProvider.started = {}
-    _InterruptibleProvider.finish = {}
-    monkeypatch.setattr(server, "CopilotProvider", _InterruptibleProvider)
-    monkeypatch.delenv("ACA_RUNNER_AUTH_TOKEN", raising=False)
-
-
-@asynccontextmanager
-async def _client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
-    async with (
-        app.router.lifespan_context(app),
-        httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://runner"
-        ) as client,
-    ):
-        yield client
+pytestmark = pytest.mark.usefixtures("interruptible_provider")
 
 
 def _body(execution_id: str, *, legacy: bool = False) -> dict[str, Any]:
@@ -104,8 +50,8 @@ def _body(execution_id: str, *, legacy: bool = False) -> dict[str, Any]:
     }
     if not legacy:
         body["execution_id"] = execution_id
-    _InterruptibleProvider.started[execution_id] = asyncio.Event()
-    _InterruptibleProvider.finish[execution_id] = asyncio.Event()
+    InterruptibleProvider.started[execution_id] = asyncio.Event()
+    InterruptibleProvider.finish[execution_id] = asyncio.Event()
     return body
 
 
@@ -154,13 +100,16 @@ async def test_main_loop_interrupt_returns_partial_through_remote_realm(
         name="writer",
         prompt="Write",
         output={"answer": OutputField(type="string")},
+        timeout_seconds=None,
+        max_session_seconds=None,
+        max_agent_iterations=None,
         routes=[RouteDef(to="$end")],
     )
     config = WorkflowConfig(
         workflow=WorkflowDef(
             name="interrupt-realm",
             entry_point="writer",
-            runtime=RuntimeConfig(provider="copilot"),
+            runtime=RuntimeConfig.model_validate({"provider": "copilot"}),
             context=ContextConfig(mode="accumulate"),
             limits=LimitsConfig(max_iterations=10),
         ),
@@ -208,21 +157,22 @@ async def test_main_loop_interrupt_returns_partial_through_remote_realm(
     handle_interrupt.assert_awaited_once()
 
 
-async def test_interrupt_targets_only_one_concurrent_agent() -> None:
+async def test_interrupt_targets_only_one_concurrent_agent(
+    runner_client_factory: RunnerClientFactory,
+) -> None:
     # Requirement: main-loop agent calls are interruptible without pausing a sibling;
-    # parallel/for-each interrupt propagation is not promised by the engine today (N5).
-    app = server.create_app()
-    async with _client(app) as client:
+    # parallel/for-each interrupt propagation is not promised by the engine today.
+    async with runner_client_factory() as client:
         first = asyncio.create_task(client.post("/execute", json=_body("first")))
         second = asyncio.create_task(client.post("/execute", json=_body("second")))
         await asyncio.wait_for(
-            asyncio.gather(*(event.wait() for event in _InterruptibleProvider.started.values())),
+            asyncio.gather(*(event.wait() for event in InterruptibleProvider.started.values())),
             timeout=5,
         )
         response = await client.post("/interrupt", json={"execution_id": "first"})
         assert response.status_code == 200
-        assert not _InterruptibleProvider.finish["second"].is_set()
-        _InterruptibleProvider.finish["second"].set()
+        assert not InterruptibleProvider.finish["second"].is_set()
+        InterruptibleProvider.finish["second"].set()
         first_response, second_response = await asyncio.wait_for(
             asyncio.gather(first, second), timeout=5
         )
@@ -231,34 +181,39 @@ async def test_interrupt_targets_only_one_concurrent_agent() -> None:
         assert _terminal(second_response)["data"]["partial"] is False
 
 
-async def test_interrupt_unknown_returns_404() -> None:
+async def test_interrupt_unknown_returns_404(
+    runner_client_factory: RunnerClientFactory,
+) -> None:
     # Requirement: an unknown execution cannot interrupt another running call.
-    async with _client(server.create_app()) as client:
+    async with runner_client_factory() as client:
         response = await client.post("/interrupt", json={"execution_id": "missing"})
     assert response.status_code == 404
 
 
-async def test_interrupt_duplicate_active_identity_returns_409() -> None:
+async def test_interrupt_duplicate_active_identity_returns_409(
+    runner_client_factory: RunnerClientFactory,
+) -> None:
     # Requirement: two calls cannot claim the same interrupt target.
-    async with _client(server.create_app()) as client:
+    async with runner_client_factory() as client:
         first = asyncio.create_task(client.post("/execute", json=_body("shared")))
-        await asyncio.wait_for(_InterruptibleProvider.started["shared"].wait(), timeout=5)
+        await asyncio.wait_for(InterruptibleProvider.started["shared"].wait(), timeout=5)
         duplicate = await client.post(
             "/execute",
             json={"agent": {"name": "agent"}, "rendered_prompt": "task", "execution_id": "shared"},
         )
-        _InterruptibleProvider.finish["shared"].set()
+        InterruptibleProvider.finish["shared"].set()
         completed = await asyncio.wait_for(first, timeout=5)
     assert duplicate.status_code == 409
     assert _terminal(completed)["data"]["partial"] is False
 
 
-async def test_interrupt_late_and_repeated_return_409() -> None:
+async def test_interrupt_late_and_repeated_return_409(
+    runner_client_factory: RunnerClientFactory,
+) -> None:
     # Requirement: already signaled and terminal identities cannot be signaled again.
-    app = server.create_app()
-    async with _client(app) as client:
+    async with runner_client_factory() as client:
         request = asyncio.create_task(client.post("/execute", json=_body("done")))
-        await asyncio.wait_for(_InterruptibleProvider.started["done"].wait(), timeout=5)
+        await asyncio.wait_for(InterruptibleProvider.started["done"].wait(), timeout=5)
         first = await client.post("/interrupt", json={"execution_id": "done"})
         repeated = await client.post("/interrupt", json={"execution_id": "done"})
         result = await asyncio.wait_for(request, timeout=5)
@@ -271,6 +226,7 @@ async def test_interrupt_late_and_repeated_return_409() -> None:
 
 async def test_interrupt_after_terminal_frame_before_stream_drain_returns_409(
     monkeypatch: pytest.MonkeyPatch,
+    runner_client_factory: RunnerClientFactory,
 ) -> None:
     # Requirement: a terminal execution refuses interruption even if its HTTP
     # consumer has not drained the final frame and released the registry entry.
@@ -286,10 +242,10 @@ async def test_interrupt_after_terminal_frame_before_stream_drain_returns_409(
             yield frame
 
     monkeypatch.setattr(server, "_stream_execute", delayed_stream)
-    async with _client(server.create_app()) as client:
+    async with runner_client_factory() as client:
         request = asyncio.create_task(client.post("/execute", json=_body("terminal")))
-        await asyncio.wait_for(_InterruptibleProvider.started["terminal"].wait(), timeout=5)
-        _InterruptibleProvider.finish["terminal"].set()
+        await asyncio.wait_for(InterruptibleProvider.started["terminal"].wait(), timeout=5)
+        InterruptibleProvider.finish["terminal"].set()
         try:
             await asyncio.wait_for(terminal_ready.wait(), timeout=5)
             response = await client.post("/interrupt", json={"execution_id": "terminal"})
@@ -299,10 +255,13 @@ async def test_interrupt_after_terminal_frame_before_stream_drain_returns_409(
             await asyncio.wait_for(request, timeout=5)
 
 
-async def test_interrupt_degraded_handshake(caplog: pytest.LogCaptureFixture) -> None:
+async def test_interrupt_degraded_handshake(
+    caplog: pytest.LogCaptureFixture,
+    runner_client_factory: RunnerClientFactory,
+) -> None:
     # Requirement: only v2 images advertising interrupt can enable realm interrupt;
     # v1 and missing-feature images keep interrupt=False and use legacy abort-read.
-    async with _client(server.create_app()) as client:
+    async with runner_client_factory() as client:
         response = await client.get("/health")
     advertised = RunnerHealthResponse.model_validate(response.json())
     assert advertised.protocol_version == 2
@@ -315,10 +274,13 @@ async def test_interrupt_degraded_handshake(caplog: pytest.LogCaptureFixture) ->
     assert any(record.name == "conductor.providers.aca" for record in caplog.records)
 
 
-async def test_interrupt_auth_and_bad_input(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_interrupt_auth_and_bad_input(
+    monkeypatch: pytest.MonkeyPatch,
+    runner_client_factory: RunnerClientFactory,
+) -> None:
     # Requirement: interruption uses the execute token gate and rejects malformed IDs.
     monkeypatch.setenv("ACA_RUNNER_AUTH_TOKEN", "runner-token")
-    async with _client(server.create_app()) as client:
+    async with runner_client_factory() as client:
         unauthorized = await client.post("/interrupt", json={"execution_id": "one"})
         malformed = await client.post(
             "/interrupt", content=b"{broken", headers={"X-Conductor-Runner-Token": "runner-token"}
@@ -333,6 +295,7 @@ async def test_interrupt_auth_and_bad_input(monkeypatch: pytest.MonkeyPatch) -> 
 
 async def test_legacy_aca_interrupt_reaches_runner_with_identifier(
     monkeypatch: pytest.MonkeyPatch,
+    runner_client_factory: RunnerClientFactory,
 ) -> None:
     # Requirement: the existing legacy ACA POST, which has no JSON body, works
     # against a new runner through the gateway's identifier routing.
@@ -341,8 +304,7 @@ async def test_legacy_aca_interrupt_reaches_runner_with_identifier(
         legacy = AcaRuntimeProvider(
             provider_settings=ProviderSettings(name="aca", pool_endpoint="https://pool.example.com")
         )
-    app = server.create_app()
-    async with _client(app) as client:
+    async with runner_client_factory() as client:
         legacy._get_access_token = AsyncMock(return_value="transport-token")
         legacy._http_client = client
         request = asyncio.create_task(
@@ -350,26 +312,28 @@ async def test_legacy_aca_interrupt_reaches_runner_with_identifier(
                 "/execute", params={"identifier": "legacy"}, json=_body("legacy", legacy=True)
             )
         )
-        await asyncio.wait_for(_InterruptibleProvider.started["legacy"].wait(), timeout=5)
+        await asyncio.wait_for(InterruptibleProvider.started["legacy"].wait(), timeout=5)
         await legacy._send_interrupt("legacy")
         result = await asyncio.wait_for(request, timeout=5)
     assert _terminal(result)["data"]["partial"] is True
 
 
-async def test_legacy_aca_identifier_can_be_reused_after_completion() -> None:
+async def test_legacy_aca_identifier_can_be_reused_after_completion(
+    runner_client_factory: RunnerClientFactory,
+) -> None:
     # Requirement: the legacy gateway's sequential session reuse remains valid.
-    async with _client(server.create_app()) as client:
+    async with runner_client_factory() as client:
         first_body = _body("legacy-one", legacy=True)
         first = asyncio.create_task(
             client.post("/execute", params={"identifier": "session"}, json=first_body)
         )
-        await asyncio.wait_for(_InterruptibleProvider.started["legacy-one"].wait(), timeout=5)
-        _InterruptibleProvider.finish["legacy-one"].set()
+        await asyncio.wait_for(InterruptibleProvider.started["legacy-one"].wait(), timeout=5)
+        InterruptibleProvider.finish["legacy-one"].set()
         assert (await asyncio.wait_for(first, timeout=5)).status_code == 200
         second_body = _body("legacy-two", legacy=True)
         second = asyncio.create_task(
             client.post("/execute", params={"identifier": "session"}, json=second_body)
         )
-        await asyncio.wait_for(_InterruptibleProvider.started["legacy-two"].wait(), timeout=5)
-        _InterruptibleProvider.finish["legacy-two"].set()
+        await asyncio.wait_for(InterruptibleProvider.started["legacy-two"].wait(), timeout=5)
+        InterruptibleProvider.finish["legacy-two"].set()
         assert (await asyncio.wait_for(second, timeout=5)).status_code == 200
