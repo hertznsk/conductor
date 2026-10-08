@@ -3140,12 +3140,31 @@ environment 'demo' mixes local and docker script backends: host_step (local), co
 
 Docker steps execute against the pre-staged content-addressed run bundle in the named volume. Changes made to the host filesystem by earlier local script steps are not automatically mirrored into the container volume.
 
-#### Non-Script Steps Reserved Errors
+### Execution Profiles on Agent Steps
 
-In this release, `backend: docker` is available for `type: script` steps only. Assigning a Docker execution profile to LLM agents (`type: agent`), direct MCP tool steps (`type: mcp`), or sub-workflows (`type: workflow`) fails validation and manifest compilation:
+Agent steps (`type: agent` or default untagged steps) can run inside remote execution realms when assigned to a profile with `backend: docker` (with `runner_image` configured) or `backend: aca`.
+
+#### Backend and Step Type Capability Matrix
+
+The following table summarizes step type support across execution backends:
+
+| Step Type | `local` | `docker` | `aca` |
+|---|---|---|---|
+| `agent` | Supported | Supported (requires `runner_image`) | Supported |
+| `script` | Supported | Supported (uses `image`) | Rejected |
+| `mcp` | Supported | Rejected | Rejected |
+| `workflow` | Supported | Rejected | Rejected |
+
+Direct MCP tool steps (`type: mcp`) and sub-workflows (`type: workflow`) require the local backend. Assigning either step type to a remote backend (`docker` or `aca`) fails validation and manifest compilation:
 
 ```
-Step '<name>' resolves to backend 'docker' in environment '<env>', but backend 'docker' is available for script steps only; agent execution realms arrive in step 7.
+Step '<name>' resolves to backend '<backend>', but this step requires the local backend.
+```
+
+Assigning an agent step to a Docker profile that omits `runner_image` fails validation with:
+
+```
+Agent step '<name>' resolves to Docker without docker.runner_image.
 ```
 
 #### Environment Inheritance (`inherit_control_environment`)
@@ -3251,8 +3270,16 @@ Remote servers used by an effective Claude or OpenAI consumer are rejected by bo
 1. **Scope Requirements**:
    - `scope: script` is required for script steps.
    - `scope: mcp` is used for MCP-server delivery outside agent realms.
-   - `scope: agent` is allowed on agent steps using remote Docker or ACA profiles and on stdio MCP servers when all consuming agents use remote realms. It requires `delivery.env` and either a declared stdio MCP server or an enabled MCP plugin that may provide one (`tools: []` cannot consume either). Static validation does not fetch or inspect plugin contents; a plugin that supplies no stdio server leaves the runner to reject the undeliverable overlay. Without any possible consumer, explicit validation and manifest compilation fail before runner contact. The variable reaches the spawn environment of in-realm stdio MCP processes per call, not the model SDK environment. A local agent inherits the control environment and does not support scoped agent delivery. Bare validation warns to rerun with `--environment` when placement cannot be checked.
-   - Agent-scoped delivery names cannot be `base_url`, `api_key`, `bearer_token`, `github_token`, `GITHUB_TOKEN`, `GH_TOKEN`, `COPILOT_GITHUB_TOKEN`, `COPILOT_PROVIDER_API_KEY`, `COPILOT_PROVIDER_BEARER_TOKEN`, `OPENAI_API_KEY`, or `ANTHROPIC_API_KEY`: use another MCP variable name. Remote realms support `copilot`, `openai`, and `claude` as inner providers; other providers require a separate implementation.
+   - `scope: agent` is allowed on agent steps using remote Docker or ACA profiles and on stdio MCP servers when all consuming agents use remote realms. It requires `delivery.env` and either a declared stdio MCP server or an enabled MCP plugin that may provide one (`tools: []` cannot consume either). Static validation does not fetch or inspect plugin contents; a plugin that supplies no stdio server leaves the runner to reject the undeliverable overlay. Without any possible consumer, explicit validation and manifest compilation fail before runner contact. The variable reaches the spawn environment of in-realm stdio MCP processes per call, not the model SDK environment. A local agent inherits the control environment and does not support scoped agent delivery. Requesting agent-scope delivery on a local profile fails with:
+     ```
+     Agent step '<name>': local agent runtime inherits the control environment; scoped delivery for local agents is not built, use a remote execution profile or mcp/script scope.
+     ```
+     Bare validation warns to rerun with `--environment` when placement cannot be checked.
+   - **Reserved-Name Rule**: Agent-scoped delivery names cannot collide with model provider credentials. Using any of the reserved names (`base_url`, `api_key`, `bearer_token`, `github_token`, `GITHUB_TOKEN`, `GH_TOKEN`, `COPILOT_GITHUB_TOKEN`, `COPILOT_PROVIDER_API_KEY`, `COPILOT_PROVIDER_BEARER_TOKEN`, `OPENAI_API_KEY`, or `ANTHROPIC_API_KEY`, checked case-insensitively) fails validation with:
+     ```
+     Agent-scope delivery.env '<name>' is reserved for provider credentials; choose a different MCP process environment variable.
+     ```
+     Remote realms support `copilot`, `openai`, and `claude` as inner providers; other providers require a separate implementation.
 2. **Delivery Collisions**:
    - Literal `env` and secret `env` delivery names within the same consumer must be unique.
    - Literal `headers` and secret `header` delivery names within the same consumer must be unique (case-insensitive).

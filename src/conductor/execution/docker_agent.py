@@ -71,7 +71,26 @@ async def stream_agent(
     can_interrupt: bool,
     send_interrupt: Callable[[str], Awaitable[None]],
 ) -> AgentResult:
-    """Read each bounded NDJSON frame before awaiting the next one."""
+    """Stream one Docker agent invocation through the runner bridge.
+
+    Args:
+        binary: Docker CLI executable.
+        cli_env: Environment for the Docker CLI process.
+        container: Lease-owned runner container name.
+        spec: Resolved agent invocation sent to the runner.
+        on_event: Optional sink for non-terminal agent frames.
+        interrupt_signal: Optional signal requesting a graceful interruption.
+        can_interrupt: Whether the runner advertises targeted interrupts.
+        send_interrupt: Callback delivering an interrupt by execution ID.
+
+    Returns:
+        The terminal agent result, or a partial result on an unsupported
+        runner interrupted while reading its stream.
+
+    Raises:
+        ConfigurationError: If the bridge stream is malformed or incomplete.
+        ProviderError: If the runner reports an agent execution error.
+    """
     process = await asyncio.create_subprocess_exec(
         binary,
         "exec",
@@ -129,7 +148,11 @@ async def stream_agent(
             try:
                 frame = json.loads(line)
             except json.JSONDecodeError as exc:
-                raise ConfigurationError("Docker runner emitted malformed NDJSON") from exc
+                raise ConfigurationError(
+                    f"Docker runner bridge in container {container!r} emitted malformed NDJSON "
+                    f"for execution {spec.execution_id!r}. Check runner logs and rebuild the "
+                    "runner image if it is stale."
+                ) from exc
             if not isinstance(frame, dict) or not isinstance(frame.get("data"), dict):
                 raise ConfigurationError("Docker runner emitted an invalid frame")
             frame_type = frame.get("type")

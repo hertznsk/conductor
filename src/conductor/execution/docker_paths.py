@@ -110,7 +110,19 @@ def _map_working_dir(value: str | None, bundle: BundleRef) -> str | None:
 
 
 def map_agent_paths(spec: AgentSpec, bundle: BundleRef | None) -> AgentSpec:
-    """Require each host component to match the published content topology."""
+    """Map host agent paths onto their published Docker workspace locations.
+
+    Args:
+        spec: Agent invocation with host-side skill and working directories.
+        bundle: Published bundle containing the staged files and path mapping.
+
+    Returns:
+        A copy of the invocation with staged skill and working directories.
+
+    Raises:
+        ConfigurationError: If the bundle topology is unreadable or a required
+            host component is missing from the published bundle.
+    """
     if bundle is None:
         raise ConfigurationError("Docker agent realm requires a published run bundle")
     try:

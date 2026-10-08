@@ -18,6 +18,7 @@ from pydantic import SecretStr
 from starlette.testclient import TestClient
 
 from conductor.providers.base import AgentOutput
+from conductor.redaction import REDACTED_MARKER
 
 
 class _FakeCopilotProvider:
@@ -166,6 +167,49 @@ class TestHealth:
 
 class TestExecuteStreaming:
     """`POST /execute` (E4-T2) — NDJSON event frames + terminal `result`."""
+
+    def test_mcp_credentials_are_redacted_from_provider_events(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Requirement: MCP spawn and HTTP authorization secrets echoed by a
+        # provider cannot escape into the runner's NDJSON event stream.
+        async def echo_secrets(
+            provider: _FakeCopilotProvider, *_args: Any, event_callback: Any, **_kwargs: Any
+        ) -> AgentOutput:
+            servers = provider.mcp_servers
+            assert servers is not None
+            event_callback(
+                "agent_message",
+                {
+                    "content": [
+                        servers["stdio"]["env"]["TOKEN"],
+                        servers["remote"]["headers"]["authorization"],
+                    ]
+                },
+            )
+            return provider._result
+
+        monkeypatch.setattr(_FakeCopilotProvider, "execute", echo_secrets)
+        secrets = ("mcp-env-private-value", "Bearer mcp-header-private-value")
+        response = client.post(
+            "/execute",
+            json=_execute_body(
+                mcp_servers={
+                    "stdio": {"command": "echo", "env": {"TOKEN": secrets[0]}},
+                    "remote": {
+                        "type": "http",
+                        "url": "https://example.com/mcp",
+                        "headers": {"authorization": secrets[1]},
+                    },
+                }
+            ),
+        )
+        assert response.status_code == 200
+        assert _parse_ndjson(response.text)[0] == {
+            "type": "agent_message",
+            "data": {"content": [REDACTED_MARKER, REDACTED_MARKER]},
+        }
+        assert all(secret not in response.text for secret in secrets)
 
     def test_execute_streams_events_and_terminal_result(self, client: TestClient) -> None:
         response = client.post("/execute", json=_execute_body())
