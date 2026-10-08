@@ -385,6 +385,7 @@ async def test_failed_run_retains_docker_and_successful_resume_removes_it(
     assert checkpoint.workspace is not None
     assert checkpoint.workspace["executed_backends"] == ["docker"]
     assert checkpoint.interrupted_step is not None
+    assert backend.attempts[0] is not None
     assert checkpoint.interrupted_step["attempt_id"] == backend.attempts[0]
 
     backend.fail_command = False
@@ -396,6 +397,42 @@ async def test_failed_run_retains_docker_and_successful_resume_removes_it(
     assert backend.outcomes == [("failed", True), ("succeeded", False)]
     assert backend.volume is False
     assert backend.attempts[0] != backend.attempts[1]
+
+
+@pytest.mark.asyncio
+async def test_plain_docker_run_has_no_attempt_id_or_mint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: Docker commands without a retained policy keep the legacy spec and labels.
+    class PlainDocker(_RetainedDocker):
+        async def prepare_run(self, run: RunSpec) -> WorkspaceLease:
+            assert run.workspace_persistence is None
+            self.volume = True
+            return WorkspaceLease(run.run_id, "docker", "ephemeral", "volume")
+
+    backend = PlainDocker()
+    backend.fail_command = False
+    monkeypatch.setitem(BACKEND_FACTORIES, "docker", lambda: backend)
+    base = _engine(tmp_path)
+    base.config.workflow.workspace = None
+    engine = WorkflowEngine(
+        base.config,
+        workflow_path=base.workflow_path,
+        execution_environment=base._execution_session.environment,
+        run_context=RunContext(run_id="plain-docker"),
+    )
+    bundle = BundleRef("sha256:bundle", str(tmp_path))
+    with (
+        patch(
+            "conductor.engine.workflow.prepare_run_bundle",
+            new_callable=AsyncMock,
+            return_value=bundle,
+        ),
+        patch.object(engine, "_mint_attempt", wraps=engine._mint_attempt) as mint,
+    ):
+        await engine.run({})
+    mint.assert_not_called()
+    assert backend.attempts == [None]
 
 
 @pytest.mark.asyncio
