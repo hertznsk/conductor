@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import errno
 import json
 import os
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -38,6 +40,43 @@ def test_live_owner_is_refused(tmp_path, monkeypatch) -> None:
     with pytest.raises(WorkspaceClaimError, match=str(os.getpid())):
         acquire_workspace_claim("run-2")
     claim.release()
+
+
+@pytest.mark.asyncio
+async def test_live_child_claim_blocks_parent_until_child_exits(tmp_path, monkeypatch) -> None:
+    # Requirement: a different process cannot claim a live owner, then can reap its stale claim.
+    monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path))
+    child_code = (
+        "import sys\n"
+        "from conductor.engine.workspace_claim import acquire_workspace_claim\n"
+        "acquire_workspace_claim('cross-process')\n"
+        "print('READY', flush=True)\n"
+        "sys.stdin.buffer.read(1)\n"
+    )
+    child = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        child_code,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        assert child.stdout is not None
+        assert await asyncio.wait_for(child.stdout.readline(), timeout=10) == b"READY\n"
+        with pytest.raises(WorkspaceClaimError, match=str(child.pid)):
+            acquire_workspace_claim("cross-process")
+        assert child.stdin is not None
+        child.stdin.write(b"x")
+        await child.stdin.drain()
+        assert await asyncio.wait_for(child.wait(), timeout=10) == 0
+        claim = acquire_workspace_claim("cross-process")
+        assert claim.path.exists()
+        claim.release()
+    finally:
+        if child.returncode is None:
+            child.kill()
+            await asyncio.wait_for(child.wait(), timeout=10)
 
 
 def test_eperm_owner_is_treated_as_alive(tmp_path, monkeypatch) -> None:
