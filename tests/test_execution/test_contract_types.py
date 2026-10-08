@@ -378,13 +378,13 @@ async def test_local_run_agent_preserves_result_identity() -> None:
 
 @pytest.mark.asyncio
 async def test_docker_agent_stub_reports_unavailable_realm() -> None:
-    # Requirement: Docker agent execution fails explicitly until its realm lands.
+    # Requirement: Docker agent calls cannot run without a lease and runner image.
     from conductor.exceptions import ConfigurationError
     from conductor.execution.docker import DockerRunnerBackend
 
     with pytest.raises(
         ConfigurationError,
-        match="docker agent realm is not available until the docker agent realm change lands",
+        match="requires a Docker lease and runner image",
     ):
         await DockerRunnerBackend("docker").run_agent(
             AgentSpec("agent", "exec-1", "copilot", None, "prompt"), None

@@ -46,11 +46,19 @@ class BundleRef:
         root: Logical directory of the root workflow relative to ``tree/``
             (e.g. ``main`` or ``registry/name/sha``). Defaults to ``main``
             for existing callers.
+        source_roots: Ephemeral host directory and staged namespace pairs used
+            to translate agent working directories. Never part of a bundle digest.
+        agent_paths: Ephemeral host dependency directory and staged namespace
+            pairs used to verify agent components against the collected closure.
     """
 
     digest: str
     store_path: str
     root: str = "main"
+    source_roots: tuple[tuple[str, str], ...] = ()
+    """Host directory and staged namespace pairs for runtime path translation."""
+    agent_paths: tuple[tuple[str, str], ...] = ()
+    """Host skill/plugin directory and its collected staged namespace."""
 
 
 @dataclass(frozen=True)
