@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import textwrap
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import MagicMock
@@ -106,7 +107,10 @@ class RecordingBackend:
         lease: WorkspaceLease | None,
         *,
         diagnostics: Any = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> CommandResult:
+        if on_dispatch is not None:
+            on_dispatch()
         self.run_calls.append((spec, lease))
         if self.run_command_impl is not None:
             return await self.run_command_impl(spec, lease)
@@ -464,9 +468,12 @@ class GuardedLeaseBackend(RecordingBackend):
         lease: WorkspaceLease | None,
         *,
         diagnostics: Any = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> CommandResult:
         assert lease not in self._finalized, "run_command received a finalized lease"
-        return await super().run_command(spec, lease, diagnostics=diagnostics)
+        return await super().run_command(
+            spec, lease, diagnostics=diagnostics, on_dispatch=on_dispatch
+        )
 
     async def finalize_run(
         self, lease: WorkspaceLease, outcome: RunOutcome, *, retain: bool = False

@@ -31,7 +31,7 @@ from conductor.engine.checkpoint import CheckpointData, CheckpointManager
 from conductor.engine.execution_resolution import BACKEND_FACTORIES
 from conductor.engine.workflow import RunContext, WorkflowEngine
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
-from conductor.exceptions import CheckpointError, ExecutionError, TemplateError
+from conductor.exceptions import CheckpointError, ConfigurationError, ExecutionError, TemplateError
 from conductor.execution import (
     BundleRef,
     CommandResult,
@@ -42,6 +42,7 @@ from conductor.execution import (
     WorkspaceIdentity,
     WorkspaceLease,
 )
+from conductor.execution.errors import WorkspaceAttachError
 from conductor.providers.copilot import CopilotProvider
 
 
@@ -342,9 +343,16 @@ class _RetainedDocker:
         return WorkspaceLease(run.run_id, "docker", identity.incarnation, "volume")
 
     async def run_command(
-        self, spec: CommandSpec, lease: WorkspaceLease | None, *, diagnostics=None
+        self,
+        spec: CommandSpec,
+        lease: WorkspaceLease | None,
+        *,
+        diagnostics=None,
+        on_dispatch=None,
     ) -> CommandResult:
         assert lease is not None and self.volume
+        if on_dispatch is not None:
+            on_dispatch()
         self.marker = True
         self.attempts.append(spec.attempt_id)
         if self.fail_command:
@@ -397,6 +405,60 @@ async def test_failed_run_retains_docker_and_successful_resume_removes_it(
     assert backend.outcomes == [("failed", True), ("succeeded", False)]
     assert backend.volume is False
     assert backend.attempts[0] != backend.attempts[1]
+
+
+@pytest.mark.asyncio
+async def test_precreate_verification_failure_does_not_mark_backend_executed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: attached verification before create cannot claim a Docker command ran.
+    class VerifyBeforeCreate(_RetainedDocker):
+        reject = True
+
+        async def run_command(
+            self,
+            spec: CommandSpec,
+            lease: WorkspaceLease | None,
+            *,
+            diagnostics=None,
+            on_dispatch=None,
+        ) -> CommandResult:
+            if self.reject:
+                raise WorkspaceAttachError("pre-create verification refused")
+            return await super().run_command(
+                spec, lease, diagnostics=diagnostics, on_dispatch=on_dispatch
+            )
+
+    backend = VerifyBeforeCreate()
+    backend.fail_command = False
+    monkeypatch.setitem(BACKEND_FACTORIES, "docker", lambda: backend)
+    bundle = BundleRef("sha256:bundle", str(tmp_path))
+    engine = _engine(tmp_path, persistence="on-failure")
+    with (
+        patch(
+            "conductor.engine.workflow.prepare_run_bundle",
+            new_callable=AsyncMock,
+            return_value=bundle,
+        ),
+        patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path),
+        pytest.raises(ConfigurationError, match="pre-create verification refused"),
+    ):
+        await engine.run({})
+
+    assert backend.attempts == [] and backend.marker is False
+    assert engine._last_checkpoint_path is not None
+    checkpoint = CheckpointManager.load_checkpoint(engine._last_checkpoint_path)
+    assert checkpoint.workspace is not None
+    assert checkpoint.workspace["executed_backends"] == []
+
+    backend.reject = False
+    resumed = _engine(tmp_path, persistence="on-failure")
+    with patch(
+        "conductor.engine.workflow.prepare_run_bundle", new_callable=AsyncMock, return_value=bundle
+    ):
+        await resumed.resume("script", checkpoint=checkpoint)
+    assert backend.marker is True
+    assert len(backend.attempts) == 1
 
 
 @pytest.mark.asyncio

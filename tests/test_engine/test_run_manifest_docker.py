@@ -56,7 +56,9 @@ class _BatchBackend:
     async def prepare_run(self, run: Any) -> Any:
         raise NotImplementedError
 
-    async def run_command(self, spec: Any, lease: Any, *, diagnostics: Any = None) -> Any:
+    async def run_command(
+        self, spec: Any, lease: Any, *, diagnostics: Any = None, on_dispatch: Any = None
+    ) -> Any:
         raise NotImplementedError
 
     async def finalize_run(self, lease: Any, outcome: Any, *, retain: bool = False) -> None:

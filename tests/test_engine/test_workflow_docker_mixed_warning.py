@@ -58,7 +58,10 @@ class _DockerBackend:
         lease: WorkspaceLease | None,
         *,
         diagnostics=None,
+        on_dispatch=None,
     ) -> CommandResult:
+        if on_dispatch is not None:
+            on_dispatch()
         return CommandResult(outcome="completed", exit_code=0, resolved_command=spec.command)
 
     async def finalize_run(

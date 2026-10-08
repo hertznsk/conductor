@@ -425,7 +425,10 @@ class RecordingBackend:
         lease: WorkspaceLease | None,
         *,
         diagnostics: Callable[[str], None] | None = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> CommandResult:
+        if on_dispatch is not None:
+            on_dispatch()
         self.calls.append((spec, lease, diagnostics))
         return self.result
 

@@ -128,6 +128,7 @@ class _NoBatchBackend:
         lease: WorkspaceLease | None,
         *,
         diagnostics=None,
+        on_dispatch=None,
     ) -> CommandResult:
         raise NotImplementedError
 
