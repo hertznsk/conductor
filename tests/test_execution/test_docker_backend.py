@@ -1378,31 +1378,57 @@ async def test_attached_command_rechecks_marker_after_tampering(
     run = RunSpec("tamper", bundle=_stateful_bundle(tmp_path), workspace_persistence="durable")
     lease = await backend.prepare_run(run)
     spec = CommandSpec("true", execution=_minimal())
-    dispatched: list[str] = []
-
-    def notify() -> None:
-        dispatched.append("create")
-
-    assert (await backend.run_command(spec, lease, on_dispatch=notify)).outcome == "completed"
+    assert (await backend.run_command(spec, lease)).outcome == "completed"
     attached_backend = DockerRunnerBackend(binary)
     attached = await attached_backend.attach_run(
         run,
         WorkspaceIdentity("docker", lease.lease_id, lease.incarnation),
         expect_staged=expect_staged,
     )
-    assert (
-        await attached_backend.run_command(spec, attached, on_dispatch=notify)
-    ).outcome == "completed"
+    assert (await attached_backend.run_command(spec, attached)).outcome == "completed"
     marker = store / "volumes/conductor-ws-tamper/.conductor-staged"
     marker.write_text("sha256:foreign", encoding="utf-8")
     before = len(_stateful_commands(log))
     with pytest.raises(WorkspaceAttachError, match="digest mismatch"):
-        await attached_backend.run_command(spec, attached, on_dispatch=notify)
-    assert dispatched == ["create", "create"]
+        await attached_backend.run_command(spec, attached)
     commands = _stateful_commands(log)[before:]
     assert sum(argv[0] == "cp" and argv[1].endswith("/.conductor-staged") for argv in commands) == 1
     assert not any(argv[0] == "cp" and argv[1] == "-a" for argv in commands)
     assert not any(argv[0] == "create" and "--env-file" in argv for argv in commands)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_callback_only_after_attached_precreate_checks(
+    stateful_docker: tuple[DockerRunnerBackend, Path, Path, str],
+    tmp_path: Path,
+) -> None:
+    # Requirement: one callback per Docker create, none when marker verification refuses it.
+    backend, log, store, binary = stateful_docker
+    run = RunSpec(
+        "dispatch-notify", bundle=_stateful_bundle(tmp_path), workspace_persistence="durable"
+    )
+    lease = await backend.prepare_run(run)
+    spec = CommandSpec("true", execution=_minimal())
+    dispatched: list[str] = []
+
+    def notify() -> None:
+        dispatched.append("create")
+
+    assert (await backend.run_command(spec, lease, on_dispatch=notify)).outcome == "completed"
+    assert dispatched == ["create"]
+    attached_backend = DockerRunnerBackend(binary)
+    attached = await attached_backend.attach_run(
+        run, WorkspaceIdentity("docker", lease.lease_id, lease.incarnation), expect_staged=True
+    )
+    marker = store / "volumes/conductor-ws-dispatch-notify/.conductor-staged"
+    marker.write_text("sha256:foreign", encoding="utf-8")
+    before = len(_stateful_commands(log))
+    with pytest.raises(WorkspaceAttachError, match="digest mismatch"):
+        await attached_backend.run_command(spec, attached, on_dispatch=notify)
+    assert dispatched == ["create"]
+    assert not any(
+        argv[0] == "create" and "--env-file" in argv for argv in _stateful_commands(log)[before:]
+    )
 
 
 @pytest.mark.asyncio
