@@ -652,6 +652,7 @@ class AgentExecutor:
                 execution=resolved_execution,
                 env_overlay=agent_env_overlay,
                 credential_resolver=realm_credential_resolver,
+                backend_name=workspace_lease.backend if workspace_lease is not None else None,
             )
 
             def on_event(event_type: str, data: Mapping[str, Any]) -> None:
@@ -717,8 +718,18 @@ class AgentExecutor:
         execution: ResolvedExecutionSpec | None = None,
         env_overlay: Mapping[str, str] | None = None,
         credential_resolver: Callable[[str], Mapping[str, Any] | None] | None = None,
+        backend_name: str | None = None,
     ) -> AgentSpec:
         """Build one transport-neutral invocation from effective provider values."""
+        if (
+            backend_name == "aca"
+            and agent.sandbox is not None
+            and agent.sandbox.identifier_scope is not None
+        ):
+            raise ConfigurationError(
+                "sandbox.identifier_scope is not supported on an ACA execution profile; "
+                "set it on the profile's aca block"
+            )
         provider_name = agent.provider or type(self.provider).__module__.rsplit(".", 1)[-1]
         servers = (
             getattr(self.provider, "_mcp_servers", None)
@@ -770,7 +781,9 @@ class AgentExecutor:
                 or getattr(self.provider, "_default_max_agent_iterations", None)
             ),
             max_session_seconds=agent.max_session_seconds or default_seconds,
-            working_dir=agent.working_dir,
+            working_dir=(agent.sandbox.working_dir if agent.sandbox is not None else None)
+            if backend_name == "aca"
+            else agent.working_dir,
             retry=agent.retry.model_dump(mode="json") if agent.retry else None,
             context_tier=agent.context_tier
             or getattr(self.provider, "_default_context_tier", None),

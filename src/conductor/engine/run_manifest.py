@@ -63,6 +63,7 @@ from conductor.config.environment import ProfileDefinition, ResolvedEnvironment
 from conductor.config.schema import (
     AgentDef,
     ExecutableStepBase,
+    RuntimeConfig,
     ScriptStepDef,
     StepSecretRef,
     WorkflowConfig,
@@ -431,7 +432,12 @@ def _require_script_backend_capability(key: str, backend_name: str) -> None:
 
 
 def _require_agent_backend_capability(
-    key: str, backend_name: str, definition: ProfileDefinition
+    key: str,
+    backend_name: str,
+    definition: ProfileDefinition,
+    *,
+    agent: AgentDef,
+    runtime: RuntimeConfig,
 ) -> None:
     """Require an agent-capable backend and a complete runtime profile."""
     provider = BACKEND_CAPABILITY_PROVIDERS.get(backend_name)
@@ -447,6 +453,21 @@ def _require_agent_backend_capability(
             f"Agent step '{key}' resolves to Docker without docker.runner_image.",
             suggestion="Set docker.runner_image to an image containing the Conductor runner.",
         )
+    if backend_name == "aca":
+        if agent.sandbox is not None and agent.sandbox.identifier_scope is not None:
+            raise ConfigurationError(
+                f"Agent step '{key}' cannot set sandbox.identifier_scope on an ACA profile; "
+                "set it on the profile's aca block."
+            )
+        skills = agent.skills if agent.skills is not None else runtime.skills
+        plugins = agent.plugins if agent.plugins is not None else runtime.plugins
+        discovery = agent.skills is None and runtime.skill_discovery.is_enabled
+        if skills or plugins or discovery:
+            raise ConfigurationError(
+                f"Agent step '{key}' resolves to ACA, which cannot stage skills or plugins.",
+                suggestion="Use a Docker agent profile for staged skills/plugins, or opt out "
+                "with skills: [] and plugins: [] on this agent.",
+            )
 
 
 def _require_known_secret_ref(
@@ -695,7 +716,9 @@ def compile_run_manifest(
             _require_script_backend_capability(key, backend_name)
             execution = resolve_execution_spec(definition)
         elif isinstance(step, AgentDef):
-            _require_agent_backend_capability(key, backend_name, definition)
+            _require_agent_backend_capability(
+                key, backend_name, definition, agent=step, runtime=config.workflow.runtime
+            )
             execution = resolve_execution_spec(definition)
             if execution is not None:
                 assert definition.docker is not None and definition.docker.runner_image is not None

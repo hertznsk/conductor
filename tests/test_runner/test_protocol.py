@@ -1,7 +1,6 @@
 """Tests for ``conductor.runner.protocol`` — the backend-neutral runner wire contract.
 
-These tests are the golden guard for the lift out of
-``conductor.providers.aca_protocol``: the wire format is FROZEN, so the
+These tests are the golden guard for the legacy wire format, so the
 key-set assertions below pin the exact ``model_dump(mode="json")`` shape of
 every model, and the cross-parse tests prove that renaming the classes did
 not change the on-the-wire field names either side already speaks.
@@ -242,7 +241,7 @@ class TestWireGoldenKeySets:
 
 class TestCrossParseLegacyWireNames:
     """A JSON literal written with the LEGACY wire field names (the exact
-    field names of ``conductor.providers.aca_protocol``) validates against
+    field names of the legacy ACA request validates against
     the new models — proving that renaming the classes did not change the
     wire."""
 
