@@ -66,12 +66,12 @@ class TestProfileDefinition:
 
     def test_unknown_backend_names_available(self) -> None:
         # Requirement: an unavailable backend is rejected with a message naming
-        # the backend and the available set — 'podman' must name 'docker, local'.
+        # the backend and the available set — 'podman' must name 'aca, docker, local'.
         with pytest.raises(ValidationError) as exc_info:
             ProfileDefinition(backend="podman")
         message = str(exc_info.value)
         assert "execution backend 'podman' is not available in this build of Conductor" in message
-        assert "available: docker, local" in message
+        assert "available: aca, docker, local" in message
 
     def test_extra_field_forbidden(self) -> None:
         # Requirement: profiles carry exactly the specified fields — no
