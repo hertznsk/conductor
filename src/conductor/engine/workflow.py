@@ -5335,15 +5335,21 @@ class WorkflowEngine:
         else:
 
             def grader_spec(grader: AgentDef, prompt: str) -> AgentSpec:
+                grader_agent = (
+                    grader.model_copy(update={"sandbox": agent.sandbox})
+                    if realm.name == "aca"
+                    else grader
+                )
                 return replace(
                     executor.build_realm_spec(
-                        grader,
+                        grader_agent,
                         prompt,
                         {},
                         tools=[],
                         execution=realm.execution,
                         env_overlay=realm.env_overlay,
                         credential_resolver=realm.credential_resolver,
+                        backend_name=realm.lease.backend if realm.lease is not None else None,
                     ),
                     mcp_servers=None,
                 )

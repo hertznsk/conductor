@@ -33,14 +33,8 @@ Compatibility rules
   rejects even optional v2 request keys via ``extra="forbid"``, so hosts must
   pre-flight against ``/health`` before sending a v2 request.
 
-History
--------
-Lifted de-ACA'd from ``conductor.providers.aca_protocol`` (issue #284); the
-field names, aliases, defaults, validators, and ``ConfigDict`` modes are
-byte-identical in meaning — only the class names and module identity changed
-to make the contract backend-neutral. ``conductor-agent-runner`` (shipped via
-``docker/aca-runner/Dockerfile``) is the reference remote runtime speaking
-this contract.
+The reference remote runtime is ``conductor-agent-runner``, shipped via
+``docker/aca-runner/Dockerfile``.
 """
 
 from __future__ import annotations

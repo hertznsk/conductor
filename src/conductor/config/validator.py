@@ -1995,7 +1995,13 @@ def _validate_docker_profiles(
             resolved.append((key, step, profile_name, definition.backend))
             if isinstance(step, AgentDef):
                 try:
-                    _require_agent_backend_capability(key, definition.backend, definition)
+                    _require_agent_backend_capability(
+                        key,
+                        definition.backend,
+                        definition,
+                        agent=step,
+                        runtime=config.workflow.runtime,
+                    )
                 except ConfigurationError as exc:
                     errors.append(f"environment '{environment_name}': {exc}")
             elif definition.backend != "local" and not isinstance(step, ScriptStepDef):
