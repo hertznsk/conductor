@@ -76,7 +76,61 @@ from conductor.providers.resolution import (
     effective_mcp_consumer_providers,
     format_claude_agent_sdk_remote_env_error,
     format_remote_mcp_stdio_only_error,
+    provider_type_for_agent,
 )
+
+REMOTE_AGENT_PROVIDERS = frozenset({"copilot", "openai", "claude"})
+RESERVED_AGENT_ENV_NAMES = frozenset(
+    {
+        "base_url",
+        "api_key",
+        "bearer_token",
+        "github_token",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "COPILOT_GITHUB_TOKEN",
+        "COPILOT_PROVIDER_API_KEY",
+        "COPILOT_PROVIDER_BEARER_TOKEN",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+    }
+)
+LOCAL_AGENT_SCOPE_ERROR = (
+    "local agent runtime inherits the control environment; scoped delivery for local "
+    "agents is not built — use a remote execution profile or mcp/script scope"
+)
+
+
+def agent_secret_name_error(name: str) -> str | None:
+    """Keep per-call MCP delivery disjoint from provider credentials."""
+    if name.casefold() in {reserved.casefold() for reserved in RESERVED_AGENT_ENV_NAMES}:
+        return (
+            f"Agent-scope delivery.env '{name}' is reserved for provider credentials; "
+            "choose a different MCP process environment variable."
+        )
+    return None
+
+
+def agent_has_stdio_mcp(config: WorkflowConfig, agent: AgentDef) -> bool:
+    """Conservatively identify MCP sources without resolving plugin contents."""
+    if agent.tools == []:
+        return False
+    if any(server.type == "stdio" for server in config.workflow.runtime.mcp_servers.values()):
+        return True
+    plugins = agent.plugins if agent.plugins is not None else config.workflow.runtime.plugins
+    return any(plugin.mcp for plugin in plugins)
+
+
+def agent_scope_stdio_error(key: str) -> str:
+    """Describe a per-call overlay that has no process to receive it."""
+    return (
+        f"Agent step '{key}' requests agent-scope delivery.env, but no stdio MCP server "
+        "can receive env_overlay: it reaches only the spawn-env of stdio MCP processes "
+        "in the remote realm, never the model SDK environment. Declare a stdio MCP server "
+        "in workflow.runtime.mcp_servers or enable an MCP-shipping plugin for this agent "
+        "(and enable its tools), or remove the agent-scope secret."
+    )
+
 
 # Capability-introspection registry: backend name -> a backend instance asked
 # only for its static ``capabilities()`` declaration. The instances are
@@ -143,7 +197,8 @@ class ManifestExecutionSpec(BaseModel):
 
 
 class ResolvedStepProfile(BaseModel):
-    """One executable step's resolved execution profile and backend."""
+    """One step's placement; realm_image records the requested image reference,
+    not the bytes selected by the daemon when the reference is a mutable tag."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -151,11 +206,16 @@ class ResolvedStepProfile(BaseModel):
     backend: str
     inherit_control_environment: bool = True
     execution: ManifestExecutionSpec | None = None
+    realm_image: str | None = None
+    inner_provider: str | None = None
 
     def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         dump = super().model_dump(*args, **kwargs)
         if dump.get("execution") is None:
             dump.pop("execution", None)
+        for name in ("realm_image", "inner_provider"):
+            if dump.get(name) is None:
+                dump.pop(name, None)
         return dump
 
 
@@ -164,7 +224,7 @@ class ResolvedSecretUse(BaseModel):
 
     consumer: str
     ref: str
-    scope: Literal["script", "mcp"]
+    scope: Literal["script", "mcp", "agent"]
     delivery_kind: Literal["env", "header"]
     delivery_name: str
 
@@ -241,8 +301,10 @@ class ResolvedRunManifest(BaseModel):
     def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         dump = super().model_dump(*args, **kwargs)
         for profile in dump.get("profiles", {}).values():
-            if isinstance(profile, dict) and profile.get("execution") is None:
-                profile.pop("execution", None)
+            if isinstance(profile, dict):
+                for name in ("execution", "realm_image", "inner_provider"):
+                    if profile.get(name) is None:
+                        profile.pop(name, None)
         return dump
 
 
@@ -446,6 +508,13 @@ def _require_agent_backend_capability(
             f"Agent step '{key}' resolves to backend '{backend_name}' without agent capability.",
             suggestion="Choose an agent-capable execution backend.",
         )
+    effective_provider = provider_type_for_agent(agent, runtime.provider.name)
+    if backend_name != "local" and effective_provider not in REMOTE_AGENT_PROVIDERS:
+        raise ConfigurationError(
+            f"Agent step '{key}' resolves to remote backend '{backend_name}' with provider "
+            f"'{effective_provider}'; supported inner providers: copilot, openai, claude. "
+            "Other providers require a follow-up implementation."
+        )
     if backend_name == "docker" and (
         definition.docker is None or not definition.docker.runner_image
     ):
@@ -491,7 +560,7 @@ def _require_known_secret_ref(
 def _resolved_secret_use(
     consumer: str,
     secret: StepSecretRef,
-    scope: Literal["script", "mcp"],
+    scope: Literal["script", "mcp", "agent"],
 ) -> ResolvedSecretUse:
     if secret.delivery.env is not None:
         return ResolvedSecretUse(
@@ -556,19 +625,46 @@ def _compile_step_secret_uses(
     key: str,
     step: ExecutableStepBase,
     environment: ResolvedEnvironment,
+    backend_name: str,
+    config: WorkflowConfig,
 ) -> list[ResolvedSecretUse]:
     secrets = step.execution.secrets if step.execution is not None else []
     if not secrets:
         return []
-    if not isinstance(step, ScriptStepDef) or any(secret.scope == "agent" for secret in secrets):
-        raise ConfigurationError(
-            f"Step '{key}' requests secret delivery, but agent-scope delivery is reserved "
-            "until agent execution realms (step 7).",
-            suggestion="Remove the secret reference until agent execution realms are available.",
-        )
-
     uses: list[ResolvedSecretUse] = []
     for secret in secrets:
+        if isinstance(step, AgentDef):
+            if secret.scope != "agent":
+                raise ConfigurationError(
+                    f"Agent step '{key}' cannot consume secret '{secret.ref}' with scope "
+                    f"'{secret.scope}'; this position requires scope 'agent'."
+                )
+            if secret.delivery.env is not None and (
+                error := agent_secret_name_error(secret.delivery.env)
+            ):
+                raise ConfigurationError(error)
+            if backend_name == "local":
+                raise ConfigurationError(f"Agent step '{key}': {LOCAL_AGENT_SCOPE_ERROR}.")
+            if secret.delivery.env is None:
+                raise ConfigurationError(
+                    f"Agent step '{key}' requires delivery.env for secret '{secret.ref}': "
+                    "env_overlay reaches only the spawn-env of stdio MCP processes in the realm "
+                    "per call, never the model SDK environment."
+                )
+            if not agent_has_stdio_mcp(config, step):
+                raise ConfigurationError(agent_scope_stdio_error(key))
+            _require_known_secret_ref(secret, consumer=key, environment=environment)
+            uses.append(_resolved_secret_use(key, secret, "agent"))
+            continue
+        if not isinstance(step, ScriptStepDef):
+            raise ConfigurationError(
+                f"Step '{key}' does not support secret delivery; use an agent or script step."
+            )
+        if secret.scope == "agent":
+            raise ConfigurationError(
+                f"Script step '{key}' cannot consume secret '{secret.ref}' with scope "
+                "'agent'; this position requires scope 'script'."
+            )
         if secret.delivery.header is not None:
             raise ConfigurationError(
                 f"Script step '{key}' requests header delivery for secret '{secret.ref}', "
@@ -583,12 +679,9 @@ def _compile_step_secret_uses(
             )
         _require_known_secret_ref(secret, consumer=key, environment=environment)
         uses.append(_resolved_secret_use(key, secret, "script"))
-    # Non-script steps and agent-scope refs raised above, so the literal
-    # ``env`` keys to check against are the script step's own.
-    assert isinstance(step, ScriptStepDef)
     _check_delivery_collisions(
         key,
-        literal_env=step.env,
+        literal_env=step.env if isinstance(step, ScriptStepDef) else (),
         literal_headers=(),
         secrets=secrets,
     )
@@ -598,9 +691,17 @@ def _compile_step_secret_uses(
 def _compile_mcp_secret_uses(
     config: WorkflowConfig,
     environment: ResolvedEnvironment,
+    profiles: Mapping[str, ResolvedStepProfile],
 ) -> list[ResolvedSecretUse]:
     uses: list[ResolvedSecretUse] = []
     consumers = effective_mcp_consumer_providers(config)
+    local_consumer = any(
+        isinstance(step, AgentDef)
+        and step.tools != []
+        and provider_type_for_agent(step, config.workflow.runtime.provider.name) != "hermes"
+        and profiles[key].backend == "local"
+        for key, step in _iter_executable_steps(config)
+    )
     for server_name in sorted(config.workflow.runtime.mcp_servers):
         server = config.workflow.runtime.mcp_servers[server_name]
         consumer = f"mcp:{server_name}"
@@ -618,11 +719,24 @@ def _compile_mcp_secret_uses(
                 )
         for secret in server.secrets:
             if secret.scope == "agent":
-                raise ConfigurationError(
-                    f"MCP server '{server_name}' requests agent-scope delivery, but agent-scope "
-                    "delivery is reserved until agent execution realms (step 7).",
-                    suggestion="Use scope 'mcp' for MCP server secret delivery.",
-                )
+                if secret.delivery.env is not None and (
+                    error := agent_secret_name_error(secret.delivery.env)
+                ):
+                    raise ConfigurationError(error)
+                if local_consumer:
+                    raise ConfigurationError(
+                        f"MCP server '{server_name}': {LOCAL_AGENT_SCOPE_ERROR}."
+                    )
+                if server.type != "stdio" or secret.delivery.env is None:
+                    raise ConfigurationError(
+                        f"MCP server '{server_name}' requires stdio and delivery.env for "
+                        f"agent-scope secret '{secret.ref}': env_overlay reaches the spawn-env "
+                        "of in-realm stdio MCP processes per call, never the model SDK "
+                        "environment."
+                    )
+                _require_known_secret_ref(secret, consumer=consumer, environment=environment)
+                uses.append(_resolved_secret_use(consumer, secret, "agent"))
+                continue
             if secret.scope != "mcp":
                 raise ConfigurationError(
                     f"MCP server '{server_name}' cannot consume secret '{secret.ref}' with scope "
@@ -657,6 +771,36 @@ def _compile_mcp_secret_uses(
             literal_headers=server.headers,
             secrets=server.secrets,
         )
+    agent_server_secrets = [
+        secret
+        for server in config.workflow.runtime.mcp_servers.values()
+        for secret in server.secrets
+        if secret.scope == "agent"
+    ]
+    literal_mcp_env = {
+        name
+        for server in config.workflow.runtime.mcp_servers.values()
+        if server.type == "stdio"
+        for name in server.env
+    }
+    for key, step in _iter_executable_steps(config):
+        if (
+            isinstance(step, AgentDef)
+            and step.tools != []
+            and provider_type_for_agent(step, config.workflow.runtime.provider.name) != "hermes"
+        ):
+            step_secrets = (
+                [secret for secret in step.execution.secrets if secret.scope == "agent"]
+                if step.execution is not None
+                else []
+            )
+            if step_secrets or agent_server_secrets:
+                _check_delivery_collisions(
+                    key,
+                    literal_env=literal_mcp_env,
+                    literal_headers=(),
+                    secrets=[*step_secrets, *agent_server_secrets],
+                )
     return uses
 
 
@@ -741,12 +885,22 @@ def compile_run_manifest(
             backend=backend_name,
             inherit_control_environment=inherit_control_environment,
             execution=execution,
+            realm_image=(
+                definition.docker.runner_image
+                if isinstance(step, AgentDef) and backend_name == "docker" and definition.docker
+                else None
+            ),
+            inner_provider=(
+                provider_type_for_agent(step, config.workflow.runtime.provider.name)
+                if isinstance(step, AgentDef) and backend_name != "local"
+                else None
+            ),
         )
         if isinstance(step, ScriptStepDef):
             script_keys.append(key)
-        secrets.extend(_compile_step_secret_uses(key, step, environment))
+        secrets.extend(_compile_step_secret_uses(key, step, environment, backend_name, config))
 
-    secrets.extend(_compile_mcp_secret_uses(config, environment))
+    secrets.extend(_compile_mcp_secret_uses(config, environment, profiles))
 
     digest: str | None = None
     if workflow_path is not None:
