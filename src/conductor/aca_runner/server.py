@@ -14,12 +14,10 @@ the wire contract shared with the host-side
   ``application/x-ndjson``: one ``{"type": ..., "data": ...}`` line per SDK
   event, terminated by a ``result`` (or ``error``) frame.
 
-Not built here: a dedicated ``/interrupt`` endpoint (the host's in-stream
-interrupt currently has nothing to land on inside this runner) and a
-runner-side ``max_session_seconds`` wall-clock guard (the capability is
-declared "as runner-enforced" by E3, but no task has assigned building the
-guard itself). Both are tracked as follow-up gaps rather than implemented
-here.
+- ``POST /interrupt`` — signals a named in-flight agent invocation; its
+  partial result uses the existing terminal result frame.
+
+The runner-side ``max_session_seconds`` wall-clock guard remains a follow-up.
 """
 
 from __future__ import annotations
@@ -39,7 +37,7 @@ from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import SecretStr
+from pydantic import BaseModel, Field, SecretStr
 from pydantic import ValidationError as PydanticValidationError
 
 from conductor import __version__ as _conductor_version
@@ -84,6 +82,10 @@ logger = logging.getLogger(__name__)
 # `conductor-cli` releases (the runner ships as a base image, not a wheel
 # release train).
 RUNNER_VERSION = "0.1.0"
+
+
+class _InterruptRequest(BaseModel):
+    execution_id: str = Field(min_length=1)
 
 
 def _frame(event_type: str, data: dict[str, Any]) -> bytes:
@@ -426,6 +428,7 @@ async def _stream_execute(
     agent: AgentDef,
     payload: RunnerAgentRequest,
     provider_cache: _InnerProviderCache,
+    interrupt_signal: asyncio.Event | None,
 ) -> AsyncIterator[bytes]:
     """Run the inner `execute()` call, yielding NDJSON frames as they arrive.
 
@@ -464,7 +467,7 @@ async def _stream_execute(
                 payload.rendered_prompt,
                 tools=payload.tools,
                 event_callback=emit,
-                interrupt_signal=None,
+                interrupt_signal=interrupt_signal,
                 skill_directories=payload.skill_directories,
                 custom_agents=payload.custom_agents,
                 extra_mcp_servers=None,
@@ -510,6 +513,8 @@ def create_app() -> FastAPI:
     `monkeypatch` before calling `create_app()`.
     """
     provider_cache = _InnerProviderCache()
+    active_executions: dict[str, asyncio.Event] = {}
+    terminal_executions: set[str] = set()
     runner_token = resolve_runner_token()
     allowed_base_urls = resolve_allowed_base_urls()
 
@@ -548,17 +553,18 @@ def create_app() -> FastAPI:
         transport-token gate on `/execute` is the actual runner-side
         control.
 
-        `protocol_version` is the one additive wire change of the
-        ``conductor.runner.protocol`` lift: it is purely additive, so old
-        hosts ignore the unknown key and new hosts reading an old runner's
-        payload simply see the key absent.
+        Realm adapters enable interrupt only with protocol v2 and the
+        advertised interrupt feature. A v1/missing-feature handshake means
+        interrupt=False: interrupt-requiring configurations must be refused
+        before dispatch. Legacy ACA retains abort-read and its existing
+        version-skew warning. The consuming adapters implement that policy.
         """
         return {
             "ready": True,
             "conductor_version": _conductor_version,
             "runner_version": RUNNER_VERSION,
             "protocol_version": RUNNER_PROTOCOL_VERSION,
-            "features": [],
+            "features": ["interrupt"],
             "auth_required": runner_token is not None,
             "auth_token_present": http_request.headers.get(RUNNER_TOKEN_HEADER) is not None,
         }
@@ -615,9 +621,76 @@ def create_app() -> FastAPI:
         except (ProviderError, PydanticValidationError) as exc:
             return JSONResponse(status_code=400, content={"error": {"message": str(exc)}})
 
+        # Legacy ACA identifies an invocation by its gateway session identifier.
+        execution_id = payload.execution_id or identifier
+        if payload.execution_id is None and identifier is not None:
+            # An ACA gateway identifier names a reusable session, not a
+            # permanently unique invocation; completed sessions may run again.
+            terminal_executions.discard(identifier)
+        if execution_id is not None and (
+            execution_id in active_executions or execution_id in terminal_executions
+        ):
+            await provider_cache.release(provider)
+            return JSONResponse(
+                status_code=409,
+                content={"error": {"message": "runner: execution_id already used"}},
+            )
+        interrupt_signal = asyncio.Event() if execution_id is not None else None
+        if execution_id is not None and interrupt_signal is not None:
+            active_executions[execution_id] = interrupt_signal
+
+        async def stream() -> AsyncIterator[bytes]:
+            try:
+                async for frame in _stream_execute(
+                    provider, agent, payload, provider_cache, interrupt_signal
+                ):
+                    yield frame
+            finally:
+                if execution_id is not None:
+                    _ = active_executions.pop(execution_id, None)
+                    terminal_executions.add(execution_id)
+
         return StreamingResponse(
-            _stream_execute(provider, agent, payload, provider_cache),
+            stream(),
             media_type="application/x-ndjson",
         )
+
+    @app.post("/interrupt")
+    async def interrupt_endpoint(
+        http_request: Request,
+        payload: _InterruptRequest | None = None,
+        identifier: str | None = None,
+        api_version: str | None = Query(default=None, alias="api-version"),
+    ) -> Response:
+        """Signal one agent without cancelling its streaming response.
+
+        New callers supply execution_id in JSON. The legacy ACA gateway
+        instead routes an empty POST by identifier to its active session.
+        """
+        presented = http_request.headers.get(RUNNER_TOKEN_HEADER)
+        if not token_gate(presented, runner_token):
+            return JSONResponse(
+                status_code=401,
+                content={"error": {"message": "runner: missing or invalid runner auth token"}},
+            )
+        execution_id = payload.execution_id if payload is not None else identifier
+        if execution_id is None:
+            return JSONResponse(
+                status_code=422,
+                content={"error": {"message": "runner: execution_id is required"}},
+            )
+        signal = active_executions.get(execution_id)
+        if signal is None and execution_id not in terminal_executions:
+            return JSONResponse(
+                status_code=404,
+                content={"error": {"message": "runner: execution_id not found"}},
+            )
+        if signal is None or signal.is_set():
+            return JSONResponse(
+                status_code=409,
+                content={"error": {"message": "runner: execution already interrupted or terminal"}},
+            )
+        signal.set()
+        return Response(status_code=200)
 
     return app
