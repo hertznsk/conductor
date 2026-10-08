@@ -3225,12 +3225,12 @@ Each secret reference in `secrets:` contains:
 | Field | Type | Description |
 |-------|------|-------------|
 | `ref` | string (required) | Logical secret name matching `[A-Za-z0-9_.-]+`. Must match a binding in the resolved environment document. |
-| `scope` | string (required) | Target consumer scope: `script` or `mcp`. `agent` is reserved for future releases. |
+| `scope` | string (required) | Target consumer scope: `script`, `mcp`, or remote-only `agent`. |
 | `delivery` | object (required) | Delivery mechanism. Exactly one of `env` or `header` must be set. |
 
 ### Delivery Targets (`delivery`)
 
-- **`env`**: Injects the secret value into an environment variable for the script subprocess or MCP server. Must be a valid shell identifier (`[A-Za-z_][A-Za-z0-9_]*`).
+- **`env`**: Injects the secret value into an environment variable for the script subprocess or MCP server. Agent-scoped `delivery.env` reaches only the spawn environment of stdio MCP processes inside the remote realm per call (via `env_overlay`), never the model SDK environment. Must be a valid shell identifier (`[A-Za-z_][A-Za-z0-9_]*`).
 - **`header`**: Injects the secret value as an HTTP request header. Header delivery applies only to HTTP/SSE MCP servers; it is rejected on script steps and stdio MCP servers. Header names must follow RFC 9110 token rules (`[!#$%&'*+\-.^_`|~0-9A-Za-z]+`). Prefer `delivery.header` for remote authentication.
 
 MCP transport and delivery support is based on the effective providers of the agents that can consume the workflow's declared servers. Per-agent `provider:` overrides take precedence over the workflow default.
@@ -3250,8 +3250,9 @@ Remote servers used by an effective Claude or OpenAI consumer are rejected by bo
 
 1. **Scope Requirements**:
    - `scope: script` is required for script steps.
-   - `scope: mcp` is required for MCP servers.
-   - `scope: agent` is reserved for future agent execution realms (architecture step 7). Using `agent` scope raises a validation error.
+   - `scope: mcp` is used for MCP-server delivery outside agent realms.
+   - `scope: agent` is allowed on agent steps using remote Docker or ACA profiles and on stdio MCP servers when all consuming agents use remote realms. It requires `delivery.env` and either a declared stdio MCP server or an enabled MCP plugin that may provide one (`tools: []` cannot consume either). Static validation does not fetch or inspect plugin contents; a plugin that supplies no stdio server leaves the runner to reject the undeliverable overlay. Without any possible consumer, explicit validation and manifest compilation fail before runner contact. The variable reaches the spawn environment of in-realm stdio MCP processes per call, not the model SDK environment. A local agent inherits the control environment and does not support scoped agent delivery. Bare validation warns to rerun with `--environment` when placement cannot be checked.
+   - Agent-scoped delivery names cannot be `base_url`, `api_key`, `bearer_token`, `github_token`, `GITHUB_TOKEN`, `GH_TOKEN`, `COPILOT_GITHUB_TOKEN`, `COPILOT_PROVIDER_API_KEY`, `COPILOT_PROVIDER_BEARER_TOKEN`, `OPENAI_API_KEY`, or `ANTHROPIC_API_KEY`: use another MCP variable name. Remote realms support `copilot`, `openai`, and `claude` as inner providers; other providers require a separate implementation.
 2. **Delivery Collisions**:
    - Literal `env` and secret `env` delivery names within the same consumer must be unique.
    - Literal `headers` and secret `header` delivery names within the same consumer must be unique (case-insensitive).
