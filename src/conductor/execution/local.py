@@ -86,6 +86,7 @@ class LocalRunnerBackend:
             sessions=False,
             shared_workspace=True,
             snapshots=False,
+            agent=True,
         )
 
     async def prepare_run(self, run: RunSpec) -> WorkspaceLease:

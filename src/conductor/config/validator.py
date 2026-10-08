@@ -1960,6 +1960,8 @@ def _validate_docker_profiles(
     config: WorkflowConfig,
     context: _EnvironmentValidationContext,
 ) -> tuple[list[str], list[str]]:
+    from conductor.engine.run_manifest import _require_agent_backend_capability
+
     if not context["explicit"] and not _profile_references(config):
         return [], []
 
@@ -1991,11 +1993,15 @@ def _validate_docker_profiles(
             if definition is None:
                 continue
             resolved.append((key, step, profile_name, definition.backend))
-            if definition.backend == "docker" and not isinstance(step, ScriptStepDef):
+            if isinstance(step, AgentDef):
+                try:
+                    _require_agent_backend_capability(key, definition.backend, definition)
+                except ConfigurationError as exc:
+                    errors.append(f"environment '{environment_name}': {exc}")
+            elif definition.backend != "local" and not isinstance(step, ScriptStepDef):
                 errors.append(
-                    f"Step '{key}' resolves to backend 'docker' in environment "
-                    f"'{environment_name}', but backend 'docker' is available for script steps "
-                    "only; agent execution realms arrive in step 7."
+                    f"Step '{key}' resolves to backend '{definition.backend}' in environment "
+                    f"'{environment_name}', but this step requires the local backend."
                 )
 
         script_backends = {

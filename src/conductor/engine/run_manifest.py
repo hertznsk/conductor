@@ -61,6 +61,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_valid
 
 from conductor.config.environment import ProfileDefinition, ResolvedEnvironment
 from conductor.config.schema import (
+    AgentDef,
     ExecutableStepBase,
     ScriptStepDef,
     StepSecretRef,
@@ -200,6 +201,7 @@ class ResolvedRunManifest(BaseModel):
     conductor_version: str
     audit: AuditInfo
     script_steps: tuple[str, ...] = Field(default=(), exclude=True)
+    script_steps_known: bool = Field(default=False, exclude=True)
     """Identities (``profiles`` keys) of the steps the compiler resolved as
     :class:`ScriptStepDef`, captured during compilation so
     :func:`script_step_backends` can restrict mixed-backend detection to
@@ -399,27 +401,13 @@ def resolve_execution_spec(definition: ProfileDefinition) -> ManifestExecutionSp
 def script_step_backends(manifest: ResolvedRunManifest) -> frozenset[str]:
     """Return the distinct backends the run's script steps resolve to.
 
-    Only profiles whose step identity the compiler recorded in
-    ``ResolvedRunManifest.script_steps`` count. Agent, workflow, and MCP steps
-    are compile-time pinned to ``local`` (a non-local backend there is a
-    reserved error), so reading backends off *every* profile would pollute
-    mixed-backend detection with a backend no script step uses — the dominant
-    shape, an agent-plus-Docker-script workflow, would always look "mixed".
-
-    Legacy fallback: an empty ``script_steps`` means either a genuinely
-    script-free compilation or a manifest without recorded identities — a v1
-    payload written by an earlier producer, or any manifest revalidated from
-    its serialized dump (``script_steps`` is never serialized). The two are
-    indistinguishable, and the second cannot afford a wrong "no": this
-    helper's only consumers are the mixed-backend run warning and the bundle
-    docker-presence gate, where silently dropping a diagnostic the run used
-    to emit is worse than the old over-inclusive answer. An empty set
-    therefore answers as the pre-recording implementation did — the backends
-    of ALL profiles. That fallback is exact for the script-free case anyway:
-    non-script steps pin to ``local``, so no Docker backend can appear in a
-    manifest that compiled no script steps.
+    A newly compiled run records script identities, including an empty set
+    for agent-only workflows. Its mixed-script warning never includes agent
+    backends. A reloaded legacy manifest has no identities, so it retains
+    the old over-inclusive fallback rather than hiding an earlier warning.
+    The presence bit and identities are both excluded from serialized dumps.
     """
-    if manifest.script_steps:
+    if manifest.script_steps_known:
         return frozenset(manifest.profiles[key].backend for key in manifest.script_steps)
     return frozenset(profile.backend for profile in manifest.profiles.values())
 
@@ -439,6 +427,25 @@ def _require_script_backend_capability(key: str, backend_name: str) -> None:
             "does not declare the 'batch' capability required to run commands.",
             suggestion="Map the step's execution profile to a backend that "
             "supports batch execution in this build of Conductor.",
+        )
+
+
+def _require_agent_backend_capability(
+    key: str, backend_name: str, definition: ProfileDefinition
+) -> None:
+    """Require an agent-capable backend and a complete runtime profile."""
+    provider = BACKEND_CAPABILITY_PROVIDERS.get(backend_name)
+    if provider is None or not provider.capabilities().agent:
+        raise ConfigurationError(
+            f"Agent step '{key}' resolves to backend '{backend_name}' without agent capability.",
+            suggestion="Choose an agent-capable execution backend.",
+        )
+    if backend_name == "docker" and (
+        definition.docker is None or not definition.docker.runner_image
+    ):
+        raise ConfigurationError(
+            f"Agent step '{key}' resolves to Docker without docker.runner_image.",
+            suggestion="Set docker.runner_image to an image containing the Conductor runner.",
         )
 
 
@@ -687,12 +694,17 @@ def compile_run_manifest(
         if isinstance(step, ScriptStepDef):
             _require_script_backend_capability(key, backend_name)
             execution = resolve_execution_spec(definition)
+        elif isinstance(step, AgentDef):
+            _require_agent_backend_capability(key, backend_name, definition)
+            execution = resolve_execution_spec(definition)
+            if execution is not None:
+                assert definition.docker is not None and definition.docker.runner_image is not None
+                execution = execution.model_copy(update={"image": definition.docker.runner_image})
         else:
             if backend_name != "local":
                 raise ConfigurationError(
-                    f"Step '{key}' resolves to backend '{backend_name}', but backend "
-                    f"'{backend_name}' is available for script steps only; agent execution "
-                    "realms arrive in step 7.",
+                    f"Step '{key}' resolves to backend '{backend_name}', but this step "
+                    "requires the local backend.",
                     suggestion="Move the step to a local profile or remove execution.profile.",
                 )
             execution = None
@@ -730,4 +742,5 @@ def compile_run_manifest(
         conductor_version=_conductor_version(),
         audit=AuditInfo(hermetic=False, classification="non-hermetic-compatibility"),
         script_steps=tuple(script_keys),
+        script_steps_known=True,
     )
