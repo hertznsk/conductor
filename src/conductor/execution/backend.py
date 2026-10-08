@@ -1,10 +1,10 @@
 """The ``RunnerBackend`` protocol: the seam every execution backend implements.
 
-The protocol is intentionally minimal — one typed operation
-(:meth:`RunnerBackend.run_command`) plus the run-scoped lease lifecycle that
-the workflow engine drives. Operations such as ``run_agent``/``open_mcp``/
-``cancel`` are deliberately absent: they will arrive together with their
-consumers in later contract revisions, not ahead of them.
+The protocol exposes typed command and agent operations
+(:meth:`RunnerBackend.run_command` and :meth:`RunnerBackend.run_agent`) plus
+the run-scoped lease lifecycle that the workflow engine drives. Agent calls
+return a complete result or propagate cancellation after teardown; separate
+``open_mcp`` and ``cancel`` operations are not part of this contract.
 
 Like the contract types, this module imports nothing from Conductor.
 """

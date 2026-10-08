@@ -276,6 +276,34 @@ def _map_working_dir(value: str | None, root: str = "main") -> str:
     return mapped
 
 
+def _container_options(execution: ResolvedExecutionSpec) -> list[str]:
+    """Build the shared creation flags for script and agent containers."""
+    argv: list[str] = []
+    if execution.init:
+        argv.append("--init")
+    if execution.read_only:
+        argv.append("--read-only")
+    if execution.cap_drop_all:
+        argv.append("--cap-drop=ALL")
+    if execution.no_new_privileges:
+        argv.append("--security-opt=no-new-privileges")
+    if execution.tmpfs is True:
+        argv.extend(("--tmpfs", "/tmp"))
+    elif isinstance(execution.tmpfs, str):
+        argv.extend(("--tmpfs", f"/tmp:size={execution.tmpfs}"))
+    for flag, value in (
+        ("--network", execution.network),
+        ("--platform", execution.platform),
+        ("--user", execution.user),
+        ("--cpus", str(execution.cpu) if execution.cpu is not None else None),
+        ("--memory", execution.memory),
+        ("--pids-limit", str(execution.pids) if execution.pids is not None else None),
+    ):
+        if value is not None:
+            argv.extend((flag, value))
+    return argv
+
+
 class DockerRunnerBackend:
     """Run commands in short-lived containers over a run-scoped named volume."""
 
@@ -379,29 +407,13 @@ class DockerRunnerBackend:
         await self._ensure_staged(lease, execution, None)
         await self._ensure_image(execution, None)
         name = f"conductor-{lease.lease_id[:8]}-runner-{uuid4().hex[:8]}"
-        argv = ["create", "--name", name, *self._label_args(self._labels(lease, "runner"))]
-        if execution.init:
-            argv.append("--init")
-        if execution.read_only:
-            argv.append("--read-only")
-        if execution.cap_drop_all:
-            argv.append("--cap-drop=ALL")
-        if execution.no_new_privileges:
-            argv.append("--security-opt=no-new-privileges")
-        if execution.tmpfs is True:
-            argv.extend(("--tmpfs", "/tmp"))
-        elif isinstance(execution.tmpfs, str):
-            argv.extend(("--tmpfs", f"/tmp:size={execution.tmpfs}"))
-        for flag, value in (
-            ("--network", execution.network),
-            ("--platform", execution.platform),
-            ("--user", execution.user),
-            ("--cpus", str(execution.cpu) if execution.cpu is not None else None),
-            ("--memory", execution.memory),
-            ("--pids-limit", str(execution.pids) if execution.pids is not None else None),
-        ):
-            if value is not None:
-                argv.extend((flag, value))
+        argv = [
+            "create",
+            "--name",
+            name,
+            *self._label_args(self._labels(lease, "runner")),
+            *_container_options(execution),
+        ]
         argv.extend(
             (
                 "-v",
@@ -433,7 +445,10 @@ class DockerRunnerBackend:
             if version != 2:
                 raise _runner_rebuild_error(execution.image, f"reports protocol {version!r}")
             if health.get("ready") is not True:
-                raise ConfigurationError(f"Docker runner image {execution.image!r} is not ready")
+                raise ConfigurationError(
+                    f"Docker runner image {execution.image!r} failed its readiness check. "
+                    "Check runner logs and rebuild or pull the runner image."
+                )
             features = health.get("features")
             return _RunnerState(
                 name=name,
@@ -478,7 +493,8 @@ class DockerRunnerBackend:
                 )
             ):
                 raise ConfigurationError(
-                    f"Docker runner health check failed for image {image!r}: {_bounded(stderr)}"
+                    f"Docker runner health check failed for image {image!r}: {_bounded(stderr)}. "
+                    "Check Docker connectivity, then rebuild or pull the runner image."
                 )
             raise _runner_rebuild_error(image, "has no usable protocol 2 bridge")
         try:
@@ -842,29 +858,7 @@ class DockerRunnerBackend:
             "io.conductor.step": spec.name or spec.command,
             "io.conductor.attempt": str(attempt),
         }
-        argv = ["create", "--name", name, *self._label_args(labels)]
-        if execution.init:
-            argv.append("--init")
-        if execution.read_only:
-            argv.append("--read-only")
-        if execution.cap_drop_all:
-            argv.append("--cap-drop=ALL")
-        if execution.no_new_privileges:
-            argv.append("--security-opt=no-new-privileges")
-        if execution.tmpfs is True:
-            argv.extend(("--tmpfs", "/tmp"))
-        elif isinstance(execution.tmpfs, str):
-            argv.extend(("--tmpfs", f"/tmp:size={execution.tmpfs}"))
-        for flag, value in (
-            ("--network", execution.network),
-            ("--platform", execution.platform),
-            ("--user", execution.user),
-            ("--cpus", str(execution.cpu) if execution.cpu is not None else None),
-            ("--memory", execution.memory),
-            ("--pids-limit", str(execution.pids) if execution.pids is not None else None),
-        ):
-            if value is not None:
-                argv.extend((flag, value))
+        argv = ["create", "--name", name, *self._label_args(labels), *_container_options(execution)]
         argv.extend(("-v", f"{self._volume_name(lease)}:/workspace"))
         state = self._lease_states.get(self._lease_key(lease))
         if state is None:
