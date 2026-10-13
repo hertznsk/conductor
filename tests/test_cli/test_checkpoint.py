@@ -6,6 +6,7 @@ deprecated alias (still works, warns, and forwards to the shared impl).
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from unittest.mock import patch
 
@@ -113,7 +114,7 @@ class TestCheckpointListCommand:
 
         assert result.exit_code == 0
         header = next(line for line in result.output.splitlines() if "Timestamp" in line)
-        columns = [cell.strip() for cell in header.split("┃")[1:-1]]
+        columns = [cell.strip() for cell in re.split(r"[┃│|]", header)[1:-1]]
         assert columns == ["Workflow", "Timestamp", "Trigger", "Agent", "Error Type", "File"]
 
     def test_help(self) -> None:

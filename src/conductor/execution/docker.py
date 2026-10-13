@@ -443,6 +443,15 @@ class DockerRunnerBackend:
         if key in self._closed_leases:
             raise ExecutionSpecError("backend is finalizing")
         state = self._lease_states[key]
+        if state.staged and not state.attached:
+            await self._verify_created_volume(lease)
+            if state.run.bundle is not None:
+                await self._ensure_image(execution, diagnostics)
+                marker = await self._probe_marker(lease, execution)
+                if marker != state.run.bundle.digest:
+                    reason = "missing" if marker is None else "digest mismatch"
+                    raise WorkspaceAttachError(f"Docker workspace staging marker {reason}")
+            return
         bundle = state.run.bundle
         if state.attached and bundle is not None:
             await self._ensure_image(execution, diagnostics)
@@ -540,7 +549,11 @@ class DockerRunnerBackend:
                 ("cp", f"{scratch}:/workspace/.conductor-staged", str(destination / "marker"))
             )
             if rc != 0:
-                if "no such file" in stderr.lower() or "could not find" in stderr.lower():
+                error = stderr.strip().lower()
+                missing_marker = "/workspace/.conductor-staged" in error and (
+                    "no such file" in error or "could not find" in error
+                )
+                if rc != _CLI_TIMEOUT_RC and missing_marker:
                     return None
                 raise WorkspaceAttachError(f"Docker marker probe failed: {_bounded(stderr)}")
             marker = destination / "marker"
@@ -789,7 +802,6 @@ class DockerRunnerBackend:
         step_hash = hashlib.sha1((spec.name or spec.command).encode()).hexdigest()[:8]
         name = f"conductor-{lease.lease_id[:8]}-{step_hash}-{attempt}"
         created = False
-        started = False
         try:
             try:
                 await self._verify_attached_volume(lease)
@@ -835,7 +847,6 @@ class DockerRunnerBackend:
                         resolved_command=spec.command,
                         duration_seconds=time.monotonic() - started_at,
                     )
-                started = True
                 rc, inspect_stdout, inspect_stderr = await self._run_docker(
                     ("inspect", "--format", "{{json .State}}", name)
                 )
@@ -870,11 +881,10 @@ class DockerRunnerBackend:
             except json.JSONDecodeError as exc:
                 return self._start_failed(name, str(exc), started_at)
         except asyncio.CancelledError:
-            cleanup_task = asyncio.create_task(
-                self._cleanup_container(lease, name, kill=created or started)
-            )
-            await _await_task_cleanup(cast(asyncio.Task[object], cleanup_task))
-            created = not cleanup_task.result()
+            if created:
+                cleanup_task = asyncio.create_task(self._cleanup_container(lease, name, kill=True))
+                await _await_task_cleanup(cast(asyncio.Task[object], cleanup_task))
+                created = not cleanup_task.result()
             raise
         finally:
             if created:
@@ -950,8 +960,72 @@ class DockerRunnerBackend:
         )
         state = _LeaseState(run=run, attached=True, expect_staged=expect_staged)
         await self._ensure_volume(lease, state)
+        await self._refuse_orphaned_executions(lease)
         self._lease_states[self._lease_key(lease)] = state
         return lease
+
+    async def _refuse_orphaned_executions(self, lease: WorkspaceLease) -> None:
+        try:
+            rc, stdout, stderr = await self._run_docker(
+                (
+                    "ps",
+                    "-aq",
+                    "--filter",
+                    "label=io.conductor.managed=true",
+                    "--filter",
+                    f"label=io.conductor.run_id={lease.lease_id}",
+                    "--filter",
+                    "label=io.conductor.resource=exec",
+                )
+            )
+            if rc != 0:
+                raise WorkspaceAttachError(
+                    f"could not list Docker execution containers: {_bounded(stderr)}"
+                )
+            survivors: list[str] = []
+            for candidate in stdout.split():
+                rc, metadata, stderr = await self._run_docker(
+                    ("inspect", "--format", "{{json .}}", candidate)
+                )
+                if rc != 0:
+                    raise WorkspaceAttachError(
+                        f"could not inspect Docker execution container {candidate}: "
+                        f"{_bounded(stderr)}"
+                    )
+                try:
+                    container = json.loads(metadata)
+                    if isinstance(container, list):
+                        container = container[0]
+                    labels = container["Config"]["Labels"]
+                    name = container["Name"]
+                except (IndexError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                    raise WorkspaceAttachError(
+                        f"Docker execution container {candidate} has unverifiable metadata"
+                    ) from exc
+                if not isinstance(labels, dict):
+                    raise WorkspaceAttachError(
+                        f"Docker execution container {candidate} has unverifiable labels"
+                    )
+                if not all(labels.get(k) == v for k, v in self._labels(lease, "exec").items()):
+                    raise WorkspaceAttachError(
+                        f"Docker execution container {candidate} has mismatched ownership labels"
+                    )
+                if not isinstance(name, str) or _CONTAINER_NAME.match(name) is None:
+                    raise WorkspaceAttachError(
+                        f"Docker execution container {candidate} has unverifiable name"
+                    )
+                survivors.append(name.removeprefix("/"))
+            if survivors:
+                names = ", ".join(survivors)
+                raise WorkspaceAttachError(
+                    f"Docker workspace has surviving execution containers: {names}. "
+                    f"Inspect them and clean up manually with docker rm -f {' '.join(survivors)} "
+                    "before resuming"
+                )
+        except (OSError, _DockerFailure) as exc:
+            raise WorkspaceAttachError(
+                f"could not verify Docker execution containers: {exc}"
+            ) from exc
 
     async def finalize_run(
         self, lease: WorkspaceLease, outcome: RunOutcome, *, retain: bool = False

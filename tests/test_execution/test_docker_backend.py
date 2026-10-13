@@ -330,6 +330,68 @@ async def test_cancel_create_removes_container_env_file(
 
 
 @pytest.mark.asyncio
+async def test_cancel_unconfirmed_create_does_not_remove_foreign_container(
+    fake_docker: tuple[DockerRunnerBackend, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: cancellation before create confirms ownership cannot remove a name collision.
+    backend, log = fake_docker
+    lease = await _lease(backend)
+    entered = asyncio.Event()
+    original = backend._run_docker
+    foreign_name: list[str] = []
+
+    async def unconfirmed_create(
+        argv: Sequence[str],
+        *,
+        stdin_bytes: bytes | None = None,
+        timeout: float | None = 300.0,
+        diagnostics: Callable[[str], None] | None = None,
+    ) -> tuple[int, str, str]:
+        if argv[0] == "create" and "--env-file" in argv:
+            name = argv[argv.index("--name") + 1]
+            foreign_name.append(name)
+            state_path = Path(os.environ["FAKE_DOCKER_STATE"])
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["containers"][name] = {
+                "Name": f"/{name}",
+                "Config": {"Labels": {}},
+                "State": {"ExitCode": 0},
+            }
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            entered.set()
+            await asyncio.Event().wait()
+        return await original(
+            argv, stdin_bytes=stdin_bytes, timeout=timeout, diagnostics=diagnostics
+        )
+
+    monkeypatch.setattr(backend, "_run_docker", unconfirmed_create)
+    task = asyncio.create_task(
+        backend.run_command(CommandSpec(command="true", execution=_minimal()), lease)
+    )
+    await asyncio.wait_for(entered.wait(), 10)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 10)
+    assert foreign_name
+    state = json.loads(Path(os.environ["FAKE_DOCKER_STATE"]).read_text(encoding="utf-8"))
+    assert foreign_name[0] in state["containers"]
+    assert not any(row["argv"][:2] == ["rm", "-f"] for row in _records(log))
+
+
+@pytest.mark.asyncio
+async def test_concurrent_fake_cli_records_are_complete(
+    fake_docker: tuple[DockerRunnerBackend, Path],
+) -> None:
+    # Requirement: concurrent CLI processes append one complete JSON object per log line.
+    backend, log = fake_docker
+    results = await asyncio.gather(
+        *(backend._run_docker(("image", "inspect", "alpine:3.20")) for _ in range(24))
+    )
+    assert all(rc == 0 for rc, _stdout, _stderr in results)
+    assert len(_records(log)) == len(results)
+
+
+@pytest.mark.asyncio
 async def test_fully_hardened_create_and_stdin(
     fake_docker: tuple[DockerRunnerBackend, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:

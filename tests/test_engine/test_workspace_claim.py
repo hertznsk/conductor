@@ -10,6 +10,7 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -63,7 +64,10 @@ async def test_live_child_claim_blocks_parent_until_child_exits(tmp_path, monkey
     )
     try:
         assert child.stdout is not None
-        assert await asyncio.wait_for(child.stdout.readline(), timeout=10) == b"READY\n"
+        assert (
+            await asyncio.wait_for(child.stdout.readline(), timeout=10)
+            == ("READY" + os.linesep).encode()
+        )
         with pytest.raises(WorkspaceClaimError, match=str(child.pid)):
             acquire_workspace_claim("cross-process")
         assert child.stdin is not None
@@ -143,3 +147,20 @@ def test_invalid_run_id_is_refused(tmp_path, monkeypatch) -> None:
     for run_id in ("", "../other"):
         with pytest.raises(WorkspaceClaimError):
             acquire_workspace_claim(run_id)
+
+
+@pytest.mark.parametrize("pid", [None, "123", 1.5, True, False, 0, -1])
+def test_invalid_owner_pid_keeps_claim_for_manual_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pid: int | str | float | bool | None
+) -> None:
+    # Requirement: corrupt owner metadata cannot authorize takeover or delete a claim.
+    monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path))
+    claim = acquire_workspace_claim("run-invalid-owner")
+    data = json.loads(claim.path.read_text(encoding="utf-8"))
+    data["pid"] = pid
+    corrupted = json.dumps(data)
+    claim.path.write_text(corrupted, encoding="utf-8")
+
+    with pytest.raises(WorkspaceClaimError, match="Invalid owner PID"):
+        acquire_workspace_claim("run-invalid-owner")
+    assert claim.path.read_text(encoding="utf-8") == corrupted

@@ -110,6 +110,9 @@ _PRESERVE_ALL_KEYS_PATHS: frozenset[tuple[str, ...]] = frozenset(
         ("system", "execution_manifest"),
         ("copilot_session_ids",),
         ("copilot_session_cwds",),
+        ("workspace",),
+        ("resume_contract",),
+        ("interrupted_step",),
     }
 )
 
@@ -303,6 +306,14 @@ def _validate_lifecycle_blocks(checkpoint: dict[str, Any]) -> None:
             raise CheckpointError("corrupt: partial lifecycle block workspace.identities")
         if identities and "resume_contract" not in checkpoint:
             raise CheckpointError("corrupt: partial lifecycle block workspace.identities")
+        if "executed_backends" in workspace:
+            history = workspace["executed_backends"]
+            if not isinstance(history, list) or any(
+                not isinstance(name, str) or not name.strip() for name in history
+            ):
+                raise CheckpointError(
+                    "corrupt: partial lifecycle block workspace.executed_backends"
+                )
 
     step = checkpoint.get("interrupted_step")
     if "interrupted_step" in checkpoint:

@@ -35,6 +35,7 @@ from conductor.engine.checkpoint import (
 from conductor.engine.context import WorkflowContext
 from conductor.engine.limits import LimitEnforcer
 from conductor.exceptions import CheckpointError
+from conductor.redaction import REDACTED_MARKER, RunRedactor
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1164,6 +1165,68 @@ class TestFindLatestByCreatedAt:
 
 
 class TestLifecycleCheckpointBlocks:
+    def test_nested_lifecycle_keys_survive_secret_collisions(self, tmp_path: Path) -> None:
+        # Requirement: lifecycle protocol and backend identity keys survive redaction.
+        secret = "private-token"
+        redactor = RunRedactor()
+        redactor.register(
+            [
+                "policy",
+                "identities",
+                "executed_backends",
+                "id",
+                "workflow_digest",
+                "environment_name",
+                "environment_digest",
+                "manifest_digest",
+                "bundle_digest",
+                "name",
+                "status",
+                "attempt_id",
+                secret,
+            ]
+        )
+        wf = _write_workflow(tmp_path)
+        workspace = {
+            "policy": "retained",
+            "identities": {"docker": {"id": "volume-1", "credential": secret}},
+            "executed_backends": ["docker"],
+        }
+        contract = {
+            "workflow_digest": "sha256:w",
+            "environment_name": "dev",
+            "environment_digest": "sha256:e",
+            "manifest_digest": "sha256:m",
+            "bundle_digest": "sha256:b",
+        }
+        interrupted = {"name": "build", "status": "unknown", "attempt_id": secret}
+        with patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path):
+            path = CheckpointManager.save_checkpoint(
+                wf,
+                _make_context(),
+                _make_limits(),
+                "build",
+                RuntimeError("stopped"),
+                {},
+                workspace=workspace,
+                resume_contract=contract,
+                interrupted_step=interrupted,
+                redactor=redactor,
+            )
+        assert path is not None
+        loaded = CheckpointManager.load_checkpoint(path)
+        assert loaded.workspace == {
+            "policy": "retained",
+            "identities": {"docker": {"id": "volume-1", "credential": REDACTED_MARKER}},
+            "executed_backends": ["docker"],
+        }
+        assert loaded.resume_contract == contract
+        assert loaded.interrupted_step == {
+            "name": "build",
+            "status": "unknown",
+            "attempt_id": REDACTED_MARKER,
+        }
+
     def test_lifecycle_blocks_round_trip(self, tmp_path: Path) -> None:
         # Requirement: all lifecycle blocks survive a version-one save and load.
         wf = _write_workflow(tmp_path)
@@ -1245,13 +1308,43 @@ class TestLifecycleCheckpointBlocks:
             "run_id": "",
             "event_log_path": "",
         }
-        expected_bytes = json.dumps(old_envelope, indent=2).encode("utf-8")
+        # Requirement: exact bytes match the platform's text-mode newline translation.
+        expected_bytes = (
+            json.dumps(old_envelope, indent=2).replace("\n", os.linesep).encode("utf-8")
+        )
         assert path.read_bytes() == expected_bytes
         loaded = CheckpointManager.load_checkpoint(path)
         assert loaded.workspace is None
         assert loaded.resume_contract is None
         assert loaded.interrupted_step is None
         assert path.read_bytes() == expected_bytes
+
+    @pytest.mark.parametrize(
+        "history",
+        [None, "docker", {}, ["docker", ""], ["docker", "  "], ["docker", 7]],
+    )
+    def test_rejects_malformed_executed_backend_history(self, tmp_path: Path, history: Any) -> None:
+        # Requirement: a present backend history must be a list of nonempty names.
+        path = _write_checkpoint_file(
+            tmp_path, "corrupt.json", "2026-01-01T00:00:00Z", run_id="r1", trigger="failure"
+        )
+        payload = json.loads(path.read_text())
+        payload["workspace"] = {"identities": {}, "executed_backends": history}
+        path.write_text(json.dumps(payload))
+        with pytest.raises(
+            CheckpointError, match="corrupt: partial lifecycle block workspace.executed_backends"
+        ):
+            CheckpointManager.load_checkpoint(path)
+
+    def test_legacy_workspace_without_executed_backends_loads(self, tmp_path: Path) -> None:
+        # Requirement: missing history in an older workspace is distinct from malformed history.
+        path = _write_checkpoint_file(
+            tmp_path, "legacy.json", "2026-01-01T00:00:00Z", run_id="r1", trigger="failure"
+        )
+        payload = json.loads(path.read_text())
+        payload["workspace"] = {"identities": {}}
+        path.write_text(json.dumps(payload))
+        assert CheckpointManager.load_checkpoint(path).workspace == {"identities": {}}
 
     @pytest.mark.parametrize(
         ("block", "field"),

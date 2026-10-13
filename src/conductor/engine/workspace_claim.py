@@ -131,8 +131,11 @@ def acquire_workspace_claim(run_id: str) -> WorkspaceClaim:
                 pid = data["pid"]
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 raise WorkspaceClaimError(f"Cannot read claim {path}") from exc
-            if not isinstance(pid, int) or isinstance(pid, bool):
-                pid = 0
+            if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+                raise WorkspaceClaimError(
+                    f"Invalid owner PID in workspace claim {path}; inspect the owner before "
+                    "removing the claim manually"
+                )
             if _pid_alive(pid):
                 raise WorkspaceClaimError(f"Workspace claim for {run_id} is held by PID {pid}")
             path.unlink()

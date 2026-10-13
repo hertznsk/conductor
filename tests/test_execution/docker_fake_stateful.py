@@ -106,7 +106,7 @@ def dispatch(store: Path) -> int:
             name, relative = source.split(":", 1)
             file = volumes / containers[name]["volume"] / relative.removeprefix("/workspace/")
             if not file.exists():
-                print("no such file", file=sys.stderr)
+                print(f"Could not find the file {relative} in container {name}", file=sys.stderr)
                 return 1
             Path(target).write_bytes(file.read_bytes())
             return 0
@@ -150,7 +150,21 @@ def dispatch(store: Path) -> int:
             print(json.dumps(data))
         return 0
     if argv[:2] == ["ps", "-aq"]:
-        print("\n".join(containers))
+        requested_labels = {}
+        for index, value in enumerate(argv[:-1]):
+            if value == "--filter":
+                key, expected = argv[index + 1].removeprefix("label=").split("=", 1)
+                requested_labels[key] = expected
+        print(
+            "\n".join(
+                name
+                for name, metadata in containers.items()
+                if all(
+                    metadata["labels"].get(key) == expected
+                    for key, expected in requested_labels.items()
+                )
+            )
+        )
         return 0
     if argv[:2] == ["rm", "-f"]:
         containers.pop(argv[-1], None)

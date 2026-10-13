@@ -7,6 +7,7 @@ import os
 import shutil
 import stat
 import sys
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Literal
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -127,6 +128,184 @@ async def test_retained_generation_publishes_marker_then_attaches_read_only(
     assert not probes[0][-1].startswith("conductor-")
     assert not any(argv[:2] in (["volume", "create"], ["volume", "rm"]) for argv in later)
     assert volume.exists()
+
+
+@pytest.mark.asyncio
+async def test_owner_rejects_lost_marker_after_successful_staging(
+    docker_processes: tuple[DockerRunnerBackend, str, Path, Path], tmp_path: Path
+) -> None:
+    # Requirement: later commands verify a committed marker and never copy the tree again.
+    owner, _binary, store, log = docker_processes
+    run = RunSpec("lost-marker", bundle=bundle(tmp_path), workspace_persistence="durable")
+    lease = await owner.prepare_run(run)
+    assert (await owner.run_command(command(), lease)).outcome == "completed"
+    marker = store / "volumes/conductor-ws-lost-marker/.conductor-staged"
+    marker.unlink()
+    start = len(commands(log))
+    for _ in range(3):
+        with pytest.raises(WorkspaceAttachError, match="marker missing"):
+            await owner.run_command(command(), lease)
+    later = commands(log)[start:]
+    assert sum(argv[0] == "cp" and argv[1].endswith("/.conductor-staged") for argv in later) == 3
+    assert not any(argv[0] == "cp" and argv[1] == "-a" for argv in later)
+    assert not any(argv[0] == "create" and "--env-file" in argv for argv in later)
+
+
+@pytest.mark.asyncio
+async def test_attach_refuses_surviving_owner_execution_container(
+    docker_processes: tuple[DockerRunnerBackend, str, Path, Path],
+) -> None:
+    # Requirement: an orphaned execution container blocks attach without cleanup or adoption.
+    owner, binary, store, log = docker_processes
+    run = RunSpec("orphan", workspace_persistence="durable")
+    lease = await owner.prepare_run(run)
+    name = "conductor-orphaned-exec"
+    create = [
+        "create",
+        "--name",
+        name,
+        *owner._label_args(owner._labels(lease, "exec")),
+        "-v",
+        f"{owner._volume_name(lease)}:/workspace",
+        "--entrypoint",
+        "true",
+        "busybox",
+    ]
+    assert (await owner._run_docker(create))[0] == 0
+    start = len(commands(log))
+    with pytest.raises(WorkspaceAttachError, match=name) as rejected:
+        await DockerRunnerBackend(binary).attach_run(
+            run, WorkspaceIdentity("docker", lease.lease_id, lease.incarnation)
+        )
+    assert "docker rm -f" in str(rejected.value)
+    later = commands(log)[start:]
+    assert not any(argv[0] in {"rm", "kill", "cp", "start"} for argv in later)
+    assert name in json.loads((store / "containers.json").read_text(encoding="utf-8"))
+
+
+@pytest.mark.asyncio
+async def test_attach_refuses_execution_container_with_mismatched_incarnation(
+    docker_processes: tuple[DockerRunnerBackend, str, Path, Path],
+) -> None:
+    # Requirement: an exec container for this run with conflicting ownership blocks attach.
+    owner, binary, store, log = docker_processes
+    run = RunSpec("orphan-incarnation", workspace_persistence="durable")
+    lease = await owner.prepare_run(run)
+    name = "conductor-old-exec"
+    old_labels = owner._labels(lease, "exec") | {"io.conductor.incarnation": "previous"}
+    assert (
+        await owner._run_docker(
+            [
+                "create",
+                "--name",
+                name,
+                *owner._label_args(old_labels),
+                "-v",
+                f"{owner._volume_name(lease)}:/workspace",
+                "--entrypoint",
+                "true",
+                "busybox",
+            ]
+        )
+    )[0] == 0
+    start = len(commands(log))
+    with pytest.raises(WorkspaceAttachError, match="mismatched ownership labels"):
+        await DockerRunnerBackend(binary).attach_run(
+            run, WorkspaceIdentity("docker", lease.lease_id, lease.incarnation)
+        )
+    later = commands(log)[start:]
+    assert not any(argv[0] in {"create", "rm", "kill", "cp", "start"} for argv in later)
+    assert name in json.loads((store / "containers.json").read_text(encoding="utf-8"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["ps", "inspect"])
+async def test_attach_refuses_unverifiable_execution_inventory(
+    docker_processes: tuple[DockerRunnerBackend, str, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    # Requirement: a failed container listing or inspection cannot authorize attach.
+    owner, binary, store, log = docker_processes
+    run = RunSpec("unverifiable", workspace_persistence="durable")
+    lease = await owner.prepare_run(run)
+    name = "conductor-unverifiable-exec"
+    assert (
+        await owner._run_docker(
+            [
+                "create",
+                "--name",
+                name,
+                *owner._label_args(owner._labels(lease, "exec")),
+                "-v",
+                f"{owner._volume_name(lease)}:/workspace",
+                "--entrypoint",
+                "true",
+                "busybox",
+            ]
+        )
+    )[0] == 0
+    other = DockerRunnerBackend(binary)
+    original = other._run_docker
+
+    async def failing_inventory(
+        argv: Sequence[str],
+        *,
+        stdin_bytes: bytes | None = None,
+        timeout: float | None = 300.0,
+        diagnostics: Callable[[str], None] | None = None,
+    ) -> tuple[int, str, str]:
+        if argv[0] == failure:
+            return 1, "", "Docker daemon unavailable"
+        return await original(
+            argv, stdin_bytes=stdin_bytes, timeout=timeout, diagnostics=diagnostics
+        )
+
+    monkeypatch.setattr(other, "_run_docker", failing_inventory)
+    start = len(commands(log))
+    with pytest.raises(WorkspaceAttachError, match="could not (list|inspect)"):
+        await other.attach_run(run, WorkspaceIdentity("docker", lease.lease_id, lease.incarnation))
+    later = commands(log)[start:]
+    assert not any(argv[0] in {"rm", "kill", "cp", "start"} for argv in later)
+    assert name in json.loads((store / "containers.json").read_text(encoding="utf-8"))
+
+
+@pytest.mark.asyncio
+async def test_marker_socket_failure_is_not_missing_marker(
+    docker_processes: tuple[DockerRunnerBackend, str, Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Requirement: a missing Docker socket cannot authorize first-use staging.
+    owner, binary, _store, log = docker_processes
+    run = RunSpec("socket", bundle=bundle(tmp_path), workspace_persistence="durable")
+    lease = await owner.prepare_run(run)
+    attached_backend = DockerRunnerBackend(binary)
+    attached = await attached_backend.attach_run(
+        run, WorkspaceIdentity("docker", lease.lease_id, lease.incarnation)
+    )
+    original = attached_backend._run_docker
+
+    async def disconnected(
+        argv: Sequence[str],
+        *,
+        stdin_bytes: bytes | None = None,
+        timeout: float | None = 300.0,
+        diagnostics: Callable[[str], None] | None = None,
+    ) -> tuple[int, str, str]:
+        if argv[0] == "cp" and argv[1].endswith("/.conductor-staged"):
+            return 1, "", "dial unix /var/run/docker.sock: no such file or directory"
+        return await original(
+            argv, stdin_bytes=stdin_bytes, timeout=timeout, diagnostics=diagnostics
+        )
+
+    monkeypatch.setattr(attached_backend, "_run_docker", disconnected)
+    start = len(commands(log))
+    with pytest.raises(WorkspaceAttachError, match="probe failed"):
+        await attached_backend.run_command(command(), attached)
+    later = commands(log)[start:]
+    assert not any(argv[0] == "cp" and argv[1] == "-a" for argv in later)
+    assert not any(argv[0] == "create" and "--env-file" in argv for argv in later)
 
 
 @pytest.mark.asyncio

@@ -613,13 +613,20 @@ async def test_e2e_timed_out_script_cleans_up_container_and_volume(
 async def test_retained_failure_then_resumed_success_removes_volume(
     docker_daemon: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Requirement: the real daemon keeps a failed retained workspace and removes it on resume.
+    # Requirement: resume preserves generated and modified bundle files exactly, then cleans up.
     del docker_daemon
     workflow = _write_docker_e2e_workflow(
         tmp_path,
         name="retained-daemon",
         image=PINNED_BUSYBOX,
-        step_fields='command: sh\nargs: [-c, "echo RETAINED"]',
+        step_fields=(
+            "command: sh\n"
+            "args: [-c, 'if [ -f /workspace/generated.txt ]; then "
+            "cat /workspace/generated.txt /workspace/main/retained-daemon.yaml; "
+            'else printf "generated-before-resume\\n" > /workspace/generated.txt; '
+            'printf "modified-bundle-before-resume\\n" > '
+            "/workspace/main/retained-daemon.yaml; fi']"
+        ),
     )
     workflow.write_text(
         workflow.read_text(encoding="utf-8").replace(
@@ -672,7 +679,7 @@ async def test_retained_failure_then_resumed_success_removes_volume(
             )
         )
         result = await resumed.resume(checkpoint.current_agent, checkpoint=checkpoint)
-        assert result["result"].strip() == "RETAINED"
+        assert result["result"] == ("generated-before-resume\nmodified-bundle-before-resume\n")
         rc, _stdout, stderr = await _docker("volume", "inspect", volume)
         assert rc != 0 and "no such volume" in stderr.lower()
     finally:
