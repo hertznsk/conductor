@@ -386,11 +386,18 @@ When resuming a workflow configured with retained workspace persistence, Conduct
 
 ### Interrupted Step and Attempt Tracking
 
-When a failure checkpoint is written, Conductor records details about the active step in `checkpoint_saved.interrupted_step`:
+For workflows with retained workspace persistence (`durable` or `on-failure`), a
+failure checkpoint records `interrupted_step` in the checkpoint file when a
+current step is known. The corresponding `checkpoint_saved` event includes
+`interrupted_step` under the same conditions. Periodic checkpoints and
+workflows without retained workspace persistence omit it.
 
-* **`name`**: The step that was actively running when failure occurred.
+* **`name`**: The current step at failure; it may not have dispatched a command yet.
 * **`status`**: Set to `"unknown"`, because external container actions cannot be verified after an interruption.
-* **`attempt_id`**: The attempt identifier active when execution halted.
+* **`attempt_id`**: The in-flight attempt identifier, or `null` if no attempt was active for that step.
+
+Checkpoints without `interrupted_step` can still have an interrupted step; resume
+uses `current_agent` as a heuristic rather than proof of an in-flight attempt.
 
 On resume, the engine evaluates the step's `restart:` policy:
 * If configured with `mode: rerun` (the default), Conductor re-executes the interrupted step from the top.

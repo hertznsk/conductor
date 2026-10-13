@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Literal
@@ -16,9 +17,12 @@ from conductor.config.environment import (
     ResolvedEnvironment,
     builtin_local_environment,
 )
+from conductor.config.loader import load_config
 from conductor.config.schema import (
     AgentDef,
+    ForEachDef,
     OutputField,
+    ParallelGroup,
     RestartConfig,
     RouteDef,
     ScriptStepDef,
@@ -158,6 +162,23 @@ async def test_retained_resume_requires_checkpoint_and_new_contract(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_failure_checkpoint_without_retained_identity_rejects_resume(tmp_path: Path) -> None:
+    # Requirement: a failure checkpoint without a required identity never attaches a new volume.
+    engine = _engine(tmp_path)
+    checkpoint = _checkpoint(engine)
+    assert checkpoint.workspace is not None
+    checkpoint.workspace["identities"] = {}
+    with (
+        patch("conductor.engine.workflow.acquire_workspace_claim") as claim,
+        patch.object(engine._execution_session, "ensure_backends", new_callable=AsyncMock) as prep,
+        pytest.raises(CheckpointError, match="missing an identity"),
+    ):
+        await engine.resume("script", checkpoint=checkpoint)
+    claim.assert_not_called()
+    prep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_restart_fail_blocks_attach_before_any_dispatch(tmp_path: Path) -> None:
     # Requirement: a failed in-flight step with restart=fail cannot attach its workspace.
     engine = _engine(tmp_path, restart="fail")
@@ -170,6 +191,154 @@ async def test_restart_fail_blocks_attach_before_any_dispatch(tmp_path: Path) ->
         await engine.resume("script", checkpoint=checkpoint)
     prep.assert_not_awaited()
     dispatch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("group_kind", ["parallel", "for_each"])
+@pytest.mark.parametrize("inherited", [False, True])
+async def test_group_member_restart_fail_blocks_failure_resume(
+    tmp_path: Path, group_kind: str, inherited: bool
+) -> None:
+    # Requirement: an interrupted group cannot rerun any member configured to fail on restart.
+    base = _engine(tmp_path)
+    config = base.config
+    config.workflow.entry_point = "group"
+    if inherited:
+        config.workflow.defaults.restart = RestartConfig(mode="fail")
+    member = ScriptStepDef(
+        name="member",
+        command="true",
+        timeout=None,
+        execution=StepExecutionConfig(profile="docker"),
+        restart=None if inherited else RestartConfig(mode="fail"),
+    )
+    if group_kind == "parallel":
+        config.agents.append(member)
+        config.parallel = [ParallelGroup(name="group", agents=["script", "member"])]
+    else:
+        config.for_each = [
+            ForEachDef.model_validate(
+                {
+                    "name": "group",
+                    "type": "for_each",
+                    "source": "workflow.input.items",
+                    "as": "item",
+                    "agent": member,
+                }
+            )
+        ]
+    engine = WorkflowEngine(
+        config,
+        workflow_path=base.workflow_path,
+        execution_environment=base._execution_session.environment,
+        run_context=RunContext(run_id="lifecycle-test"),
+    )
+    checkpoint = _checkpoint(engine)
+    checkpoint.current_agent = "group"
+    with (
+        patch("conductor.engine.workflow.acquire_workspace_claim") as claim,
+        patch.object(engine._execution_session, "ensure_backends", new_callable=AsyncMock) as prep,
+        patch.object(engine, "_execute_loop", new_callable=AsyncMock) as dispatch,
+        pytest.raises(CheckpointError, match="group.*member.*restart.mode: fail"),
+    ):
+        await engine.resume("group", checkpoint=checkpoint)
+    claim.assert_not_called()
+    prep.assert_not_awaited()
+    dispatch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_periodic_group_checkpoint_skips_member_restart_policy(tmp_path: Path) -> None:
+    # Requirement: a step-boundary checkpoint has no interrupted member to reject.
+    base = _engine(tmp_path, restart="fail")
+    base.config.workflow.entry_point = "group"
+    base.config.for_each = [
+        ForEachDef.model_validate(
+            {
+                "name": "group",
+                "type": "for_each",
+                "source": "workflow.input.items",
+                "as": "item",
+                "agent": base.config.agents[0],
+            }
+        )
+    ]
+    engine = WorkflowEngine(
+        base.config,
+        workflow_path=base.workflow_path,
+        execution_environment=base._execution_session.environment,
+        run_context=RunContext(run_id="lifecycle-test"),
+    )
+    checkpoint = _checkpoint(engine)
+    checkpoint.current_agent = "group"
+    checkpoint.trigger = "periodic"
+    with (
+        patch("conductor.engine.workflow.acquire_workspace_claim"),
+        patch.object(engine._execution_session, "ensure_backends", new_callable=AsyncMock),
+        patch.object(engine._execution_session, "prepare_leases", new_callable=AsyncMock),
+        patch.object(engine._execution_session, "finalize_leases", new_callable=AsyncMock),
+        patch.object(engine, "_execute_loop", new_callable=AsyncMock, return_value={}) as dispatch,
+        patch("conductor.engine.workflow.prepare_run_bundle", new_callable=AsyncMock),
+    ):
+        await engine.resume("group", checkpoint=checkpoint)
+    dispatch.assert_awaited_once_with("group")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resumed", [False, True])
+@pytest.mark.parametrize("failure", [RuntimeError("execution failed"), asyncio.CancelledError()])
+async def test_claim_release_does_not_replace_active_outcome(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, resumed: bool, failure: BaseException
+) -> None:
+    # Requirement: claim cleanup records a failure while preserving the run's exception.
+    engine = _engine(tmp_path)
+    checkpoint = _checkpoint(engine)
+    claim_error = RuntimeError("claim release failed")
+    with (
+        patch("conductor.engine.workflow.acquire_workspace_claim") as acquire,
+        patch.object(engine._execution_session, "ensure_backends", new_callable=AsyncMock),
+        patch.object(engine._execution_session, "prepare_leases", new_callable=AsyncMock),
+        patch.object(engine._execution_session, "finalize_leases", new_callable=AsyncMock),
+        patch.object(engine, "_execute_loop", new_callable=AsyncMock, side_effect=failure),
+        patch("conductor.engine.workflow.prepare_run_bundle", new_callable=AsyncMock),
+        pytest.raises(type(failure)) as raised,
+    ):
+        acquire.return_value.run_id = "lifecycle-test"
+        acquire.return_value.path = tmp_path / "claim.json"
+        acquire.return_value.release.side_effect = claim_error
+        if resumed:
+            await engine.resume("script", checkpoint=checkpoint)
+        else:
+            await engine.run({})
+    assert raised.value is failure
+    acquire.return_value.release.assert_called_once()
+    assert "lifecycle-test" in caplog.text
+    assert "claim release failed" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resumed", [False, True])
+async def test_claim_release_failure_propagates_after_success(
+    tmp_path: Path, resumed: bool
+) -> None:
+    # Requirement: a claim release failure is visible when execution succeeded.
+    engine = _engine(tmp_path)
+    checkpoint = _checkpoint(engine)
+    with (
+        patch("conductor.engine.workflow.acquire_workspace_claim") as acquire,
+        patch.object(engine._execution_session, "ensure_backends", new_callable=AsyncMock),
+        patch.object(engine._execution_session, "prepare_leases", new_callable=AsyncMock),
+        patch.object(engine._execution_session, "finalize_leases", new_callable=AsyncMock),
+        patch.object(engine, "_execute_loop", new_callable=AsyncMock, return_value={}),
+        patch("conductor.engine.workflow.prepare_run_bundle", new_callable=AsyncMock),
+        pytest.raises(RuntimeError, match="claim release failed"),
+    ):
+        acquire.return_value.release.side_effect = RuntimeError("claim release failed")
+        if resumed:
+            await engine.resume("script", checkpoint=checkpoint)
+        else:
+            await engine.run({})
+    acquire.return_value.release.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -405,6 +574,83 @@ async def test_failed_run_retains_docker_and_successful_resume_removes_it(
     assert backend.outcomes == [("failed", True), ("succeeded", False)]
     assert backend.volume is False
     assert backend.attempts[0] != backend.attempts[1]
+
+
+@pytest.mark.asyncio
+async def test_asset_only_bundle_change_rejects_resume_before_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: an asset-only bundle change rejects attach without deleting retained storage.
+    monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path / "home"))
+    asset = tmp_path / "asset.txt"
+    asset.write_text("before", encoding="utf-8")
+    path = tmp_path / "workflow.yaml"
+    base = _engine(tmp_path)
+    environment = base._execution_session.environment
+    backend = _RetainedDocker()
+    monkeypatch.setitem(BACKEND_FACTORIES, "docker", lambda: backend)
+    path.write_text(
+        """workflow:
+  name: asset-test
+  entry_point: script
+  workspace:
+    persistence: on-failure
+  bundle:
+    assets: [asset.txt]
+agents:
+  - name: script
+    type: script
+    command: "true"
+    execution:
+      profile: docker
+    routes:
+      - to: $end
+""",
+        encoding="utf-8",
+    )
+    engine = WorkflowEngine(
+        load_config(path),
+        workflow_path=path,
+        execution_environment=environment,
+        run_context=RunContext(run_id="lifecycle-test"),
+    )
+    with (
+        patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path),
+        pytest.raises(ExecutionError, match="fake command failure"),
+    ):
+        await engine.run({})
+    assert engine._last_checkpoint_path is not None
+    checkpoint = CheckpointManager.load_checkpoint(engine._last_checkpoint_path)
+    assert checkpoint.resume_contract is not None
+    original_digest = checkpoint.resume_contract["bundle_digest"]
+    asset.write_text("after", encoding="utf-8")
+    resumed = WorkflowEngine(
+        load_config(path),
+        workflow_path=path,
+        execution_environment=environment,
+        run_context=RunContext(run_id="lifecycle-test"),
+    )
+    assert (
+        resumed._resume_contract()["workflow_digest"]
+        == checkpoint.resume_contract["workflow_digest"]
+    )
+    with (
+        patch.object(
+            resumed._execution_session,
+            "ensure_backends",
+            wraps=resumed._execution_session.ensure_backends,
+        ) as prep,
+        patch.object(backend, "attach_run", wraps=backend.attach_run) as attach,
+        patch.object(resumed, "_execute_loop", new_callable=AsyncMock) as dispatch,
+        pytest.raises(CheckpointError, match="bundle_digest mismatch"),
+    ):
+        await resumed.resume("script", checkpoint=checkpoint)
+    prep.assert_not_awaited()
+    attach.assert_not_awaited()
+    dispatch.assert_not_awaited()
+    assert resumed._run_bundle is not None
+    assert original_digest != resumed._run_bundle.digest
+    assert backend.volume is True and backend.outcomes == [("failed", True)]
 
 
 @pytest.mark.asyncio

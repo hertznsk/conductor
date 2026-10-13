@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 import pytest
 
-from conductor.cli.run import _run_with_stop_signal
+from conductor.cli.run import _resume_with_stop_signal, _run_with_stop_signal
 from conductor.config.schema import (
     ContextConfig,
     LimitsConfig,
@@ -32,11 +32,13 @@ from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.exceptions import ExecutionError
 from conductor.execution.docker import DockerRunnerBackend
 from conductor.execution.types import RunOutcome
+from conductor.executor.wait import WaitOutput
 from conductor.providers.copilot import CopilotProvider
 from tests.test_execution.test_workspace_retention import (
     bundle,
     commands,
     lifecycle_engine,
+    restore,
 )
 
 pytest_plugins = ["tests.test_execution.test_workspace_retention"]
@@ -214,3 +216,69 @@ async def test_dashboard_cancel_keeps_fake_docker_volume_on_failed_checkpoint(
     assert not any(argv[:2] == ["volume", "rm"] for argv in commands(log))
     assert "retention-engine" in caplog.text
     assert "docker volume rm conductor-ws-retention-engine" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_initial_and_resumed_dashboard_stop_preserve_workspace_identity(
+    docker_processes: tuple[DockerRunnerBackend, str, Path, Path], tmp_path: Path
+) -> None:
+    # Requirement: both stop generations checkpoint retained identities after lease finalization.
+    _backend, _binary, store, log = docker_processes
+    engine = lifecycle_engine(tmp_path, last="pause")
+    run_bundle = bundle(tmp_path)
+    volume = store / "volumes" / "conductor-ws-retention-engine"
+    started = asyncio.Event()
+
+    async def paused(*_args: object) -> None:
+        assert engine._dashboard_stop_workspace is None
+        started.set()
+        await asyncio.Future()
+
+    class StopWhenPaused:
+        async def wait_for_stop(self) -> None:
+            await started.wait()
+
+    with (
+        patch(
+            "conductor.engine.workflow.prepare_run_bundle",
+            new_callable=mock.AsyncMock,
+            return_value=run_bundle,
+        ),
+        patch.object(engine, "_execute_wait", side_effect=paused),
+        patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path),
+    ):
+        with pytest.raises(ExecutionError, match="stopped by user"):
+            await _run_with_stop_signal(engine, {}, StopWhenPaused())
+        assert engine._last_checkpoint_path is not None
+        first = CheckpointManager.load_checkpoint(engine._last_checkpoint_path)
+        assert first.current_agent == "pause"
+        assert first.workspace is not None
+        identity = first.workspace["identities"]["docker"]
+        assert first.workspace["executed_backends"] == ["docker"]
+        assert volume.exists()
+        assert engine._dashboard_stop_workspace is None
+
+        started = asyncio.Event()
+        restore(engine, first)
+        with pytest.raises(ExecutionError, match="stopped by user"):
+            await _resume_with_stop_signal(engine, first.current_agent, StopWhenPaused(), first)
+        assert engine._last_checkpoint_path is not None
+        second = CheckpointManager.load_checkpoint(engine._last_checkpoint_path)
+        assert second.workspace is not None
+        assert second.workspace["identities"]["docker"] == identity
+        assert second.workspace["executed_backends"] == ["docker"]
+        assert volume.exists()
+        assert engine._dashboard_stop_workspace is None
+
+    restore(engine, second)
+    with (
+        patch(
+            "conductor.engine.workflow.prepare_run_bundle",
+            new_callable=mock.AsyncMock,
+            return_value=run_bundle,
+        ),
+        patch.object(engine, "_execute_wait", return_value=WaitOutput(0, 0, None, False)),
+    ):
+        await engine.resume(second.current_agent, checkpoint=second)
+    assert not volume.exists()
+    assert sum(argv[:2] == ["volume", "rm"] for argv in commands(log)) == 1

@@ -105,7 +105,7 @@ agents:
 * **`rerun`**: If the workflow was interrupted while this step was running, re-run the step from the beginning upon resume. This is the default.
 * **`fail`**: If the workflow was interrupted while this step was running, fail immediately upon resume. This protects non-idempotent steps (such as publishing a package or charging a card) from double execution.
 * **`reuse`**: Reserved for future step-level output reuse.
-* **Step Group Scope**: For parallel groups and for-each groups, `restart:` applies to the entire group. Resuming an interrupted group re-runs all group members.
+* **Step Group Scope**: Resuming an interrupted parallel or for-each group re-runs the whole group. If any member has an effective `restart.mode: fail`, resume refuses the group instead.
 
 ## Checkpoint Contract
 
@@ -113,7 +113,10 @@ Conductor checkpoints preserve full lifecycle context so resumption can verify s
 
 ### Checkpoint Fields
 
-When saving a checkpoint, the engine includes three lifecycle structures:
+Checkpoints for retained workspaces include `workspace` and `resume_contract`. A
+failure checkpoint also includes `interrupted_step` when a current step is known;
+periodic checkpoints omit it. Workflows without retained persistence omit all
+three structures.
 
 1. **`workspace`**: A dictionary containing workspace retention state:
    * `policy`: The configured retention policy string (`"durable"` or `"on-failure"`).
@@ -125,10 +128,10 @@ When saving a checkpoint, the engine includes three lifecycle structures:
    * `environment_digest`: The canonical digest of the resolved environment document.
    * `manifest_digest`: The canonical semantic digest of the compiled execution manifest, computed by `manifest_semantic_digest()` in `src/conductor/engine/run_manifest.py`.
    * `bundle_digest`: The content-addressed bundle digest (or `null` if no bundle was built).
-3. **`interrupted_step`**: Details about the active step when execution halted:
-   * `name`: The name of the in-flight step.
+3. **`interrupted_step`**: Details about the current step at failure:
+   * `name`: The current step, which might not yet have dispatched a command.
    * `status`: Marked as `"unknown"` because external container effects cannot be proven after interruption.
-   * `attempt_id`: The execution attempt identifier if one was active.
+   * `attempt_id`: The execution attempt identifier if one was active, otherwise `null`.
 
 ### Legacy Compatibility
 
@@ -194,9 +197,9 @@ Retained workspaces persist on the host filesystem or Docker daemon across proce
 
 Claim fencing operates strictly within a single host machine. It does not provide distributed synchronization across multiple machines.
 
-## Garbage Collection (GC) via Docker Labels
+## Workspace Inventory via Docker Labels
 
-Retained Docker volumes can accumulate over time if failing runs are not cleaned up manually. Conductor tags all created volumes with tracking labels to simplify automated garbage collection.
+Retained Docker volumes can accumulate over time. Conductor tags created volumes with tracking labels so operators can identify the resources belonging to a particular run.
 
 ### Volume Label Schema
 
@@ -212,32 +215,27 @@ Conductor tags Docker resources with a consistent set of `io.conductor.*` labels
 * `io.conductor.step=<step_name>`: Recorded on execution containers to identify the active step.
 * `io.conductor.workspace=<lease_id>`: Identifies the workspace lease ID on initial volume creation.
 
-### Sample CI Cleanup Job
+### Inventory Before Manual Cleanup
 
-In continuous integration environments, old retained volumes can be pruned using standard Docker CLI filtering against the real labels and Docker's native volume creation timestamp:
+List managed workspace volumes without deleting them:
 
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-# Find all Conductor workspace volumes created more than 24 hours ago
-CUTOFF_SECONDS=$(date -d "24 hours ago" +%s 2>/dev/null || date -v -24H +%s)
-
-echo "Scanning for orphaned Conductor workspace volumes..."
 docker volume ls \
   --filter "label=io.conductor.managed=true" \
   --filter "label=io.conductor.resource=workspace" \
-  --format "{{.Name}}" | while read -r vol; do
-  CREATED=$(docker volume inspect "$vol" --format '{{.CreatedAt}}')
-  if [ -n "$CREATED" ]; then
-    CREATED_SECONDS=$(date -d "$CREATED" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%SZ" "$CREATED" +%s 2>/dev/null || echo 0)
-    if [ "$CREATED_SECONDS" -lt "$CUTOFF_SECONDS" ] && [ "$CREATED_SECONDS" -gt 0 ]; then
-      echo "Pruning expired workspace volume: $vol (created $CREATED)"
-      docker volume rm "$vol" || true
-    fi
-  fi
-done
+  --format "{{.Name}}"
 ```
+
+Age alone does not establish that a volume is abandoned: a long-running or
+resumable workflow may still need it. Before any manual removal, identify the
+specific run ID from its run record, checkpoint, or event log, confirm that
+neither the original run nor a resumed process still owns it, and inspect the
+volume labels to confirm the run ID and retention policy. Only explicitly
+confirmed abandoned run IDs are candidates for cleanup; never remove every
+volume returned by this inventory. The absence of attached containers does
+not prove a workspace is abandoned: a live run can pause between script steps.
+See the run-scoped manual cleanup procedure in
+[Docker Backend](docker-backend.md).
 
 ## Limitations
 

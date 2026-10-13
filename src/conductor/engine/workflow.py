@@ -52,7 +52,7 @@ from conductor.engine.run_manifest import (
 )
 from conductor.engine.secrets import SecretValueCache
 from conductor.engine.usage import UsageTracker, WorkflowUsage
-from conductor.engine.workspace_claim import acquire_workspace_claim
+from conductor.engine.workspace_claim import WorkspaceClaim, acquire_workspace_claim
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.exceptions import (
     AgentTimeoutError,
@@ -114,6 +114,24 @@ from conductor.redaction import RunRedactor
 from conductor.telemetry import guards
 
 logger = logging.getLogger(__name__)
+
+
+def _release_workspace_claim(claim: WorkspaceClaim) -> None:
+    """Keep an in-flight outcome when claim cleanup fails."""
+    active_error = sys.exc_info()[1]
+    try:
+        claim.release()
+    except Exception:
+        if active_error is None:
+            raise
+        logger.warning(
+            "Failed to release workspace claim for run %s at %s; "
+            "inspect the claim before removing it manually.",
+            claim.run_id,
+            claim.path,
+            exc_info=True,
+        )
+
 
 # Maximum nesting depth for sub-workflow composition.
 # Prevents runaway recursion when workflows reference each other.
@@ -821,6 +839,9 @@ class WorkflowEngine:
         # (issue #244) also set _last_checkpoint_path, so it can no longer
         # double as "the dashboard-stop handler already ran".
         self._dashboard_stop_handled: bool = False
+        self._dashboard_stop_workspace: (
+            tuple[dict[str, WorkspaceIdentity], frozenset[str]] | None
+        ) = None
 
         # True only for the first questions node reached via resume(), so a
         # loop-back re-asks rather than replaying the prior pass's answers.
@@ -3562,6 +3583,8 @@ class WorkflowEngine:
         """
         await self._ensure_plugin_marketplaces()
         self._explicit_terminal_failure = False
+        self._dashboard_stop_handled = False
+        self._dashboard_stop_workspace = None
 
         # Apply defaults from input schema for optional inputs not provided
         merged_inputs = self._apply_input_defaults(inputs)
@@ -3646,6 +3669,11 @@ class WorkflowEngine:
             finally:
                 if self._subworkflow_depth == 0:
                     try:
+                        if outcome == "cancelled":
+                            self._dashboard_stop_workspace = (
+                                self._execution_session.workspace_identities(),
+                                self._execution_session.executed_backends(),
+                            )
                         await self._execution_session.finalize_leases(
                             outcome, retain=self._compute_workspace_retain(outcome)
                         )
@@ -3654,7 +3682,7 @@ class WorkflowEngine:
                         if redaction_token is not None:
                             redaction.reset_current(redaction_token)
                         if claim is not None:
-                            claim.release()
+                            _release_workspace_claim(claim)
         # Successful completion: this run's periodic checkpoints are now stale.
         self._cleanup_run_periodic_checkpoints()
         return result
@@ -3682,6 +3710,8 @@ class WorkflowEngine:
         """
         await self._ensure_plugin_marketplaces()
         self._explicit_terminal_failure = False
+        self._dashboard_stop_handled = False
+        self._dashboard_stop_workspace = None
 
         # A questions node restores its partial answers only here. On an
         # ordinary loop-back the node must ask its new questions, not replay
@@ -3774,15 +3804,23 @@ class WorkflowEngine:
                     interrupted = checkpoint.interrupted_step
                     step_name = (interrupted or {}).get("name") or checkpoint.current_agent
                     step = self._find_agent(step_name)
-                    restart = getattr(step, "restart", None)
+                    parallel_group = self._find_parallel_group(step_name)
+                    for_each_group = self._find_for_each_group(step_name)
+                    if parallel_group is not None:
+                        members = [self._find_agent(name) for name in parallel_group.agents]
+                    elif for_each_group is not None:
+                        members = [for_each_group.agent]
+                    else:
+                        members = [step]
                     default_restart = self.config.workflow.defaults.restart
-                    selected_restart = restart or default_restart
-                    mode = selected_restart.mode if selected_restart is not None else "rerun"
-                    if mode == "fail":
-                        raise CheckpointError(
-                            f"Interrupted step {step_name!r} has restart.mode: fail; "
-                            "start a fresh run."
-                        )
+                    for member in members:
+                        restart = getattr(member, "restart", None) or default_restart
+                        if restart is not None and restart.mode == "fail":
+                            member_name = getattr(member, "name", step_name)
+                            raise CheckpointError(
+                                f"Interrupted step {step_name!r} includes {member_name!r} "
+                                "with restart.mode: fail; start a fresh run."
+                            )
                     note = (
                         f"Resuming interrupted step {step_name!r} at least once "
                         "(legacy current_agent is a heuristic, not a proven in-flight identity)"
@@ -3796,7 +3834,6 @@ class WorkflowEngine:
             backend_names = {
                 profile.backend for profile in self._execution_resolver.manifest.profiles.values()
             }
-            await self._execution_session.ensure_backends(backend_names)
             if self._subworkflow_depth == 0:
                 if self._execution_session.owns_secrets:
                     self._execution_session.reset_secrets()
@@ -3815,6 +3852,7 @@ class WorkflowEngine:
                             f"Checkpoint bundle_digest mismatch: recorded {recorded_bundle!r}, "
                             f"current {current_bundle!r}; start a fresh run."
                         )
+                await self._execution_session.ensure_backends(backend_names)
                 backends = script_step_backends(self._execution_resolver.manifest)
                 if len(backends) > 1:
                     message = "Workflow uses mixed script execution backends: " + ", ".join(
@@ -3842,6 +3880,8 @@ class WorkflowEngine:
                     set_redactor(self._execution_session.redactor)
                 if redaction.current() is not self._execution_session.redactor:
                     redaction_token = redaction.set_current(self._execution_session.redactor)
+            else:
+                await self._execution_session.ensure_backends(backend_names)
             result = await self._execute_loop(current_agent_name)
         except asyncio.CancelledError:
             outcome = "cancelled"
@@ -3862,6 +3902,11 @@ class WorkflowEngine:
             finally:
                 if self._subworkflow_depth == 0:
                     try:
+                        if outcome == "cancelled":
+                            self._dashboard_stop_workspace = (
+                                self._execution_session.workspace_identities(),
+                                self._execution_session.executed_backends(),
+                            )
                         await self._execution_session.finalize_leases(
                             outcome, retain=self._compute_workspace_retain(outcome)
                         )
@@ -3870,7 +3915,7 @@ class WorkflowEngine:
                         if redaction_token is not None:
                             redaction.reset_current(redaction_token)
                         if claim is not None:
-                            claim.release()
+                            _release_workspace_claim(claim)
         # Successful completion: this run's periodic checkpoints are now stale.
         self._cleanup_run_periodic_checkpoints()
         return result
@@ -3987,7 +4032,11 @@ class WorkflowEngine:
             copilot_session_cwds = None
 
         persistence = self._workspace_persistence()
-        identities = self._execution_session.workspace_identities()
+        if self._dashboard_stop_handled and self._dashboard_stop_workspace is not None:
+            identities, executed_backends = self._dashboard_stop_workspace
+        else:
+            identities = self._execution_session.workspace_identities()
+            executed_backends = self._execution_session.executed_backends()
         interrupted = None
         if (
             persistence is not None
@@ -4018,7 +4067,7 @@ class WorkflowEngine:
                 {
                     "policy": persistence,
                     "identities": {name: asdict(identity) for name, identity in identities.items()},
-                    "executed_backends": sorted(self._execution_session.executed_backends()),
+                    "executed_backends": sorted(executed_backends),
                 }
                 if persistence is not None
                 else None
@@ -4252,7 +4301,10 @@ class WorkflowEngine:
         # outcome (path, or the reason none was written) atomically. This emits
         # ``checkpoint_saved`` on success; harmless here since the dashboard
         # reads the path inline from ``workflow_failed``.
-        checkpoint_path = self._save_checkpoint_on_failure(error)
+        try:
+            checkpoint_path = self._save_checkpoint_on_failure(error)
+        finally:
+            self._dashboard_stop_workspace = None
         if checkpoint_path is None and self._compute_workspace_retain("cancelled"):
             logger.warning(
                 "Retained workspace for run %s has no current checkpoint; "
