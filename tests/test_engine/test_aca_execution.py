@@ -8,7 +8,7 @@ import logging
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -74,6 +74,44 @@ async def test_aca_backend_streams_events_and_finalizes_lease() -> None:
     await backend.finalize_run(lease, "succeeded")
     assert backend._leases == {}
     assert transport._http_client is None
+
+
+@pytest.mark.asyncio
+async def test_aca_finalizes_every_pool_after_first_transport_close_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Requirement: one pool close failure cannot leave sibling and root transports open.
+    gateway = httpx.MockTransport(lambda request: httpx.Response(200))
+    root = _provider(gateway)
+    backend = AcaRunnerBackend(transport=root)
+    pools = backend.bind_profiles(
+        {
+            name: AcaProfileOptions(pool_endpoint=f"https://{name}.example.com")
+            for name in ("first", "second", "third")
+        }
+    )
+    first_child = _provider(gateway)
+    later_child = _provider(gateway)
+    pools["second"]._transport = first_child
+    pools["third"]._transport = later_child
+    later_close = AsyncMock(wraps=later_child.close)
+    root_close = AsyncMock(wraps=root.close)
+    original_close = first_child.close
+    monkeypatch.setattr(first_child, "close", AsyncMock(side_effect=RuntimeError("close failed")))
+    monkeypatch.setattr(later_child, "close", later_close)
+    monkeypatch.setattr(root, "close", root_close)
+    lease = await backend.prepare_run(RunSpec("run-1"))
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        await backend.finalize_run(lease, "failed")
+
+    later_close.assert_awaited_once()
+    root_close.assert_awaited_once()
+    assert backend._leases == {}
+    assert later_child._http_client is None
+    assert root._http_client is None
+    assert pools["second"]._transport is first_child
+    await original_close()
 
 
 @pytest.mark.asyncio

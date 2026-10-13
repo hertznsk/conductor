@@ -56,6 +56,9 @@ def main() -> int:
             if args.interrupt is not None:
                 sys.stdout.buffer.write(response.read(65536))
             else:
+                # Response headers arrive only after /execute has registered its execution_id.
+                sys.stdout.buffer.write(b'{"type":"bridge_ready","data":{}}\n')
+                sys.stdout.buffer.flush()
                 for line in response:
                     sys.stdout.buffer.write(line)
                     sys.stdout.buffer.flush()

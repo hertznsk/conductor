@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
+import pytest
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from conductor.execution.agent_wire import _DEFAULT_PROTOCOL_VERSION, agent_spec_to_wire_body
@@ -79,3 +81,19 @@ def test_v1_body_is_accepted_by_the_pinned_v1_request_shape() -> None:
     assert set(_V1Request.model_fields) == set(v1_fields)
     assert _V1Request.model_validate(body).rendered_prompt == "Summarize."
     assert body["inner_provider_settings"] == {"api_key": "model-secret"}
+    assert "temperature" not in body["agent"]
+    assert "max_tokens" not in body["agent"]
+
+
+def test_sampling_values_survive_spec_to_wire_parse() -> None:
+    # Requirement: the strict runner request parses both effective sampling values.
+    body = agent_spec_to_wire_body(replace(_spec(), temperature=0.27, max_tokens=4096))
+    parsed = RunnerAgentRequest.model_validate(body)
+    assert parsed.agent.temperature == 0.27
+    assert parsed.agent.max_tokens == 4096
+
+
+def test_v1_sampling_configuration_is_rejected() -> None:
+    # Requirement: a v1 runner must not silently ignore configured sampling settings.
+    with pytest.raises(ValueError, match="v1 cannot honor"):
+        agent_spec_to_wire_body(replace(_spec(), temperature=0.27), protocol_version=1)

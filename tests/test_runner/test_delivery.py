@@ -5,16 +5,28 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
+from pydantic import SecretStr
 
 from conductor.config.schema import AgentDef, ProviderSettings
+from conductor.engine.realm_credentials import resolve_realm_credentials
 from conductor.exceptions import ProviderError
+from conductor.execution.agent_wire import agent_spec_to_wire_body
+from conductor.execution.types import AgentSpec
 from conductor.providers.aca import AcaRuntimeProvider
-from tests.test_runner.conftest import DeliveryProvider, RunnerClientFactory
+from conductor.providers.base import AgentOutput
+from conductor.redaction import REDACTED_MARKER
+from tests.test_runner.conftest import (
+    ClaudeDeliveryProvider,
+    CopilotDeliveryProvider,
+    DeliveryProvider,
+    OpenAIDeliveryProvider,
+    RunnerClientFactory,
+)
 
 pytestmark = pytest.mark.usefixtures("delivery_provider")
 
@@ -53,6 +65,18 @@ async def test_factory_executes_each_supported_provider(
         assert sum(frame["type"] in {"result", "error"} for frame in frames) == 1
         assert "model-key" not in response.text
         instance = DeliveryProvider.instances[0]
+        assert (
+            type(instance)
+            is {
+                "copilot": CopilotDeliveryProvider,
+                "openai": OpenAIDeliveryProvider,
+                "claude": ClaudeDeliveryProvider,
+            }[provider]
+        )
+        if provider == "copilot":
+            assert instance.settings["provider_settings"].api_key.get_secret_value() == "model-key"
+        else:
+            assert instance.settings["api_key"] == "model-key"
         assert instance.calls[0]["skill_directories"] == ["/workspace/skills/review"]
         assert instance.calls[0]["custom_agents"] == [{"name": "reviewer", "prompt": "Review."}]
         assert instance.calls[0]["interrupt_signal"] is None
@@ -141,6 +165,188 @@ async def test_error_frames_and_runner_logs_redact_overlay(
     assert response.status_code == 200
     assert _frames(response)[-1]["type"] == "error"
     assert "private-overlay" not in response.text
+    assert "private-overlay" not in caplog.text
+
+
+@pytest.mark.parametrize("transport", ["http", "sse"])
+async def test_remote_mcp_header_secret_is_scrubbed_from_events_errors_and_logs(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    runner_client_factory: RunnerClientFactory,
+    transport: str,
+) -> None:
+    # Requirement: all HTTP/SSE header secrets are redacted from events and diagnostics.
+    secret = "TEST_SECRET_SENTINEL"
+
+    async def echo_header(
+        self: CopilotDeliveryProvider,
+        agent: AgentDef,
+        context: dict[str, Any],
+        prompt: str,
+        **kwargs: Any,
+    ) -> AgentOutput:
+        value = self.settings["mcp_servers"]["remote"]["headers"]["X-Api-Key"]
+        kwargs["event_callback"]("agent_message", {"content": value})
+        raise RuntimeError(f"header failure: {value}")
+
+    monkeypatch.setattr(CopilotDeliveryProvider, "execute", echo_header)
+    async with runner_client_factory() as client:
+        response = await client.post(
+            "/execute",
+            json=_body(
+                agent={"name": "header-agent"},
+                execution_id="header-call",
+                mcp_servers={
+                    "remote": {
+                        "type": transport,
+                        "url": "https://mcp.example.test",
+                        "headers": {"X-Api-Key": secret},
+                    }
+                },
+            ),
+        )
+    frames = _frames(response)
+    assert response.status_code == 200
+    assert [frame["type"] for frame in frames] == ["agent_message", "error"]
+    assert frames[0]["data"]["content"] == REDACTED_MARKER
+    assert REDACTED_MARKER in frames[1]["data"]["message"]
+    assert secret not in response.text
+    assert secret not in caplog.text
+    assert "execution_id=header-call" in caplog.text
+    assert "Traceback (most recent call last)" in caplog.text
+
+
+@pytest.mark.parametrize("provider", ["copilot", "openai", "claude"])
+async def test_sampling_settings_reach_distinct_provider_constructors(
+    provider: str, runner_client_factory: RunnerClientFactory
+) -> None:
+    # Requirement: runner constructs the selected SDK with host-effective sampling settings.
+    async with runner_client_factory() as client:
+        response = await client.post(
+            "/execute",
+            json=_body(
+                provider,
+                agent={
+                    "name": "sampler",
+                    "temperature": 0.37,
+                    "max_tokens": 2048 if provider != "copilot" else None,
+                },
+                inner_provider_settings={"api_key": "specific-key"},
+            ),
+        )
+    assert response.status_code == 200
+    instance = DeliveryProvider.instances[0]
+    assert instance.settings["temperature"] == 0.37
+    if provider != "copilot":
+        assert instance.settings["max_tokens"] == 2048
+
+
+async def test_copilot_refuses_unsupported_output_limit(
+    runner_client_factory: RunnerClientFactory,
+) -> None:
+    # Requirement: a requested Copilot output limit cannot be silently discarded.
+    async with runner_client_factory() as client:
+        response = await client.post(
+            "/execute", json=_body(agent={"name": "sampler", "max_tokens": 512})
+        )
+    assert response.status_code == 400
+    assert "max_tokens" in response.text
+    assert not DeliveryProvider.instances
+
+
+async def test_claude_bearer_credential_is_forwarded_to_auth_token(
+    runner_client_factory: RunnerClientFactory,
+) -> None:
+    # Requirement: Anthropic bearer auth cannot silently become an API key or vanish.
+    async with runner_client_factory() as client:
+        response = await client.post(
+            "/execute",
+            json=_body(
+                "claude",
+                inner_provider_settings={
+                    "base_url": "https://gateway.example.test",
+                    "bearer_token": "claude-bearer",
+                },
+            ),
+        )
+    assert response.status_code == 200
+    instance = DeliveryProvider.instances[0]
+    assert type(instance) is ClaudeDeliveryProvider
+    assert instance.settings["auth_token"] == "claude-bearer"
+    assert instance.settings["api_key"] is None
+    assert instance.settings["base_url"] == "https://gateway.example.test"
+    assert "claude-bearer" not in response.text
+
+
+@pytest.mark.parametrize("provider", ["copilot", "claude"])
+async def test_host_credentials_survive_wire_to_matching_provider(
+    provider: Literal["copilot", "claude"],
+    monkeypatch: pytest.MonkeyPatch,
+    runner_client_factory: RunnerClientFactory,
+) -> None:
+    # Requirement: authored credentials and endpoint reach only their matching SDK.
+    monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_URL", raising=False)
+    monkeypatch.delenv("COPILOT_PROVIDER_BASE_URL", raising=False)
+    monkeypatch.delenv("COPILOT_PROVIDER_BEARER_TOKEN", raising=False)
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    settings = ProviderSettings(
+        name=provider,
+        base_url=f"https://{provider}.example.test",
+        api_key=SecretStr(f"{provider}-key"),
+    )
+    spec = AgentSpec(
+        name="routed",
+        execution_id=f"{provider}-call",
+        model_provider=provider,
+        model="model",
+        rendered_prompt="task",
+        provider_credentials=resolve_realm_credentials(provider, settings),
+        temperature=0.23,
+        max_tokens=1536 if provider == "claude" else None,
+    )
+    async with runner_client_factory() as client:
+        response = await client.post("/execute", json=agent_spec_to_wire_body(spec))
+    assert response.status_code == 200
+    instance = DeliveryProvider.instances[0]
+    assert (
+        type(instance)
+        is {
+            "copilot": CopilotDeliveryProvider,
+            "claude": ClaudeDeliveryProvider,
+        }[provider]
+    )
+    if provider == "copilot":
+        assert instance.settings["provider_settings"].base_url == settings.base_url
+        assert instance.settings["provider_settings"].bearer_token is None
+        assert (
+            instance.settings["provider_settings"].api_key.get_secret_value() == f"{provider}-key"
+        )
+    else:
+        assert instance.settings["base_url"] == settings.base_url
+        assert instance.settings["api_key"] == f"{provider}-key"
+        assert instance.settings["max_tokens"] == 1536
+    assert instance.settings["temperature"] == 0.23
+
+
+async def test_unexpected_exception_logs_redacted_trace_and_execution_identity(
+    caplog: pytest.LogCaptureFixture,
+    runner_client_factory: RunnerClientFactory,
+) -> None:
+    # Requirement: diagnostic trace and invocation ID survive without exposing credentials.
+    async with runner_client_factory() as client:
+        response = await client.post(
+            "/execute",
+            json=_body(
+                execution_id="trace-42",
+                mcp_servers={"echo": {"command": "echo"}},
+                env_overlay={"MCP_TOKEN": "private-overlay"},
+                context={"raise_with_secret": True},
+            ),
+        )
+    assert _frames(response)[-1]["type"] == "error"
+    assert "trace-42" in caplog.text
+    assert "RuntimeError" in caplog.text
+    assert "raise RuntimeError" in caplog.text
     assert "private-overlay" not in caplog.text
 
 

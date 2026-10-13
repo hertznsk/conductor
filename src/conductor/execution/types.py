@@ -311,6 +311,8 @@ class AgentSpec:
     provider_credentials: Mapping[str, Any] | None = field(default=None, repr=False)
     tool_output: Mapping[str, Any] | None = None
     reasoning_effort: str | None = None
+    temperature: float | None = None
+    max_tokens: int | None = None
     max_agent_iterations: int | None = None
     max_session_seconds: float | None = None
     working_dir: str | None = None

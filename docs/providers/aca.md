@@ -737,7 +737,7 @@ degraded mode and no in-sandbox failure.
 | `name` | `"aca"` | — | Selects the ACA provider. |
 | `pool_endpoint` | `str` | *(required)* | ACA dynamic-sessions pool management endpoint. **Must be `https://`** with a hostname and no query string / fragment — AAD bearer tokens and forwarded provider credentials (`inner_provider_settings`) are sent to this endpoint on every request, and `identifier` / `api-version` / the request path are appended to it; `conductor validate` rejects a plain-`http://` value, a bare `https://` with no host, or one that already carries `?query` / `#fragment`. |
 | `api_version` | `str` | `"2025-07-01"` | ACA management API version. |
-| `inner_provider` | `"copilot" \| "openai" \| "claude"` | `copilot` | SDK the in-sandbox runner drives. Supported inner providers: `copilot`, `openai`, and `claude`. Other providers (such as `claude-agent-sdk` or `hermes`) require follow-up implementations. |
+| `inner_provider` | `"copilot" \| "claude-agent-sdk"` | `copilot` | Legacy `provider: aca` setting. For the profile-based ACA realm, use an agent `provider: copilot`, `openai`, or `claude` instead; these are runner capabilities, not values accepted by this legacy field. |
 | `identifier_scope` | `workflow \| agent \| item \| none` | `agent` | Default granularity for *sequential* session reuse (see [Architecture](#architecture)). Concurrent units always diverge regardless. |
 | `egress` | `enabled \| disabled` | — | Advisory mirror of the pool's own `sessionNetworkConfiguration.status` (the pool governs actual egress). |
 | `lifecycle` | `timed \| on_container_exit` | — | Advisory mirror of the pool's session lifecycle mode. |
@@ -773,7 +773,7 @@ agents:
 | `agent_reasoning_events` | ✅ `True` | Runner forwards reasoning frames from the inner provider. |
 | `reasoning_effort` | ✅ Copilot's full tuple | Inner provider (Copilot) translates reasoning effort natively. |
 | `structured_output` | `prompt_injection` | Inherits the real `CopilotProvider` — Copilot has no native JSON mode. |
-| `interrupt` | ✅ `True` | The in-container runner implements `POST /interrupt` with per-execution targeting. On protocol version 2 images, graceful in-flight interrupt revives for remote agents. On older protocol version 1 images lacking the `/interrupt` feature, the host degrades to aborting stream reads with a single warning. |
+| `interrupt` | ✅ `True` | Protocol version 2 sends a targeted, cooperative `POST /interrupt`; partial output depends on the inner provider responding. On version 1, the host attempts best-effort session deletion before aborting the stream read and warns once. |
 | `max_session_seconds` | ✅ `True` | Best-effort only: the value is forwarded into the wrapped provider's wall-clock check inside the container, which is Copilot-internal timeout behavior, not a runner-enforced guarantee of remote termination. There is no separate runner-level guard watching the request. If the inner call hangs in a way that check doesn't catch, there is no independent runner-side backstop. See [Known Gaps](#known-gaps-and-image-versioning). |
 | `checkpoint_resume` | ❌ **`False`** | Sessions are ephemeral with no volume mount; `conductor resume` re-runs the agent rather than restoring in-sandbox state. |
 | `usage_tracking` | ✅ `True` | The runner returns token counts (and `session_seconds`) on the terminal result frame. |
@@ -799,7 +799,7 @@ longer will still hit the cap — plan `max_session_seconds` accordingly.
 
 The runner supports graceful interrupts when running on protocol version 2 images:
 
-- **Runner `/interrupt` support**: Protocol version 2 runner images implement `POST /interrupt` with per-execution targeting. When an interrupt is triggered, the runner signals the active inner provider and frames a partial result cleanly. On older protocol version 1 runner images lacking the `/interrupt` endpoint, the host falls back to aborting the stream read with a warning.
+- **Runner `/interrupt` support**: Protocol version 2 runner images implement `POST /interrupt` with per-execution targeting. The runner signals the active inner provider, which may take time to produce a partial result. On version 1 images without the endpoint, the host attempts best-effort session deletion, then aborts the stream read and warns; the sandbox may continue computing if deletion fails.
 - **No dedicated runner-level `max_session_seconds` guard**: The declared value is forwarded into the wrapped provider's wall-clock check inside the container. This operates as an inner SDK timeout rather than an independent runner-level watchdog.
 
 When deploying custom runner images, rebuild from current Conductor sources to ensure protocol version 2 and the `/interrupt` feature are present.
@@ -1054,9 +1054,9 @@ includes the raw response body to make that distinguishable.
 
 ### Stopping the workflow on older runner images
 
-On protocol version 2 runner images, interrupting an `aca`-backed agent sends a targeted request to `POST /interrupt` that halts the in-flight execution and frames partial results immediately.
+On protocol version 2 runner images, interrupting an `aca`-backed agent sends a targeted request to `POST /interrupt`. The endpoint signals the inner provider; a cooperative provider then emits a partial result, which may take time rather than arriving immediately.
 
-On older protocol version 1 runner images that lack the `/interrupt` endpoint, the host logs a warning and aborts reading from the response stream. In that case, the remote container execution may continue running until its inner SDK timeout expires. Rebuilding the runner image from the current Conductor release resolves this and enables graceful interrupt signaling.
+On older protocol version 1 runner images that lack the `/interrupt` endpoint, the host attempts best-effort session deletion before aborting the response stream. If the pool cannot delete that session, the remote execution may continue until its inner SDK timeout expires. Rebuilding the runner image enables targeted, cooperative interrupt signaling.
 
 ### `working_dir` (or `sandbox.working_dir`) fails with a not-found error
 

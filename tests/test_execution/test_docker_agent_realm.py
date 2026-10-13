@@ -14,6 +14,7 @@ import pytest
 
 from conductor.bundle.collector import collect_bundle
 from conductor.exceptions import ConfigurationError, ProviderError
+from conductor.execution import docker_agent
 from conductor.execution.docker import DockerRunnerBackend
 from conductor.execution.docker_paths import map_agent_paths
 from conductor.execution.types import (
@@ -290,11 +291,22 @@ async def test_runner_identity_includes_security_and_resource_options(
 
 
 @pytest.mark.asyncio
-async def test_concurrent_agent_calls_share_one_runner(
-    fake_realm: tuple[DockerRunnerBackend, Path, Path], tmp_path: Path
+async def test_concurrent_agent_calls_use_exclusive_runners(
+    fake_realm: tuple[DockerRunnerBackend, Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Requirement: overlapping agent calls on one lease create exactly one runner container.
+    # Requirement: overlapping calls own separate runners and neither blocks the other.
     backend, log, _state = fake_realm
+    original = backend._run_docker
+    state_lock = asyncio.Lock()
+
+    async def serialized_docker(argv, **kwargs):
+        # The file-backed fake must serialize writes as a real daemon does.
+        async with state_lock:
+            return await original(argv, **kwargs)
+
+    monkeypatch.setattr(backend, "_run_docker", serialized_docker)
     both_events = asyncio.Event()
     released = asyncio.Event()
     received: list[str] = []
@@ -338,7 +350,7 @@ async def test_concurrent_agent_calls_share_one_runner(
                     if row["argv"][0] == "create" and "io.conductor.resource=runner" in row["argv"]
                 ]
             )
-            == 1
+            == 2
         )
         await backend.finalize_run(lease, "succeeded")
     finally:
@@ -353,10 +365,89 @@ async def test_concurrent_agent_calls_share_one_runner(
 
 
 @pytest.mark.asyncio
-async def test_realm_cancel_preserves_streaming_and_invalidates_generation(
+async def test_cancelling_one_call_preserves_concurrent_call_and_its_runner(
+    fake_realm: tuple[DockerRunnerBackend, Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Requirement: cancellation retires its runner, not the concurrently active sibling's.
+    backend, log, state = fake_realm
+    original = backend._run_docker
+    state_lock = asyncio.Lock()
+
+    async def serialized_docker(argv, **kwargs):
+        # The file-backed fake must serialize writes as a real daemon does.
+        async with state_lock:
+            return await original(argv, **kwargs)
+
+    monkeypatch.setattr(backend, "_run_docker", serialized_docker)
+    received: set[str] = set()
+    both_streaming = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handle(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await release.wait()
+        writer.write(b"1")
+        await writer.drain()
+        writer.close()
+
+    def event_for(execution_id: str):
+        def record(_kind: str, _data: Mapping[str, Any]) -> None:
+            received.add(execution_id)
+            if len(received) == 2:
+                both_streaming.set()
+
+        return record
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    tasks: list[asyncio.Task[AgentResult]] = []
+    try:
+        backend._cli_env["FAKE_DOCKER_RELEASE_PORT"] = str(server.sockets[0].getsockname()[1])
+        lease = await backend.prepare_run(RunSpec(run_id="run_ABC-1", bundle=_bundle(tmp_path)))
+        tasks = [
+            asyncio.create_task(
+                backend.run_agent(
+                    replace(_spec(), execution_id=execution_id),
+                    lease,
+                    on_event=event_for(execution_id),
+                )
+            )
+            for execution_id in ("exec-1", "exec-2")
+        ]
+        await asyncio.wait_for(both_streaming.wait(), 20)
+        assert len(json.loads(state.read_text(encoding="utf-8"))["containers"]) == 2
+        tasks[0].cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(tasks[0], 20)
+        assert not tasks[1].done()
+        assert len(json.loads(state.read_text(encoding="utf-8"))["containers"]) == 1
+        release.set()
+        assert (await asyncio.wait_for(tasks[1], 20)).content == {"answer": "agent"}
+        assert (await backend.run_agent(_spec(), lease)).content == {"answer": "agent"}
+        assert (
+            sum(
+                row["argv"][0] == "create" and "io.conductor.resource=runner" in row["argv"]
+                for row in _rows(log)
+            )
+            == 2
+        )
+        await backend.finalize_run(lease, "cancelled")
+    finally:
+        release.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_realm_cancel_preserves_streaming_and_retires_its_runner(
     fake_realm: tuple[DockerRunnerBackend, Path, Path], tmp_path: Path
 ) -> None:
-    # Requirement: streaming events precede result; cancellation reaps and recreates runner.
+    # Requirement: cancellation reaps the bridge and its exclusive runner before returning.
     backend, log, state = fake_realm
     received = asyncio.Event()
     released = asyncio.Event()
@@ -402,6 +493,227 @@ async def test_realm_cancel_preserves_streaming_and_invalidates_generation(
         released.set()
         server.close()
         await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_while_runner_starts_retires_only_its_reservation(
+    fake_realm: tuple[DockerRunnerBackend, Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Requirement: cancellation during startup waits for that runner's cleanup, then propagates.
+    backend, log, state = fake_realm
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = backend._bridge_health
+
+    async def gated_health(name: str, image: str):
+        entered.set()
+        await release.wait()
+        return await original(name, image)
+
+    monkeypatch.setattr(backend, "_bridge_health", gated_health)
+    lease = await backend.prepare_run(RunSpec(run_id="run_ABC-1", bundle=_bundle(tmp_path)))
+    task = asyncio.create_task(backend.run_agent(_spec(), lease))
+    try:
+        await asyncio.wait_for(entered.wait(), 20)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 20)
+        assert json.loads(state.read_text(encoding="utf-8"))["containers"] == {}
+        assert (await backend.run_agent(_spec(), lease)).content == {"answer": "agent"}
+        assert (
+            sum(
+                row["argv"][0] == "create" and "io.conductor.resource=runner" in row["argv"]
+                for row in _rows(log)
+            )
+            == 2
+        )
+        await backend.finalize_run(lease, "cancelled")
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_interrupt_bridge_error_fails_active_invocation(
+    fake_realm: tuple[DockerRunnerBackend, Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Requirement: a failed targeted interrupt cannot leave the invocation waiting indefinitely.
+    backend, _log, _state = fake_realm
+    streamed = asyncio.Event()
+    release = asyncio.Event()
+    attempted = asyncio.Event()
+    original = backend._run_docker
+
+    async def run_docker(argv, **kwargs):
+        if "--interrupt" in argv:
+            attempted.set()
+            return 1, "", "runner interrupt HTTP 404"
+        return await original(argv, **kwargs)
+
+    async def handle(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await release.wait()
+        writer.write(b"1")
+        await writer.drain()
+        writer.close()
+
+    monkeypatch.setattr(backend, "_run_docker", run_docker)
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    task: asyncio.Task[AgentResult] | None = None
+    try:
+        backend._cli_env["FAKE_DOCKER_RELEASE_PORT"] = str(server.sockets[0].getsockname()[1])
+        lease = await backend.prepare_run(RunSpec(run_id="run_ABC-1", bundle=_bundle(tmp_path)))
+        signal = asyncio.Event()
+        task = asyncio.create_task(
+            backend.run_agent(
+                _spec(),
+                lease,
+                interrupt_signal=signal,
+                on_event=lambda _kind, _data: streamed.set(),
+            )
+        )
+        await asyncio.wait_for(streamed.wait(), 20)
+        signal.set()
+        await asyncio.wait_for(attempted.wait(), 20)
+        with pytest.raises(ConfigurationError, match="interrupt.*404"):
+            await asyncio.wait_for(task, 5)
+        await backend.finalize_run(lease, "failed")
+    finally:
+        release.set()
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("release_result", [True, False])
+async def test_acknowledged_interrupt_requires_partial_terminal(
+    fake_realm: tuple[DockerRunnerBackend, Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    release_result: bool,
+) -> None:
+    # Requirement: HTTP 200 alone is insufficient; a missing or full result fails and retires.
+    backend, _log, state = fake_realm
+    streamed = asyncio.Event()
+    connected = asyncio.Event()
+    release = asyncio.Event()
+    acknowledged = asyncio.Event()
+    original = backend._run_docker
+
+    async def run_docker(argv, **kwargs):
+        if "--interrupt" in argv:
+            acknowledged.set()
+            return 0, "", ""
+        return await original(argv, **kwargs)
+
+    async def handle(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        connected.set()
+        await release.wait()
+        writer.write(b"1")
+        await writer.drain()
+        writer.close()
+
+    monkeypatch.setattr(backend, "_run_docker", run_docker)
+    if not release_result:
+        monkeypatch.setattr(docker_agent, "_INTERRUPT_TIMEOUT_SECONDS", 0)
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    task: asyncio.Task[AgentResult] | None = None
+    try:
+        backend._cli_env["FAKE_DOCKER_RELEASE_PORT"] = str(server.sockets[0].getsockname()[1])
+        lease = await backend.prepare_run(RunSpec(run_id="run_ABC-1", bundle=_bundle(tmp_path)))
+        signal = asyncio.Event()
+        task = asyncio.create_task(
+            backend.run_agent(
+                _spec(),
+                lease,
+                interrupt_signal=signal,
+                on_event=lambda _kind, _data: streamed.set(),
+            )
+        )
+        await asyncio.wait_for(streamed.wait(), 20)
+        await asyncio.wait_for(connected.wait(), 20)
+        signal.set()
+        await asyncio.wait_for(acknowledged.wait(), 20)
+        if release_result:
+            release.set()
+        with pytest.raises(ConfigurationError, match="acknowledged without a partial result"):
+            await asyncio.wait_for(task, 20)
+        assert json.loads(state.read_text(encoding="utf-8"))["containers"] == {}
+        await backend.finalize_run(lease, "failed")
+    finally:
+        release.set()
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_post_eof_reap_propagates(
+    fake_realm: tuple[DockerRunnerBackend, Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Requirement: cancellation after stdout EOF does not wait for an unresponsive wait().
+    backend, _log, state = fake_realm
+    lease = await backend.prepare_run(RunSpec(run_id="run_ABC-1", bundle=_bundle(tmp_path)))
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    wait_cancelled = asyncio.Event()
+    original = docker_agent._reap
+    gated_once = True
+
+    async def gated_reap(process: asyncio.subprocess.Process, *, kill: bool) -> bool:
+        nonlocal gated_once
+        if not kill and gated_once:
+            gated_once = False
+            process_wait = process.wait
+            first_wait = True
+
+            async def wait() -> int:
+                nonlocal first_wait
+                if not first_wait:
+                    return await process_wait()
+                first_wait = False
+                entered.set()
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    wait_cancelled.set()
+                    raise
+                return await process_wait()
+
+            monkeypatch.setattr(process, "wait", wait)
+        return await original(process, kill=kill)
+
+    monkeypatch.setattr(docker_agent, "_reap", gated_reap)
+    task = asyncio.create_task(backend.run_agent(_spec(), lease))
+    try:
+        await asyncio.wait_for(entered.wait(), 20)
+        task.cancel()
+        done, _pending = await asyncio.wait({task}, timeout=3)
+        assert task in done, "cancellation remained blocked on the post-EOF wait"
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert wait_cancelled.is_set()
+        assert json.loads(state.read_text(encoding="utf-8"))["containers"] == {}
+        assert (await backend.run_agent(_spec(), lease)).content == {"answer": "agent"}
+        await backend.finalize_run(lease, "cancelled")
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -543,7 +855,7 @@ def test_staged_paths_match_bundle_topology(tmp_path: Path) -> None:
     with pytest.raises(ConfigurationError, match="staged bundle topology"):
         map_agent_paths(replace(spec, skill_directories=(str(clone),)), bundle)
     with pytest.raises(ConfigurationError, match="outside the staged Docker bundle"):
-        map_agent_paths(replace(spec, working_dir="/unbundled"), bundle)
+        map_agent_paths(replace(spec, working_dir=str(tmp_path.parent / "unbundled")), bundle)
     (skill / "SKILL.md").write_text("modified after collection", encoding="utf-8")
     with pytest.raises(ConfigurationError, match="staged bundle topology"):
         map_agent_paths(replace(spec, skill_directories=(str(skill),)), bundle)

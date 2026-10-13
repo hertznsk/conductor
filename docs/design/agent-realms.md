@@ -89,7 +89,7 @@ When starting an agent realm, Conductor queries the runner `GET /health` endpoin
 }
 ```
 
-Conductor requires `protocol_version == 2`. If an older image reports version 1 or fails the check, Conductor halts execution before sending agent requests. It raises an error telling the operator to rebuild the runner image with the current Conductor release.
+Docker agent realms require `protocol_version == 2` and reject an older image before sending agent requests, with an error asking the operator to rebuild it. ACA execution profiles can negotiate version 1 with an older image, but cannot deliver agent-scoped secrets there; the legacy `provider: aca` form also retains its version 1 wire format unless targeted interrupt is available.
 
 ## Docker Realm Transport
 
@@ -101,7 +101,7 @@ The host process runs `docker exec -i <container> python -m conductor.runner.bri
 
 Stdout streams NDJSON event frames directly back to Conductor. This design delivers several benefits:
 
-* **No published ports**: The runner port never binds to host interfaces. There is no host port collision when running multiple workflows concurrently.
+* **No published ports**: Docker does not publish the runner port. With an isolated container network it stays on container loopback; with `docker.network: host`, loopback is shared with the host, so other host processes can reach the runner and concurrent runners may contend for the port.
 * **Remote daemon compatibility**: The bridge relies entirely on standard Docker client execution pipes. It works unchanged across local Docker daemons, rootless Docker, and remote `DOCKER_HOST` setups.
 * **Shielded lifecycle**: Host-side streaming reader tasks track progress incrementally while shielding container cleanup operations from premature cancellation.
 
@@ -170,6 +170,10 @@ The following table summarizes provider support across execution environments:
 
 Selecting `claude-agent-sdk` or `hermes` on a remote profile triggers a static configuration error during manifest compilation and validation. The error identifies supported providers and notes that other engines require follow-up implementations.
 
+Remote profiles also reject `dialog:` until evaluation and conversation turns have a
+runner contract. Remote Copilot rejects `runtime.max_tokens`, which its runner SDK
+cannot enforce; OpenAI and Claude receive their configured generation limits in the realm.
+
 ## Skills and Plugins Staging
 
 Agents frequently rely on local skills or repository plugins. How these dependencies reach the agent depends on the realm backend.
@@ -200,15 +204,15 @@ Consistent with Docker script profiles, Conductor records the runner image name 
 
 ## Security and Trust Boundaries
 
-Agent realms isolate untrusted agent and tool execution from the Conductor host. The architecture enforces specific trust boundaries:
+Docker agent realms can isolate agent and tool processes from the Conductor host when the operator chooses an isolated container network. These boundaries do not make credentialed agent workloads safe to treat as untrusted:
 
-* **Loopback isolation**: The runner listens on `127.0.0.1` inside the container network namespace. No outside network entity can query the runner port.
-* **No ambient host inheritance**: Remote profiles default `inherit_control_environment` to false. Host process environment variables do not leak into the container.
+* **Loopback isolation**: A Docker runner listening on `127.0.0.1` is private to its container only with an isolated network namespace. With `docker.network: host`, that address is host loopback, so other host processes can reach it. The ACA runner is bound for its session gateway instead; its reachability and isolation depend on the ACA pool configuration.
+* **No ambient host inheritance**: Remote profiles default `inherit_control_environment` to false. The control process environment is not passed wholesale to the runner.
 * **Per-call secret injection**: Secrets travel through the `env_overlay` parameter in the POST payload. They never appear in container creation arguments, inspect metadata, or filesystem configs.
 * **Operating system process boundary**: Environment variables passed to stdio MCP children reside in those child processes. Anyone with root access or permission to inspect `/proc/<pid>/environ` inside the container can inspect those variables. Conductor guarantees protection on the host and runner communication boundary, not kernel-level isolation inside the container itself.
 
 ## Operator Sizing and Concurrency
 
-Conductor permits multiple agent steps to invoke the same runner container concurrently when workflows execute parallel branches.
+Conductor reserves one runner container per concurrently active agent invocation. An idle runner may be reused for a later sequential call; if an invocation is cancelled, only its owned container is retired, so another active invocation can continue. All runners for a lease share its staged workspace volume.
 
-Conductor does not artificially throttle concurrent requests to a single runner container. The platform operator is responsible for sizing daemon resources, CPU limits, memory allocations, and session pools to accommodate expected peak concurrency.
+Conductor does not artificially throttle parallel agent invocations. The platform operator is responsible for sizing daemon resources, CPU limits, memory allocations, and ACA session pools for the expected peak number of concurrent runners.

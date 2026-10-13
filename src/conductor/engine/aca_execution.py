@@ -218,10 +218,17 @@ class AcaRunnerBackend:
     async def finalize_run(self, lease: WorkspaceLease, outcome: RunOutcome) -> None:
         del outcome
         self._leases.pop(lease.incarnation, None)
-        for child in self._children:
-            if child._transport is not None:
-                await child._transport.close()
-                child._transport = None
-        if self._transport is not None:
-            await self._transport.close()
-            self._transport = None
+        failures: list[Exception] = []
+        for backend in (*self._children, self):
+            if backend._transport is None:
+                continue
+            try:
+                await backend._transport.close()
+            except Exception as exc:
+                failures.append(exc)
+            else:
+                backend._transport = None
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise ExceptionGroup("ACA transport cleanup failed", failures)

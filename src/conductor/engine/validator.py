@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from conductor.config.schema import AgentDef, OutputField
+from conductor.exceptions import ConfigurationError
 from conductor.executor.agent import AgentExecutor
 
 if TYPE_CHECKING:
@@ -147,7 +148,7 @@ class OutputValidator:
         agent: AgentDef,
         primary_prompt: str,
         primary_output: dict[str, Any],
-        provider: AgentProvider,
+        provider: AgentProvider | None,
         interrupt_signal: asyncio.Event | None = None,
         *,
         execution_backend: RunnerBackend | None = None,
@@ -170,6 +171,8 @@ class OutputValidator:
         """
         if agent.validator is None:  # defensive; callers guard on this
             return ValidationOutcome(passed=True)
+        if provider is None and (execution_backend is None or spec_factory is None):
+            raise ConfigurationError("Validator requires a provider or a remote spec factory.")
 
         try:
             # ``ensure_ascii=False`` keeps non-ASCII text literal so the fixed
@@ -201,6 +204,7 @@ class OutputValidator:
                 )
                 output = AgentExecutor.output_from_realm_result(result)
             else:
+                assert provider is not None
                 output = await provider.execute(
                     agent=validator_agent,
                     context={},

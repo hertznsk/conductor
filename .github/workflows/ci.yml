@@ -435,25 +435,27 @@ jobs:
       CONDUCTOR_TEST_RUNNER_IMAGE: conductor-agent-realm:ci
       RUNNER_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
       RUNNER_BRANCH: ${{ github.event.pull_request.head.ref || github.ref_name }}
+      RUNNER_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Verify runner source is fetchable
-        # The Dockerfile installs from microsoft/conductor, so a PR merge SHA
-        # (and a fork-only branch) cannot stand in for its pushed branch head.
+        # The image must install the PR head from its actual repository, not
+        # the checkout merge commit or an unrelated upstream branch.
         run: |
-          if ! remote_head=$(git ls-remote https://github.com/microsoft/conductor.git "refs/heads/$RUNNER_BRANCH" | cut -f1); then
-            echo "Runner source unavailable: cannot query $RUNNER_BRANCH on microsoft/conductor" >&2
+          runner_url="https://github.com/$RUNNER_REPOSITORY.git"
+          if ! remote_head=$(git ls-remote "$runner_url" "refs/heads/$RUNNER_BRANCH" | cut -f1); then
+            echo "Runner source unavailable: cannot query $RUNNER_BRANCH on $RUNNER_REPOSITORY" >&2
             exit 1
           fi
           if [ "$remote_head" != "$RUNNER_SHA" ]; then
-            echo "Runner source unavailable: $RUNNER_SHA is not the fetchable head of $RUNNER_BRANCH on microsoft/conductor" >&2
+            echo "Runner source unavailable: $RUNNER_SHA is not the fetchable head of $RUNNER_BRANCH on $RUNNER_REPOSITORY" >&2
             exit 1
           fi
-          if ! git fetch --no-tags https://github.com/microsoft/conductor.git "$RUNNER_SHA"; then
-            echo "Runner source unavailable: Dockerfile cannot fetch $RUNNER_SHA from microsoft/conductor" >&2
+          if ! git fetch --no-tags "$runner_url" "$RUNNER_SHA"; then
+            echo "Runner source unavailable: Dockerfile cannot fetch $RUNNER_SHA from $RUNNER_REPOSITORY" >&2
             exit 1
           fi
 
@@ -475,7 +477,11 @@ jobs:
         run: docker pull busybox@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e
 
       - name: Build runner image from pushed PR head
-        run: docker build --build-arg CONDUCTOR_VERSION="$RUNNER_SHA" -t "$CONDUCTOR_TEST_RUNNER_IMAGE" docker/aca-runner
+        run: |
+          docker build \
+            --build-arg CONDUCTOR_REPOSITORY="https://github.com/$RUNNER_REPOSITORY.git" \
+            --build-arg CONDUCTOR_VERSION="$RUNNER_SHA" \
+            -t "$CONDUCTOR_TEST_RUNNER_IMAGE" docker/aca-runner
 
       - name: Run Docker integration tests
         run: uv run pytest tests/test_execution/test_docker_integration.py -m docker_integration -v

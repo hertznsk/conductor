@@ -96,6 +96,12 @@ class RunnerAgentPayload(BaseModel):
     host via ``resolve_reasoning_effort``. ``None`` means no reasoning
     parameter should be sent to the inner SDK."""
 
+    temperature: float | None = None
+    """Workflow sampling temperature selected on the host."""
+
+    max_tokens: int | None = None
+    """Workflow output-token limit selected on the host."""
+
     working_dir: str | None = None
     """Runtime-relative working directory. Never a host path — interpreted by
     the runner as a path inside the remote session filesystem."""
@@ -117,7 +123,7 @@ class RunnerAgentRequest(BaseModel):
     """Body of ``POST {endpoint}/execute?identifier=<id>``.
 
     The envelope is backend-neutral, but the concrete dict of credential keys
-    (``_INNER_PROVIDER_SECRET_KEYS``) is the vocabulary of today's single
+    (``_INNER_PROVIDER_SECRET_KEYS``) is the vocabulary of today's
     inner providers. Credential keys are distinct from MCP spawn environment.
     """
 
@@ -143,15 +149,16 @@ class RunnerAgentRequest(BaseModel):
     inner_provider_settings: dict[str, Any] | None = None
     """Credential precedence — either BYOK settings (``base_url`` + optional
     ``api_key``/``bearer_token``) or a single ``github_token`` field for
-    Copilot-capacity auth. The host raises ``ProviderError`` rather than
-    sending a request with this unset, so in practice this field is never
+    Copilot-capacity auth. For Claude, the protected ``bearer_token`` field
+    carries Anthropic ``auth_token`` to its constructor. The host raises
+    ``ProviderError`` rather than sending a request with this unset, so in practice it is never
     ``None`` on the wire. Secret values are ``SecretStr`` instances (redacted
     in ``model_dump``/``repr``); the host unwraps them to plaintext only in
     the dedicated wire-serialization step (:func:`request_to_wire_body`).
 
     The type is a loosely-typed ``dict[str, Any]`` (not a dedicated
-    sub-model) because the runner side treats it as opaque
-    ``ProviderSettings`` constructor kwargs. ``_redact_inner_provider_secrets``
+    sub-model) because the runner side validates settings per selected
+    provider before construction. ``_redact_inner_provider_secrets``
     below still guarantees redaction on every *validated* construction path —
     not just the host's own direct-construction call site —
     by wrapping any plain-``str`` value under a known credential key in
@@ -348,6 +355,11 @@ def request_to_wire_body(request: RunnerAgentRequest) -> dict[str, Any]:
     codebase sees the plaintext.
     """
     body = request.model_dump(mode="json")
+    # Legacy ACA requests do not carry sampling overrides; keep their v1
+    # payload shape intact when the host sends null defaults.
+    for key in ("temperature", "max_tokens"):
+        if body["agent"][key] is None:
+            del body["agent"][key]
     # Legacy ACA callers construct no v2 fields; omitting their null defaults
     # keeps their requests acceptable to v1 runners with extra="forbid".
     for key in ("skill_directories", "custom_agents", "env_overlay", "execution_id"):

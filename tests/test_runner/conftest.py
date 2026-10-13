@@ -23,7 +23,7 @@ class DeliveryProvider:
     started = asyncio.Event()
     release = asyncio.Event()
 
-    def __init__(self, **settings: Any) -> None:
+    def __init__(self, settings: dict[str, Any]) -> None:
         self.settings = settings
         self.calls: list[dict[str, Any]] = []
         self.closed = False
@@ -46,6 +46,81 @@ class DeliveryProvider:
 
     async def close(self) -> None:
         self.closed = True
+
+
+class CopilotDeliveryProvider(DeliveryProvider):
+    """Record exactly the Copilot constructor contract."""
+
+    def __init__(
+        self,
+        *,
+        mcp_servers: dict[str, Any] | None,
+        provider_settings: Any,
+        tool_output: Any,
+        github_token: str | None,
+        temperature: float | None,
+    ) -> None:
+        super().__init__(
+            {
+                "mcp_servers": mcp_servers,
+                "provider_settings": provider_settings,
+                "tool_output": tool_output,
+                "github_token": github_token,
+                "temperature": temperature,
+            }
+        )
+
+
+class OpenAIDeliveryProvider(DeliveryProvider):
+    """Record exactly the OpenAI constructor contract."""
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None,
+        base_url: str | None,
+        mcp_servers: dict[str, Any] | None,
+        tool_output: Any,
+        temperature: float | None,
+        max_tokens: int | None,
+    ) -> None:
+        super().__init__(
+            {
+                "api_key": api_key,
+                "base_url": base_url,
+                "mcp_servers": mcp_servers,
+                "tool_output": tool_output,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+        )
+
+
+class ClaudeDeliveryProvider(DeliveryProvider):
+    """Record exactly the Claude constructor contract."""
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None,
+        auth_token: str | None,
+        base_url: str | None,
+        mcp_servers: dict[str, Any] | None,
+        tool_output: Any,
+        temperature: float | None,
+        max_tokens: int | None,
+    ) -> None:
+        super().__init__(
+            {
+                "api_key": api_key,
+                "auth_token": auth_token,
+                "base_url": base_url,
+                "mcp_servers": mcp_servers,
+                "tool_output": tool_output,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+        )
 
 
 class InterruptibleProvider:
@@ -114,8 +189,9 @@ def delivery_provider(monkeypatch: pytest.MonkeyPatch) -> type[DeliveryProvider]
     monkeypatch.delenv("ACA_RUNNER_AUTH_TOKEN", raising=False)
     monkeypatch.delenv("ACA_RUNNER_ALLOWED_BASE_URLS", raising=False)
     monkeypatch.delenv("MCP_TOKEN", raising=False)
-    for name in ("CopilotProvider", "OpenAIProvider", "ClaudeProvider"):
-        monkeypatch.setattr(server, name, DeliveryProvider)
+    monkeypatch.setattr(server, "CopilotProvider", CopilotDeliveryProvider)
+    monkeypatch.setattr(server, "OpenAIProvider", OpenAIDeliveryProvider)
+    monkeypatch.setattr(server, "ClaudeProvider", ClaudeDeliveryProvider)
     return DeliveryProvider
 
 

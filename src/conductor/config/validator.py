@@ -1898,6 +1898,20 @@ def _validate_secret_references(
                         secrets=[*step_secrets, *agent_server_secrets],
                     )
                 )
+                for server in config.workflow.runtime.mcp_servers.values():
+                    if server.type == "stdio":
+                        errors.extend(
+                            _delivery_collision_errors(
+                                key,
+                                literal_env=(
+                                    secret.delivery.env
+                                    for secret in server.secrets
+                                    if secret.scope == "mcp" and secret.delivery.env is not None
+                                ),
+                                literal_headers=(),
+                                secrets=[*step_secrets, *agent_server_secrets],
+                            )
+                        )
 
     context["refs_found"] = True
     if context["explicit"]:

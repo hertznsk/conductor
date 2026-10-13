@@ -25,24 +25,46 @@ def clear_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
         "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "COPILOT_PROVIDER_RUNTIME_URL",
     ):
         monkeypatch.delenv(name, raising=False)
 
 
 def test_copilot_byok_takes_precedence_over_github_token(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Requirement: BYOK forwarding contains only allowlisted custom-routing fields.
+    # Requirement: opted-in BYOK forwarding contains only allowlisted routing fields.
     monkeypatch.setenv("COPILOT_PROVIDER_BASE_URL", " https://api.example.test ")
     monkeypatch.setenv("COPILOT_PROVIDER_API_KEY", "api-secret")
     monkeypatch.setenv("COPILOT_PROVIDER_BEARER_TOKEN", "bearer-secret")
     monkeypatch.setenv("GH_TOKEN", "ignored")
 
-    settings = resolve_realm_credentials("copilot")
+    settings = resolve_realm_credentials(
+        "copilot", ProviderSettings(name="copilot", api_key=SecretStr("configured-key"))
+    )
 
     assert settings["base_url"] == "https://api.example.test"
     assert isinstance(settings["api_key"], SecretStr)
-    assert settings["api_key"].get_secret_value() == "api-secret"
+    assert settings["api_key"].get_secret_value() == "configured-key"
+    assert isinstance(settings["bearer_token"], SecretStr)
     assert settings["bearer_token"].get_secret_value() == "bearer-secret"
     assert "github_token" not in settings
+
+
+@pytest.mark.parametrize("settings", [None, ProviderSettings(name="copilot")])
+def test_copilot_ambient_endpoint_without_routing_opt_in_uses_github_identity(
+    monkeypatch: pytest.MonkeyPatch, settings: ProviderSettings | None
+) -> None:
+    # Requirement: an ambient BYOK endpoint cannot replace a bare Copilot provider identity.
+    monkeypatch.setenv("COPILOT_PROVIDER_BASE_URL", "https://ambient.example.test")
+    monkeypatch.setenv("COPILOT_PROVIDER_API_KEY", "ambient-key")
+    monkeypatch.setenv("GITHUB_TOKEN", "github-token")
+
+    resolved = resolve_realm_credentials("copilot", settings)
+
+    assert set(resolved) == {"github_token"}
+    assert isinstance(resolved["github_token"], SecretStr)
+    assert resolved["github_token"].get_secret_value() == "github-token"
 
 
 @pytest.mark.parametrize("name", ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"])
@@ -105,6 +127,100 @@ def test_claude_ambient_key(monkeypatch: pytest.MonkeyPatch) -> None:
     # Requirement: Anthropic API key is delivered only as an allowlisted field.
     monkeypatch.setenv("ANTHROPIC_API_KEY", "claude-secret")
     assert resolve_realm_credentials("claude")["api_key"].get_secret_value() == "claude-secret"
+
+
+def test_copilot_yaml_routing_overrides_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Requirement: authored endpoint and key win over ambient routing and GitHub auth.
+    monkeypatch.setenv("COPILOT_PROVIDER_BASE_URL", "https://ambient.example.test")
+    monkeypatch.setenv("COPILOT_PROVIDER_API_KEY", "ambient-key")
+    monkeypatch.delenv("COPILOT_PROVIDER_BEARER_TOKEN", raising=False)
+    monkeypatch.setenv("GH_TOKEN", "github-token")
+    settings = ProviderSettings(
+        name="copilot", base_url="https://yaml.example.test", api_key=SecretStr("yaml-key")
+    )
+    resolved = resolve_realm_credentials("copilot", settings)
+    assert resolved["base_url"] == "https://yaml.example.test"
+    assert isinstance(resolved["api_key"], SecretStr)
+    assert resolved["api_key"].get_secret_value() == "yaml-key"
+    assert "github_token" not in resolved
+
+
+def test_copilot_yaml_missing_values_use_dedicated_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Requirement: an authored routing opt-in uses only its dedicated credential fallback.
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://unrelated.example.test")
+    monkeypatch.setenv("COPILOT_PROVIDER_API_KEY", "dedicated-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "unrelated-key")
+    resolved = resolve_realm_credentials(
+        "copilot", ProviderSettings(name="copilot", base_url="https://yaml.example.test")
+    )
+    assert resolved["base_url"] == "https://yaml.example.test"
+    assert isinstance(resolved["api_key"], SecretStr)
+    assert resolved["api_key"].get_secret_value() == "dedicated-key"
+
+
+def test_copilot_yaml_opt_in_uses_openai_base_url_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Requirement: only opted-in custom routing can consult OPENAI_BASE_URL.
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://fallback.example.test")
+    resolved = resolve_realm_credentials(
+        "copilot", ProviderSettings(name="copilot", api_key=SecretStr("paired-key"))
+    )
+    assert resolved["base_url"] == "https://fallback.example.test"
+    assert isinstance(resolved["api_key"], SecretStr)
+    assert resolved["api_key"].get_secret_value() == "paired-key"
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("type", "azure"),
+        ("wire_api", "responses"),
+        ("headers", {"x-route": "one"}),
+        ("runtime_url", "localhost:4321"),
+    ],
+)
+def test_copilot_unforwardable_mode_fails_closed(field: str, value: object) -> None:
+    # Requirement: remote execution refuses configuration it cannot reproduce.
+    with pytest.raises(ProviderError, match="remote"):
+        resolve_realm_credentials(
+            "copilot",
+            ProviderSettings.model_validate(
+                {"name": "copilot", "base_url": "https://route.example.test", field: value}
+            ),
+        )
+
+
+def test_claude_yaml_auth_token_and_endpoint_override_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Requirement: YAML bearer auth excludes both ambient Anthropic credential sources.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-key")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "ambient-token")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://ambient.example.test")
+    resolved = resolve_realm_credentials(
+        "claude",
+        ProviderSettings(
+            name="claude", base_url="https://yaml.example.test", auth_token=SecretStr("yaml-token")
+        ),
+    )
+    assert resolved["base_url"] == "https://yaml.example.test"
+    assert isinstance(resolved["bearer_token"], SecretStr)
+    assert resolved["bearer_token"].get_secret_value() == "yaml-token"
+    assert "api_key" not in resolved
+
+
+def test_claude_custom_endpoint_uses_anthropic_environment_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Requirement: Claude retains its documented environment fallback when YAML sets only URL.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-key")
+    resolved = resolve_realm_credentials(
+        "claude", ProviderSettings(name="claude", base_url="https://custom.example.test")
+    )
+    assert resolved["base_url"] == "https://custom.example.test"
+    assert isinstance(resolved["api_key"], SecretStr)
+    assert resolved["api_key"].get_secret_value() == "ambient-key"
 
 
 @pytest.mark.parametrize(
