@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -19,6 +20,7 @@ from conductor.config.environment import (
 )
 from conductor.config.schema import (
     AgentDef,
+    DialogConfig,
     MCPServerDef,
     ProviderName,
     RouteDef,
@@ -27,8 +29,10 @@ from conductor.config.schema import (
     SecretDelivery,
     StepExecutionConfig,
     StepSecretRef,
+    ValidatorConfig,
     WorkflowConfig,
     WorkflowDef,
+    WorkflowStepDef,
 )
 from conductor.config.validator import validate_workflow_config
 from conductor.engine import execution_resolution
@@ -45,6 +49,7 @@ from conductor.execution import (
 )
 from conductor.execution.local import LocalRunnerBackend
 from conductor.providers.copilot import CopilotProvider
+from conductor.providers.registry import ProviderRegistry
 
 
 class _RemoteBackend(LocalRunnerBackend):
@@ -69,6 +74,8 @@ class _RemoteBackend(LocalRunnerBackend):
     ) -> AgentResult:
         assert execute_local is None
         self.specs.append(spec)
+        if "passed" in (spec.output_schema or {}):
+            return AgentResult(content={"passed": True, "issues": []})
         return AgentResult(content={"answer": "from-remote"})
 
 
@@ -211,6 +218,7 @@ async def test_agent_scope_placement_matrix(
         assert "test-only-secret" not in str(manifest.model_dump(mode="json"))
     else:
         backend = _RemoteBackend()
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "fixed-test-token")
         monkeypatch.setitem(execution_resolution.BACKEND_FACTORIES, kind, lambda: backend)
         # Bundle materialization belongs to the Docker backend suite, not dispatch.
         monkeypatch.setattr(workflow_module, "prepare_run_bundle", AsyncMock(return_value=None))
@@ -222,6 +230,217 @@ async def test_agent_scope_placement_matrix(
         assert await engine.run({}) == {}
         assert len(backend.specs) == 1
         assert backend.specs[0].env_overlay == {"MCP_TOKEN": "test-only-secret"}
+        credentials = backend.specs[0].provider_credentials
+        assert credentials is not None
+        assert credentials["github_token"].get_secret_value() == "fixed-test-token"
+
+
+@pytest.mark.asyncio
+async def test_remote_dispatch_and_validator_never_construct_host_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Requirement: remote dispatch and metadata use static configuration, never a host SDK.
+    monkeypatch.setenv("CONDUCTOR_REALM_TEST_TOKEN", "test-only-secret")
+    monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "fixed-test-token")
+    config = _config()
+    config.agents[0] = config.agents[0].model_copy(
+        update={"validator": ValidatorConfig(criteria="Accurate")}
+    )
+    config.workflow.runtime.temperature = 0.35
+    config.workflow.runtime.default_model = "gpt-4.1"
+    config.workflow.runtime.default_reasoning_effort = "high"
+    config.workflow.runtime.default_context_tier = "long_context"
+    config.workflow.runtime.max_agent_iterations = 9
+    config.workflow.runtime.max_session_seconds = 120
+    backend = _RemoteBackend()
+    monkeypatch.setitem(execution_resolution.BACKEND_FACTORIES, "aca", lambda: backend)
+    create = AsyncMock(side_effect=AssertionError("host provider constructed"))
+    monkeypatch.setattr("conductor.providers.registry.create_provider", create)
+
+    engine = WorkflowEngine(
+        config, registry=ProviderRegistry(config), execution_environment=_environment("aca")
+    )
+    assert await engine.run({}) == {}
+    create.assert_not_awaited()
+    assert len(backend.specs) == 2
+    spec, grader = backend.specs
+    assert (spec.model_provider, spec.model, spec.temperature) == ("copilot", "gpt-4.1", 0.35)
+    assert (spec.max_agent_iterations, spec.max_session_seconds) == (9, 120)
+    assert (spec.reasoning_effort, spec.context_tier) == ("high", "long_context")
+    assert spec.tool_output == config.workflow.runtime.tool_output.model_dump(mode="json")
+    assert spec.env_overlay == {"MCP_TOKEN": "test-only-secret"}
+    assert grader.env_overlay is None and grader.mcp_servers is None
+
+
+@pytest.mark.asyncio
+async def test_remote_engine_runs_without_a_host_provider_or_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Requirement: a remote-only engine needs no host provider object or SDK connection.
+    monkeypatch.setenv("CONDUCTOR_REALM_TEST_TOKEN", "test-only-secret")
+    monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "fixed-test-token")
+    backend = _RemoteBackend()
+    monkeypatch.setitem(execution_resolution.BACKEND_FACTORIES, "aca", lambda: backend)
+    config = _config()
+
+    engine = WorkflowEngine(config, execution_environment=_environment("aca"))
+    assert engine.provider is None and engine.executor is None
+    assert await engine.run({}) == {}
+    assert engine.provider is None and engine.executor is None
+    assert [spec.model_provider for spec in backend.specs] == ["copilot"]
+
+
+@pytest.mark.asyncio
+async def test_remote_copilot_max_tokens_rejected_before_backend_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Requirement: Copilot cannot silently ignore a requested output-token cap in a realm.
+    monkeypatch.setenv("CONDUCTOR_REALM_TEST_TOKEN", "test-only-secret")
+    config = _config()
+    config.workflow.runtime.max_tokens = 512
+    backend = _RemoteBackend()
+    monkeypatch.setitem(execution_resolution.BACKEND_FACTORIES, "aca", lambda: backend)
+    create = AsyncMock(side_effect=AssertionError("host provider constructed"))
+    monkeypatch.setattr("conductor.providers.registry.create_provider", create)
+
+    with pytest.raises(ConfigurationError, match="copilot.*max_tokens"):
+        _validate(config, _environment("aca"))
+    with pytest.raises(ConfigurationError, match="copilot.*max_tokens"):
+        compile_run_manifest(config, workflow_path=None, environment=_environment("aca"))
+    with pytest.raises(ConfigurationError, match="copilot.*max_tokens"):
+        engine = WorkflowEngine(
+            config, registry=ProviderRegistry(config), execution_environment=_environment("aca")
+        )
+        await engine.run({})
+    assert backend.specs == []
+    create.assert_not_awaited()
+
+
+@pytest.mark.parametrize("provider", ["claude", "openai"])
+@pytest.mark.asyncio
+async def test_remote_override_receives_generation_settings_without_host_provider(
+    provider: ProviderName, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: remote overrides that support max_tokens receive the root runtime cap.
+    monkeypatch.setenv("CONDUCTOR_REALM_TEST_TOKEN", "test-only-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "claude-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+    config = _config(provider=provider)
+    config.workflow.runtime.temperature = 0.41
+    config.workflow.runtime.max_tokens = 2048
+    backend = _RemoteBackend()
+    monkeypatch.setitem(execution_resolution.BACKEND_FACTORIES, "aca", lambda: backend)
+    create = AsyncMock(side_effect=AssertionError("host provider constructed"))
+    monkeypatch.setattr("conductor.providers.registry.create_provider", create)
+
+    engine = WorkflowEngine(
+        config, registry=ProviderRegistry(config), execution_environment=_environment("aca")
+    )
+    assert await engine.run({}) == {}
+    create.assert_not_awaited()
+    assert len(backend.specs) == 1
+    assert (backend.specs[0].model_provider, backend.specs[0].temperature) == (provider, 0.41)
+    assert backend.specs[0].max_tokens == 2048
+
+
+@pytest.mark.asyncio
+async def test_nested_remote_override_uses_root_registry_settings_without_host_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: inherited and overridden providers use root registry settings.
+    child = tmp_path / "child.yaml"
+    child.write_text(
+        """workflow:
+  name: child
+  entry_point: first
+  runtime:
+    provider: claude
+    temperature: 0.9
+agents:
+  - name: first
+    prompt: first
+    routes:
+      - to: second
+  - name: second
+    provider: claude
+    prompt: second
+    routes:
+      - to: $end
+""",
+        encoding="utf-8",
+    )
+    root = tmp_path / "root.yaml"
+    root.write_text("workflow: root", encoding="utf-8")
+    config = WorkflowConfig(
+        workflow=WorkflowDef(
+            name="root",
+            entry_point="delegate",
+            runtime=RuntimeConfig.model_validate(
+                {
+                    "provider": {
+                        "name": "copilot",
+                        "base_url": "https://models.example.test/v1",
+                        "api_key": "root-key",
+                    },
+                    "temperature": 0.4,
+                    "max_agent_iterations": 7,
+                }
+            ),
+        ),
+        agents=[
+            WorkflowStepDef(
+                name="delegate",
+                workflow="child.yaml",
+                execution=StepExecutionConfig(profile="local"),
+                routes=[RouteDef(to="$end")],
+            )
+        ],
+    )
+    environment = _environment("aca")
+    environment.document.profiles["local"] = ProfileDefinition(backend="local")
+    backend = _RemoteBackend()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "claude-key")
+    monkeypatch.setitem(execution_resolution.BACKEND_FACTORIES, "aca", lambda: backend)
+    create = AsyncMock(side_effect=AssertionError("host provider constructed"))
+    monkeypatch.setattr("conductor.providers.registry.create_provider", create)
+
+    engine = WorkflowEngine(
+        config,
+        registry=ProviderRegistry(config),
+        workflow_path=root,
+        execution_environment=environment,
+    )
+    assert await engine.run({}) == {}
+    create.assert_not_awaited()
+    assert [(spec.name, spec.model_provider) for spec in backend.specs] == [
+        ("first", "copilot"),
+        ("second", "claude"),
+    ]
+    first, second = backend.specs
+    assert first.temperature == second.temperature == 0.4
+    assert first.max_agent_iterations == second.max_agent_iterations == 7
+    assert first.provider_credentials is not None
+    assert first.provider_credentials["base_url"] == "https://models.example.test/v1"
+    assert first.provider_credentials["api_key"].get_secret_value() == "root-key"
+    assert second.provider_credentials is not None
+    assert second.provider_credentials["api_key"].get_secret_value() == "claude-key"
+    assert "base_url" not in second.provider_credentials
+
+
+@pytest.mark.parametrize("kind", ["docker", "aca"])
+def test_remote_dialog_rejected_by_validate_and_manifest(kind: str) -> None:
+    # Requirement: dialog is local-only until the remote backend can evaluate and converse.
+    config = _config()
+    config.agents[0] = config.agents[0].model_copy(
+        update={"dialog": DialogConfig(trigger_prompt="Clarify the answer")}
+    )
+    environment = _environment(kind)
+    with pytest.raises(ConfigurationError, match="dialog.*remote"):
+        _validate(config, environment)
+    with pytest.raises(ConfigurationError, match="dialog.*remote"):
+        compile_run_manifest(config, workflow_path=None, environment=environment)
+    with pytest.raises(ConfigurationError, match="dialog.*remote"):
+        WorkflowEngine(config, execution_environment=environment)
 
 
 @pytest.mark.parametrize(

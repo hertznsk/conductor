@@ -11,6 +11,7 @@ from unittest.mock import ANY, patch
 import pytest
 
 from conductor.config.environment import (
+    DockerProfileOptions,
     EnvironmentDocument,
     ProfileDefinition,
     ResolvedEnvironment,
@@ -51,7 +52,7 @@ def _secret(
 
 def _binding(
     env_var: str,
-    allow: list[Literal["script", "mcp"]] | None = None,
+    allow: list[Literal["script", "mcp", "agent"]] | None = None,
 ) -> SecretBinding:
     return SecretBinding(source=SecretBindingSource(env=env_var), allow=allow)
 
@@ -200,6 +201,43 @@ def _validate_explicit(
         workflow_path=tmp_path / "workflow.yaml",
         _environment_context=cast(Any, _explicit_context(environment, tmp_path)),
     )
+
+
+def test_agent_overlay_rejects_same_server_mcp_binding(tmp_path: Path) -> None:
+    # Requirement: an agent overlay cannot replace an MCP credential in its receiving server.
+    config = _agent_config(_secret("alpha", "agent", env="MCP_TOKEN"))
+    config.workflow.runtime.mcp_servers["docs"] = MCPServerDef(
+        command="docs-server", secrets=[_secret("beta", "mcp", env="MCP_TOKEN")]
+    )
+    environment = _alpha_beta_environment()
+    environment.document.profiles["default"] = ProfileDefinition(
+        backend="docker",
+        docker=DockerProfileOptions(image="script:test", runner_image="runner:test"),
+    )
+    with pytest.raises(ConfigurationError, match="collides within consumer 'agent'"):
+        _validate_explicit(config, environment, tmp_path)
+
+
+def test_independent_mcp_server_bindings_share_env_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: identical delivery names in separate servers remain independent.
+    config = _agent_config(_secret("alpha", "agent", env="OVERLAY_TOKEN"))
+    config.workflow.runtime.mcp_servers = {
+        name: MCPServerDef(
+            command=f"{name}-server",
+            secrets=[_secret(ref, "mcp", env="MCP_TOKEN")],
+        )
+        for name, ref in (("docs", "alpha"), ("search", "beta"))
+    }
+    environment = _alpha_beta_environment()
+    environment.document.profiles["default"] = ProfileDefinition(
+        backend="docker",
+        docker=DockerProfileOptions(image="script:test", runner_image="runner:test"),
+    )
+    monkeypatch.setenv("CONDUCTOR_TEST_TASK10_ALPHA", "alpha-value")
+    monkeypatch.setenv("CONDUCTOR_TEST_TASK10_BETA", "beta-value")
+    assert _validate_explicit(config, environment, tmp_path) == []
 
 
 class TestScopeVsPosition:
@@ -613,6 +651,32 @@ class TestExplicitEnvironment:
             monkeypatch.setenv("CONDUCTOR_TEST_TASK10_TOKEN", "x")
             warnings = _validate_explicit(config, environment, tmp_path)
         assert warnings == []
+
+    def test_agent_only_binding_allows_remote_agent(self, tmp_path: Path) -> None:
+        # Requirement: allow: [agent] authorizes agent scope without granting script or MCP.
+        environment = _environment({"token": _binding("CONDUCTOR_TEST_AGENT_TOKEN", ["agent"])})
+        environment.document.profiles["default"] = ProfileDefinition(
+            backend="docker",
+            docker=DockerProfileOptions(image="script:test", runner_image="runner:test"),
+        )
+        config = _agent_config(_secret("token", "agent", env="MCP_TOKEN"))
+        config.workflow.runtime.mcp_servers["docs"] = MCPServerDef(command="docs-server")
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setenv("CONDUCTOR_TEST_AGENT_TOKEN", "test-only-secret")
+            assert _validate_explicit(config, environment, tmp_path) == []
+
+    def test_agent_only_binding_rejects_script_and_mcp(self, tmp_path: Path) -> None:
+        # Requirement: allow: [agent] does not authorize other consumer scopes.
+        environment = _environment({"token": _binding("CONDUCTOR_TEST_AGENT_TOKEN", ["agent"])})
+        configs = (
+            _script_config(_secret("token", "script", env="TOKEN")),
+            _mcp_config(
+                MCPServerDef(command="docs-server", secrets=[_secret("token", "mcp", env="TOKEN")])
+            ),
+        )
+        for config in configs:
+            with pytest.raises(ConfigurationError, match=r"binding allow list is \[agent\]"):
+                _validate_explicit(config, environment, tmp_path)
 
     def test_empty_allow_list_allows_no_consumer_classes(self, tmp_path: Path) -> None:
         # Requirement: ``allow: []`` is fail-closed and rejects every consumer.

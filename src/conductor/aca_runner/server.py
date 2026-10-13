@@ -29,6 +29,7 @@ import json
 import logging
 import shutil
 import time
+import traceback
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -196,6 +197,12 @@ def _validate_execute_request(
             provider_name="aca",
             is_retryable=False,
         )
+    if request.inner_provider == "copilot" and request.agent.max_tokens is not None:
+        raise ProviderError(
+            "runner: copilot does not support max_tokens in a remote agent realm",
+            provider_name="aca",
+            is_retryable=False,
+        )
     _check_stdio_binaries(request.mcp_servers)
     check_inner_provider_settings(
         request.inner_provider_settings, allowed_base_urls=allowed_base_urls
@@ -282,6 +289,8 @@ class _InnerProviderCache:
         *,
         inner_provider: str = "copilot",
         env_overlay: dict[str, str] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> str:
         def unwrap(value: Any) -> Any:
             if isinstance(value, SecretStr):
@@ -297,6 +306,8 @@ class _InnerProviderCache:
                 "inner_provider_settings": unwrap(inner_provider_settings),
                 "tool_output": tool_output,
                 "env_overlay": unwrap(env_overlay),
+                "temperature": temperature,
+                "max_tokens": max_tokens,
             },
             sort_keys=True,
             default=str,
@@ -310,8 +321,13 @@ class _InnerProviderCache:
         mcp_servers: dict[str, Any] | None,
         inner_provider_settings: dict[str, Any] | None,
         tool_output: dict[str, Any] | None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> AgentProvider:
         settings = dict(inner_provider_settings or {})
+        claude_auth_token = (
+            settings.pop("bearer_token", None) if inner_provider == "claude" else None
+        )
         github_token_value = settings.pop("github_token", None)
         if github_token_value is not None and inner_provider != "copilot":
             raise ProviderError(
@@ -338,18 +354,28 @@ class _InnerProviderCache:
                 provider_settings=provider_settings,
                 tool_output=tool_config,
                 github_token=github_token,
+                temperature=temperature,
             ),
             "openai": lambda: OpenAIProvider(
                 api_key=api_key_text,
                 base_url=settings.get("base_url"),
                 mcp_servers=mcp_servers,
                 tool_output=tool_config,
+                temperature=temperature,
+                max_tokens=max_tokens,
             ),
             "claude": lambda: ClaudeProvider(
                 api_key=api_key_text,
                 base_url=settings.get("base_url"),
                 mcp_servers=mcp_servers,
                 tool_output=tool_config,
+                auth_token=(
+                    claude_auth_token.get_secret_value()
+                    if isinstance(claude_auth_token, SecretStr)
+                    else claude_auth_token
+                ),
+                temperature=temperature,
+                max_tokens=max_tokens,
             ),
         }
         return factories[inner_provider]()
@@ -363,6 +389,8 @@ class _InnerProviderCache:
         inner_provider: str = "copilot",
         env_overlay: dict[str, str] | None = None,
         reserve: bool = False,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> AgentProvider:
         key = self._key_for(
             mcp_servers,
@@ -370,6 +398,8 @@ class _InnerProviderCache:
             tool_output,
             inner_provider=inner_provider,
             env_overlay=env_overlay,
+            temperature=temperature,
+            max_tokens=max_tokens,
         )
         async with self._lock:
             if self._closing:
@@ -378,14 +408,19 @@ class _InnerProviderCache:
             if entry is None:
                 entry = _ProviderEntry(
                     self._construct_provider(
-                        inner_provider, mcp_servers, inner_provider_settings, tool_output
+                        inner_provider,
+                        mcp_servers,
+                        inner_provider_settings,
+                        tool_output,
+                        temperature,
+                        max_tokens,
                     )
                 )
                 self._entries[key] = entry
             self._entries.move_to_end(key)
+            await self._evict_idle(protected_key=key)
             if reserve:
                 entry.active += 1
-            await self._evict_idle(protected_key=key)
             return entry.provider
 
     async def _evict_idle(self, *, protected_key: str | None = None) -> None:
@@ -400,8 +435,9 @@ class _InnerProviderCache:
             )
             if idle_key is None:
                 return
-            entry = self._entries.pop(idle_key)
+            entry = self._entries[idle_key]
             await entry.provider.close()
+            del self._entries[idle_key]
 
     async def release(self, provider: AgentProvider) -> None:
         async with self._lock:
@@ -409,8 +445,10 @@ class _InnerProviderCache:
                 if entry.provider is provider:
                     entry.active -= 1
                     break
-            await self._evict_idle()
-            self._idle.notify_all()
+            try:
+                await self._evict_idle()
+            finally:
+                self._idle.notify_all()
 
     async def close(self) -> None:
         async with self._idle:
@@ -418,9 +456,16 @@ class _InnerProviderCache:
             await self._idle.wait_for(
                 lambda: all(entry.active == 0 for entry in self._entries.values())
             )
-            for entry in self._entries.values():
-                await entry.provider.close()
-            self._entries.clear()
+            errors: list[Exception] = []
+            for key, entry in list(self._entries.items()):
+                try:
+                    await entry.provider.close()
+                except Exception as exc:
+                    errors.append(exc)
+                else:
+                    del self._entries[key]
+            if errors:
+                raise ExceptionGroup("runner: provider cache close failed", errors)
 
 
 async def _stream_execute(
@@ -430,6 +475,7 @@ async def _stream_execute(
     provider_cache: _InnerProviderCache,
     interrupt_signal: asyncio.Event | None,
     mark_terminal: Callable[[], None] | None = None,
+    execution_id: str | None = None,
 ) -> AsyncIterator[bytes]:
     """Run the inner `execute()` call, yielding NDJSON frames as they arrive.
 
@@ -468,8 +514,7 @@ async def _stream_execute(
         if server.get("type") in ("http", "sse") and isinstance(headers, dict):
             redactor.register(
                 value.get_secret_value() if isinstance(value, SecretStr) else value
-                for name, value in headers.items()
-                if isinstance(name, str) and name.lower() == "authorization"
+                for value in headers.values()
             )
 
     def emit(event_type: str, data: dict[str, Any]) -> None:
@@ -491,7 +536,12 @@ async def _stream_execute(
                 suppress_mcp_servers=payload.mcp_servers is None,
             )
         except Exception as exc:  # broad: forwarded as an error frame, never swallowed
-            logger.error("runner: execute failed for agent %r (%s)", agent.name, type(exc).__name__)
+            logger.error(
+                "runner: execute failed for agent %s execution_id=%s: %s",
+                redactor.scrub(agent.name),
+                redactor.scrub(execution_id or "unknown"),
+                redactor.scrub("".join(traceback.format_exception(exc))),
+            )
             frame = _frame("error", {"message": redactor.scrub(str(exc))})
             if mark_terminal is not None:
                 mark_terminal()
@@ -574,11 +624,10 @@ def create_app() -> FastAPI:
         transport-token gate on `/execute` is the actual runner-side
         control.
 
-        Realm adapters enable interrupt only with protocol v2 and the
-        advertised interrupt feature. A v1/missing-feature handshake means
-        interrupt=False: interrupt-requiring configurations must be refused
-        before dispatch. Legacy ACA retains abort-read and its existing
-        version-skew warning. The consuming adapters implement that policy.
+        Protocol v2 with the advertised interrupt feature supports targeted
+        cooperative signaling. With v1 or a missing feature, ACA falls back
+        to aborting its host-side read and warns about version skew; Docker
+        realms may require v2 before dispatch. Adapters select the behavior.
         """
         return {
             "ready": True,
@@ -638,6 +687,8 @@ def create_app() -> FastAPI:
                 inner_provider=payload.inner_provider,
                 env_overlay=payload.env_overlay,
                 reserve=True,
+                temperature=payload.agent.temperature,
+                max_tokens=payload.agent.max_tokens,
             )
         except (ProviderError, PydanticValidationError) as exc:
             return JSONResponse(status_code=400, content={"error": {"message": str(exc)}})
@@ -667,7 +718,13 @@ def create_app() -> FastAPI:
 
             try:
                 async for frame in _stream_execute(
-                    provider, agent, payload, provider_cache, interrupt_signal, mark_terminal
+                    provider,
+                    agent,
+                    payload,
+                    provider_cache,
+                    interrupt_signal,
+                    mark_terminal,
+                    execution_id,
                 ):
                     yield frame
             finally:

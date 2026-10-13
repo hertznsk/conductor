@@ -142,7 +142,7 @@ class TestWireGoldenKeySets:
     """
 
     # Requirement: RunnerAgentPayload serializes to exactly these keys on the
-    # wire — all 10 lifted fields, no more, no less.
+    # wire — all 12 lifted fields, no more, no less.
     def test_payload_wire_keys(self) -> None:
         assert set(_sample_payload().model_dump(mode="json").keys()) == {
             "name",
@@ -152,6 +152,8 @@ class TestWireGoldenKeySets:
             "max_agent_iterations",
             "max_session_seconds",
             "reasoning_effort",
+            "temperature",
+            "max_tokens",
             "working_dir",
             "retry",
             "context_tier",
@@ -415,7 +417,12 @@ class TestSecretRedaction:
         dump = request.model_dump(mode="json")
         for key in dump:
             if key in body and key not in ("inner_provider_settings", "env_overlay"):
-                assert body[key] == dump[key]
+                expected = dump[key]
+                if key == "agent":
+                    expected = {
+                        k: v for k, v in expected.items() if k not in ("temperature", "max_tokens")
+                    }
+                assert body[key] == expected
 
     # Requirement: a per-call overlay remains secret in every diagnostic dump.
     def test_env_overlay_is_redacted_until_wire_serialization(self) -> None:

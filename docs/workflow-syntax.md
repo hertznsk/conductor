@@ -3183,6 +3183,15 @@ Assigning an agent step to a Docker profile that omits `runner_image` fails vali
 Agent step '<name>' resolves to Docker without docker.runner_image.
 ```
 
+Remote agent profiles reject `dialog:` during validation and manifest compilation: dialog
+evaluation and conversation do not yet have a runner protocol, so they cannot safely run
+in the selected realm. Dialog remains available to local agents.
+
+Remote Copilot also rejects `runtime.max_tokens` because its runner SDK cannot enforce
+that limit. Remote OpenAI and Claude forward the configured `temperature` and
+`max_tokens` to their in-realm providers. The host does not start a model-provider
+session merely to resolve a remote agent's settings.
+
 #### Environment Inheritance (`inherit_control_environment`)
 
 The `inherit_control_environment` setting behaves differently depending on the backend:
@@ -3209,6 +3218,9 @@ Execution profiles are resolved against environment documents defined in project
 Secret bindings provide a secure, declarative way for workflow steps and MCP servers to request credentials without hardcoding secrets or relying on ambient environment variables.
 
 Workflows declare logical secret references at the step or server level. An execution environment document (see [Execution Environments](configuration.md#execution-environments)) binds those logical names to credential sources and enforces consumer access rules.
+The binding's optional `allow` list accepts `script`, `mcp`, and `agent`. For example,
+`allow: [agent]` permits agent-scoped delivery while denying script and MCP consumers;
+omitting `allow` permits all three, and `allow: []` denies all three.
 
 ### Use-Sites
 
@@ -3299,6 +3311,7 @@ Remote servers used by an effective Claude or OpenAI consumer are rejected by bo
 2. **Delivery Collisions**:
    - Literal `env` and secret `env` delivery names within the same consumer must be unique.
    - Literal `headers` and secret `header` delivery names within the same consumer must be unique (case-insensitive).
+   - Agent `env_overlay` must not overwrite literal or secret-bound environment variables on any receiving stdio MCP server. The same MCP credential variable name on separate servers is allowed when it does not collide with the overlay.
 3. **Redaction**:
    - Registered secret values are automatically sanitized across event streams, checkpoints, terminal records, and CLI output displays.
 

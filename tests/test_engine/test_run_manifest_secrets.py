@@ -7,6 +7,7 @@ from typing import Literal
 import pytest
 
 from conductor.config.environment import (
+    DockerProfileOptions,
     EnvironmentDocument,
     ProfileDefinition,
     ResolvedEnvironment,
@@ -167,6 +168,41 @@ def _remote_mcp_config(
             for index, provider in enumerate(agent_providers)
         ],
     )
+
+
+def test_agent_overlay_rejects_same_server_mcp_binding_at_compile() -> None:
+    # Requirement: compilation rejects an overlay replacing its stdio server credential.
+    config = _agent_config(_secret("alpha", "agent", env="MCP_TOKEN"))
+    config.workflow.runtime.mcp_servers["docs"] = MCPServerDef(
+        command="docs-server", secrets=[_secret("beta", "mcp", env="MCP_TOKEN")]
+    )
+    environment = _environment()
+    environment.document.profiles["default"] = ProfileDefinition(
+        backend="docker",
+        docker=DockerProfileOptions(image="script:test", runner_image="runner:test"),
+    )
+    with pytest.raises(ConfigurationError, match="collides within consumer 'agent'"):
+        compile_run_manifest(config, workflow_path=None, environment=environment)
+
+
+def test_independent_mcp_server_bindings_share_env_name_at_compile() -> None:
+    # Requirement: compilation keeps each MCP server's credential namespace separate.
+    config = _agent_config(_secret("alpha", "agent", env="OVERLAY_TOKEN"))
+    config.workflow.runtime.mcp_servers = {
+        name: MCPServerDef(command=f"{name}-server", secrets=[_secret(ref, "mcp", env="MCP_TOKEN")])
+        for name, ref in (("docs", "alpha"), ("search", "beta"))
+    }
+    environment = _environment()
+    environment.document.profiles["default"] = ProfileDefinition(
+        backend="docker",
+        docker=DockerProfileOptions(image="script:test", runner_image="runner:test"),
+    )
+    manifest = compile_run_manifest(config, workflow_path=None, environment=environment)
+    assert {(use.consumer, use.delivery_name) for use in manifest.secrets} == {
+        ("agent", "OVERLAY_TOKEN"),
+        ("mcp:docs", "MCP_TOKEN"),
+        ("mcp:search", "MCP_TOKEN"),
+    }
 
 
 def test_secret_uses_are_recorded_in_step_then_sorted_server_order() -> None:

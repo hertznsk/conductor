@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -119,7 +120,7 @@ async def test_script_agent_event_and_output_parity(
                 )
             observed.append((await engine.run({}), events))
         (local_output, local_events), (docker_output, docker_events) = observed
-        assert local_output == docker_output == {"script": "ready\n", "answer": "agent"}
+        assert local_output == docker_output == {"script": f"ready{os.linesep}", "answer": "agent"}
         assert tuple(event.type for event in local_events) == canonical_events
         assert tuple(event.type for event in docker_events) == canonical_events
         for events in (local_events, docker_events):
@@ -130,7 +131,7 @@ async def test_script_agent_event_and_output_parity(
             ]
             assert (
                 next(e.data["rendered_prompt"] for e in events if e.type == "agent_prompt_rendered")
-                == "Use ready\n"
+                == f"Use ready{os.linesep}"
             )
             assert next(e.data["text"] for e in events if e.type == "agent_message") == "streamed"
             completed = next(e.data for e in events if e.type == "agent_completed")

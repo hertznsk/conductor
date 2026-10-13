@@ -29,6 +29,8 @@ def agent_spec_to_wire_body(
     """
     if protocol_version < 1:
         raise ValueError("runner protocol version must be positive")
+    if protocol_version == 1 and (spec.temperature is not None or spec.max_tokens is not None):
+        raise ValueError("runner protocol v1 cannot honor temperature or max_tokens")
 
     body: dict[str, Any] = {
         "agent": {
@@ -39,6 +41,8 @@ def agent_spec_to_wire_body(
             "max_agent_iterations": spec.max_agent_iterations,
             "max_session_seconds": spec.max_session_seconds,
             "reasoning_effort": spec.reasoning_effort,
+            "temperature": spec.temperature,
+            "max_tokens": spec.max_tokens,
             "working_dir": spec.working_dir,
             "retry": dict(spec.retry) if spec.retry is not None else None,
             "context_tier": spec.context_tier,
@@ -62,4 +66,7 @@ def agent_spec_to_wire_body(
             skill_directories=list(spec.skill_directories) or None,
             custom_agents=[dict(agent) for agent in spec.custom_agents] or None,
         )
+    else:
+        body["agent"].pop("temperature")
+        body["agent"].pop("max_tokens")
     return body

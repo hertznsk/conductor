@@ -18,7 +18,6 @@ import time as _time
 import traceback
 import uuid
 from dataclasses import dataclass, field, replace
-from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
@@ -47,7 +46,11 @@ from conductor.engine.limits import LimitEnforcer
 from conductor.engine.pricing import ModelPricing
 from conductor.engine.realm_credentials import resolve_realm_credentials
 from conductor.engine.router import Router, RouteResult
-from conductor.engine.run_manifest import executable_step_identity, script_step_backends
+from conductor.engine.run_manifest import (
+    executable_step_identity,
+    remote_dialog_error,
+    script_step_backends,
+)
 from conductor.engine.secrets import SecretValueCache
 from conductor.engine.usage import UsageTracker, WorkflowUsage
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
@@ -1855,15 +1858,18 @@ class WorkflowEngine:
 
         return _callback
 
-    async def _get_executor_for_agent(self, agent: AgentDef) -> AgentExecutor:
+    async def _get_executor_for_agent(
+        self, agent: AgentDef, realm: AgentRealm | None = None
+    ) -> AgentExecutor:
         """Get the appropriate executor for an agent.
 
-        When using a ProviderRegistry (multi-provider mode), this creates
-        an executor with the provider appropriate for the agent. When using
-        a single provider (backward compat mode), returns the shared executor.
+        Remote realms use static registry configuration without constructing
+        a host provider. Local registry agents still obtain their provider;
+        local single-provider mode returns the shared executor.
 
         Args:
             agent: The agent definition.
+            realm: Resolved remote placement, if any.
 
         Returns:
             AgentExecutor configured for the agent's provider.
@@ -1871,29 +1877,57 @@ class WorkflowEngine:
         Raises:
             ExecutionError: If no provider or registry is configured.
         """
-        if self._registry is not None:
-            # Multi-provider mode: get provider from registry
-            provider = await self._registry.get_provider(agent)
-            return AgentExecutor(
-                provider,
-                workflow_tools=self.config.tools,
-                instructions_preamble=self._instructions_preamble,
-                workflow_skills=self._workflow_skills,
-                workflow_dir=self._workflow_dir,
-                skill_injection=self.config.workflow.runtime.skill_injection,
-                skill_discovery=self.config.workflow.runtime.skill_discovery,
-                workflow_plugins=self._workflow_plugins,
-                plugin_marketplaces=self._plugin_marketplaces,
-                declared_plugin_sources=self._declared_plugin_sources,
-            )
-        elif self.executor is not None:
+        if realm is None and self._registry is None and self.executor is not None:
             # Single provider mode (backward compatibility)
             return self.executor
-        else:
+        if realm is None and self._registry is None:
             raise ExecutionError(
                 "No provider configured for workflow execution",
                 suggestion="Provide either a provider or registry to WorkflowEngine",
             )
+
+        remote_kwargs: dict[str, Any] = {}
+        if realm is not None:
+            runtime = (
+                self._registry.runtime
+                if self._registry is not None
+                else self.config.workflow.runtime
+            )
+            remote_kwargs = {
+                "remote_provider_type": self._provider_name_for(agent),
+                "remote_runtime": runtime,
+                "remote_mcp_servers": (
+                    self._registry.mcp_servers
+                    if self._registry is not None
+                    else self.config.workflow.runtime.mcp_servers
+                ),
+            }
+            provider = None
+        else:
+            assert self._registry is not None
+            provider = await self._registry.get_provider(agent)
+        return AgentExecutor(
+            provider,
+            workflow_tools=self.config.tools,
+            instructions_preamble=self._instructions_preamble,
+            workflow_skills=self._workflow_skills,
+            workflow_dir=self._workflow_dir,
+            skill_injection=self.config.workflow.runtime.skill_injection,
+            skill_discovery=self.config.workflow.runtime.skill_discovery,
+            workflow_plugins=self._workflow_plugins,
+            plugin_marketplaces=self._plugin_marketplaces,
+            declared_plugin_sources=self._declared_plugin_sources,
+            **remote_kwargs,
+        )
+
+    def _realm_credentials_for(self, provider_type: str) -> Mapping[str, Any] | None:
+        """Resolve credentials using the registry settings that configure this provider."""
+        settings = (
+            self._registry.provider_settings_for(provider_type)
+            if self._registry is not None
+            else self.config.workflow.runtime.provider
+        )
+        return resolve_realm_credentials(provider_type, settings)
 
     def _agent_realm(self, name: str, *, for_each_group: str | None = None) -> AgentRealm | None:
         """Resolve placement once, retaining the identity for every follow-up."""
@@ -1921,10 +1955,7 @@ class WorkflowEngine:
             env_overlay=self._execution_resolver.secret_env_for_step(
                 name, for_each_group=for_each_group
             ),
-            credential_resolver=partial(
-                resolve_realm_credentials,
-                settings=self.config.workflow.runtime.provider,
-            ),
+            credential_resolver=self._realm_credentials_for,
             image=image,
             name=profile.backend,
         )
@@ -3342,7 +3373,9 @@ class WorkflowEngine:
             },
         )
 
-    async def _ensure_pricing_resolved(self, agent: AgentDef, model: str | None) -> None:
+    async def _ensure_pricing_resolved(
+        self, agent: AgentDef, model: str | None, realm: AgentRealm | None = None
+    ) -> None:
         """Resolve provider-supplied pricing for ``model`` and cache it.
 
         Best-effort bridge between the async :meth:`AgentProvider.get_model_pricing`
@@ -3373,7 +3406,7 @@ class WorkflowEngine:
         ``(provider, model)`` or returning the price inline to ``record`` — when a
         second provider implements the hook. Acceptable for a best-effort estimate.
         """
-        if not model or not isinstance(model, str):
+        if realm is not None or not model or not isinstance(model, str):
             return
         # Fast path: this model was already attempted this run (price cached, or
         # deliberately left unpriced).
@@ -3434,7 +3467,7 @@ class WorkflowEngine:
             self._pricing_resolved_models.add(model)
 
     async def _get_context_window_for_agent(
-        self, agent: AgentDef, output: AgentOutput | None = None
+        self, agent: AgentDef, output: AgentOutput | None = None, realm: AgentRealm | None = None
     ) -> int | None:
         """Return the SDK-reported max prompt tokens for an agent.
 
@@ -3449,6 +3482,8 @@ class WorkflowEngine:
         reached, or the provider's metadata call fails — context-window
         metadata is best-effort and must never break workflow execution.
         """
+        if realm is not None:
+            return None
         provider = await self._get_provider_for_agent(agent)
         if provider is None:
             return None
@@ -3476,7 +3511,7 @@ class WorkflowEngine:
         return None
 
     async def _context_window_fields(
-        self, agent: AgentDef, output: AgentOutput
+        self, agent: AgentDef, output: AgentOutput, realm: AgentRealm | None = None
     ) -> dict[str, int | None]:
         """Return the ``context_window_used`` / ``context_window_max`` event pair.
 
@@ -3507,7 +3542,7 @@ class WorkflowEngine:
             ready to splice into an event payload.
         """
         used = output.last_call_input_tokens
-        maximum = await self._get_context_window_for_agent(agent, output)
+        maximum = await self._get_context_window_for_agent(agent, output, realm)
         if used is not None and maximum is not None and used > maximum:
             logger.debug(
                 "Dropping impossible context-window pair for agent %s: "
@@ -5178,7 +5213,11 @@ class WorkflowEngine:
             The original output if dialog was not triggered or declined,
             or an updated output after re-execution with dialog context.
         """
+        if realm is not None:
+            raise ConfigurationError(remote_dialog_error(agent.name, realm.name))
+
         provider = executor.provider
+        assert provider is not None
 
         # Suspend keyboard listener for interactive dialog
         if self._keyboard_listener is not None:
@@ -5367,7 +5406,6 @@ class WorkflowEngine:
                         {},
                         tools=[],
                         execution=realm.execution,
-                        env_overlay=realm.env_overlay,
                         credential_resolver=realm.credential_resolver,
                         backend_name=realm.lease.backend if realm.lease is not None else None,
                     ),
@@ -5405,7 +5443,7 @@ class WorkflowEngine:
         v_cost: float | None = None
         v_billing_mode: BillingMode | None = None
         if outcome.output is not None:
-            await self._ensure_pricing_resolved(agent, outcome.output.model)
+            await self._ensure_pricing_resolved(agent, outcome.output.model, realm)
             v_usage = self.usage_tracker.record(validator_row, outcome.output, _v_elapsed)
             v_cost = v_usage.cost_usd
             v_billing_mode = v_usage.billing_mode
@@ -5511,7 +5549,7 @@ class WorkflowEngine:
         # The re-run succeeded and is now the effective output (recorded under
         # the primary name by the caller). Attribute the now-discarded first
         # attempt to the validator row so its cost isn't lost.
-        await self._ensure_pricing_resolved(agent, output.model)
+        await self._ensure_pricing_resolved(agent, output.model, realm)
         self.usage_tracker.record(validator_row, output, primary_elapsed)
         return new_output
 
@@ -5794,7 +5832,7 @@ class WorkflowEngine:
                             "provider": event_provider,
                             "context_window_max": (
                                 await self._get_context_window_for_agent(resolved_agent)
-                                if resolved_agent is not None
+                                if resolved_agent is not None and agent_realm is None
                                 else None
                             ),
                         }
@@ -6562,7 +6600,7 @@ class WorkflowEngine:
                                 "executed as a provider-backed agent"
                             )
                         _agent_start = _time.time()
-                        executor = await self._get_executor_for_agent(resolved_agent)
+                        executor = await self._get_executor_for_agent(resolved_agent, agent_realm)
                         guidance_section = self.context.get_guidance_prompt_section()
                         event_callback = self._make_event_callback(agent.name)
                         output = await self._execute_with_agent_timeout(
@@ -6664,7 +6702,9 @@ class WorkflowEngine:
                             _agent_elapsed = _time.time() - _agent_start
 
                         # Record usage and calculate cost
-                        await self._ensure_pricing_resolved(resolved_agent, output.model)
+                        await self._ensure_pricing_resolved(
+                            resolved_agent, output.model, agent_realm
+                        )
                         usage = self.usage_tracker.record(agent.name, output, _agent_elapsed)
                         if output.session_seconds is not None:
                             self.usage_tracker.record_sandbox(
@@ -6696,7 +6736,9 @@ class WorkflowEngine:
                                     else {}
                                 ),
                                 **_billing_mode_field(usage.billing_mode),
-                                **await self._context_window_fields(resolved_agent, output),
+                                **await self._context_window_fields(
+                                    resolved_agent, output, agent_realm
+                                ),
                             },
                         )
 
@@ -7703,7 +7745,7 @@ class WorkflowEngine:
                 )
 
                 # Execute agent (get executor for multi-provider support)
-                executor = await self._get_executor_for_agent(resolved_agent)
+                executor = await self._get_executor_for_agent(resolved_agent, realm)
                 event_callback = self._make_event_callback(agent.name)
                 guidance_section = self.context.get_guidance_prompt_section()
                 output = await self._execute_with_agent_timeout(
@@ -7735,7 +7777,7 @@ class WorkflowEngine:
                     _agent_elapsed = _time.time() - _agent_start
 
                 # Record usage and calculate cost
-                await self._ensure_pricing_resolved(resolved_agent, output.model)
+                await self._ensure_pricing_resolved(resolved_agent, output.model, realm)
                 usage = self.usage_tracker.record(agent.name, output, _agent_elapsed)
                 if output.session_seconds is not None:
                     self.usage_tracker.record_sandbox(
@@ -7759,7 +7801,7 @@ class WorkflowEngine:
                             else {}
                         ),
                         **_billing_mode_field(usage.billing_mode),
-                        **await self._context_window_fields(resolved_agent, output),
+                        **await self._context_window_fields(resolved_agent, output, realm),
                     },
                 )
 
@@ -8304,7 +8346,7 @@ class WorkflowEngine:
                     },
                 )
 
-                executor = await self._get_executor_for_agent(qualified_agent)
+                executor = await self._get_executor_for_agent(qualified_agent, realm)
 
                 # Item-scoped event callback that tags all streaming events
                 # with the for-each group name + item_key. Wrapper keys are
@@ -8352,7 +8394,7 @@ class WorkflowEngine:
                     _item_elapsed = _time.time() - _item_start
 
                 # Record usage and calculate cost
-                await self._ensure_pricing_resolved(qualified_agent, output.model)
+                await self._ensure_pricing_resolved(qualified_agent, output.model, realm)
                 usage = self.usage_tracker.record(
                     f"{for_each_group.name}[{key}]", output, _item_elapsed
                 )

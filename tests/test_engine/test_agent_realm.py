@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import socket
 from collections.abc import Awaitable, Callable
-from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
@@ -15,6 +14,7 @@ import pytest
 from conductor.config.schema import (
     AgentDef,
     ContextConfig,
+    DialogConfig,
     ForEachDef,
     LimitsConfig,
     OutputField,
@@ -41,10 +41,10 @@ from conductor.execution import (
 )
 from conductor.execution.docker import DockerRunnerBackend
 from conductor.executor.agent import AgentExecutor
-from conductor.gates.dialog import DialogMessage, DialogResult
 from conductor.gates.interrupt import InterruptAction, InterruptResult
 from conductor.providers.base import AgentOutput
 from conductor.providers.copilot import CopilotProvider
+from conductor.providers.registry import ProviderRegistry
 
 
 class RecordingAgentBackend(LocalRunnerBackend):
@@ -129,14 +129,18 @@ def _engine(agent: AgentDef) -> tuple[WorkflowEngine, list[WorkflowEvent]]:
 
 
 def _place(
-    engine: WorkflowEngine, backend: RecordingAgentBackend, monkeypatch: pytest.MonkeyPatch
+    engine: WorkflowEngine,
+    backend: RecordingAgentBackend,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    env_overlay: dict[str, str] | None = None,
 ) -> AgentRealm:
     # Requirement: all agent follow-ups use one backend and its original lease.
     realm = AgentRealm(
         backend=backend,
         lease=WorkspaceLease(lease_id="run", backend="docker", incarnation="original"),
         execution=ResolvedExecutionSpec(image="runner:test"),
-        env_overlay={},
+        env_overlay=env_overlay or {},
         credential_resolver=lambda _: {"github_token": "test-token"},
         image="runner:test",
         name="docker",
@@ -152,7 +156,8 @@ async def test_remote_main_and_grader_share_realm_and_rerun_statelessly(
     # Requirement: the grader and failed-validation retry never use the host SDK.
     backend = RecordingAgentBackend()
     engine, events = _engine(_agent(validated=True))
-    realm = _place(engine, backend, monkeypatch)
+    overlay = {"AGENT_TOKEN": "agent-secret", "MCP_SERVER_TOKEN": "server-secret"}
+    realm = _place(engine, backend, monkeypatch, env_overlay=overlay)
 
     result = await engine.run({"topic": "carefully"})
 
@@ -163,6 +168,9 @@ async def test_remote_main_and_grader_share_realm_and_rerun_statelessly(
     assert all(spec.execution is realm.execution for spec in backend.specs)
     assert primary.rendered_prompt == "Write carefully"
     assert grader.tools == () and grader.mcp_servers is None
+    # Requirement: grading has neither agent nor MCP-process secret delivery.
+    assert grader.env_overlay is None
+    assert primary.env_overlay == rerun.env_overlay == overlay
     assert rerun.rendered_prompt.startswith("Write carefully")
     assert rerun.execution_id != primary.execution_id
     assert all(
@@ -477,9 +485,14 @@ async def test_parallel_members_use_remote_backend_with_identity(
         }
     )
     _place(engine, backend, monkeypatch)
+    # Requirement: parallel remote members never initialize a host SDK provider.
+    engine._registry = ProviderRegistry(engine.config)
+    create = AsyncMock(side_effect=AssertionError("host provider constructed"))
+    monkeypatch.setattr("conductor.providers.registry.create_provider", create)
 
     await engine.run({"topic": "parallel"})
 
+    create.assert_not_awaited()
     assert {spec.name for spec in backend.specs} == {"writer", "peer"}
     starts = [event for event in events if event.type == "parallel_agent_started"]
     completions = [event for event in events if event.type == "parallel_agent_completed"]
@@ -524,9 +537,14 @@ async def test_for_each_inline_agent_retains_item_event_attribution(
         }
     )
     _place(engine, backend, monkeypatch)
+    # Requirement: for-each remote items never initialize a host SDK provider.
+    engine._registry = ProviderRegistry(engine.config)
+    create = AsyncMock(side_effect=AssertionError("host provider constructed"))
+    monkeypatch.setattr("conductor.providers.registry.create_provider", create)
 
     await engine.run({})
 
+    create.assert_not_awaited()
     inline = next(spec for spec in backend.specs if spec.name.startswith("worker["))
     assert inline.rendered_prompt == "Write a"
     start = next(event for event in events if event.type == "for_each_agent_started")
@@ -541,39 +559,31 @@ async def test_for_each_inline_agent_retains_item_event_attribution(
 
 
 @pytest.mark.asyncio
-async def test_dialog_refinement_keeps_primary_realm(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Requirement: a dialog-triggered refinement uses the original backend.
+async def test_remote_dialog_rejected_before_host_evaluation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Requirement: remote dialog cannot grade or converse through the host provider.
     backend = RecordingAgentBackend()
     engine, _ = _engine(_agent())
     _place(engine, backend, monkeypatch)
-    monkeypatch.setattr(
-        engine._dialog_evaluator,
-        "evaluate",
-        AsyncMock(return_value=SimpleNamespace(trigger=True, reason="", question="Continue?")),
-    )
-    monkeypatch.setattr(
-        engine._dialog_handler,
-        "handle_dialog",
-        AsyncMock(
-            return_value=DialogResult(
-                dialog_id="dialog", messages=[DialogMessage(role="user", content="yes")]
-            )
-        ),
-    )
+    evaluate = AsyncMock(side_effect=AssertionError("host evaluator contacted"))
+    converse = AsyncMock(side_effect=AssertionError("host dialog contacted"))
+    monkeypatch.setattr(engine._dialog_evaluator, "evaluate", evaluate)
+    monkeypatch.setattr(engine._dialog_handler, "handle_dialog", converse)
     executor = engine.executor
     assert executor is not None
 
-    output = await engine._handle_dialog(
-        _agent(),
-        AgentOutput(content={"answer": "draft"}, raw_response=None),
-        {"workflow": {"input": {"topic": "dialog"}}},
-        executor,
-        engine._agent_realm("writer"),
-    )
-
-    assert output.content == {"answer": "remote"}
-    assert len(backend.specs) == 1
-    assert "yes" in backend.specs[0].rendered_prompt
+    with pytest.raises(ConfigurationError, match="dialog.*remote"):
+        await engine._handle_dialog(
+            _agent().model_copy(update={"dialog": DialogConfig(trigger_prompt="Ask")}),
+            AgentOutput(content={"answer": "draft"}, raw_response=None),
+            {"workflow": {"input": {"topic": "dialog"}}},
+            executor,
+            engine._agent_realm("writer"),
+        )
+    evaluate.assert_not_awaited()
+    converse.assert_not_awaited()
+    assert backend.specs == []
 
 
 @pytest.mark.asyncio

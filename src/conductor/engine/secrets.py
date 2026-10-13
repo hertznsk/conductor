@@ -82,7 +82,7 @@ class ResolvedSecret:
 
     Attributes:
         ref: The logical secret reference name from the environment document.
-        allow: Allowed consumer classes (``"script"``, ``"mcp"``), or ``None``
+        allow: Allowed consumer classes (``"script"``, ``"mcp"``, ``"agent"``), or ``None``
             when the binding permits every consumer class forever.
     """
 

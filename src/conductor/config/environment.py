@@ -130,7 +130,7 @@ class SecretBinding(BaseModel):
     source: SecretBindingSource
     """Source resolving the secret value."""
 
-    allow: list[Literal["script", "mcp"]] | None = None
+    allow: list[Literal["script", "mcp", "agent"]] | None = None
     """Allowed consumer classes for this secret.
 
     When ``None`` (the default), all consumer classes are allowed forever.

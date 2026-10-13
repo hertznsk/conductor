@@ -1,6 +1,8 @@
 """Test-only model provider installed in a real runner container."""
 
 import asyncio
+import os
+from contextlib import suppress
 from pathlib import Path
 
 from conductor.aca_runner import server
@@ -8,9 +10,6 @@ from conductor.providers.base import AgentOutput
 
 
 class FixtureProvider:
-    overlapping = asyncio.Event()
-    active = 0
-
     def __init__(self, **_settings):
         pass
 
@@ -18,13 +17,19 @@ class FixtureProvider:
         callback = kwargs["event_callback"]
         callback("agent_message", {"content": "fixture-event"})
         if prompt.startswith("overlap:"):
-            type(self).active += 1
-            if self.active == 2:
-                self.overlapping.set()
-            try:
-                await asyncio.wait_for(self.overlapping.wait(), 15)
-            finally:
-                type(self).active -= 1
+            # A FIFO on the shared volume requires both runner processes to arrive.
+            def meet_other_runner():
+                fifo = Path("/workspace/main/overlap.fifo")
+                with suppress(FileExistsError):
+                    os.mkfifo(fifo)
+                if prompt == "overlap: a":
+                    with fifo.open("rb", buffering=0) as reader:
+                        assert reader.read(1) == b"x"
+                else:
+                    with fifo.open("wb", buffering=0) as writer:
+                        writer.write(b"x")
+
+            await asyncio.wait_for(asyncio.to_thread(meet_other_runner), 15)
             return AgentOutput(content={"answer": "overlapped"}, raw_response=None)
         if prompt.startswith("interrupt:"):
             signal = kwargs["interrupt_signal"]

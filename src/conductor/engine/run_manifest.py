@@ -493,6 +493,15 @@ def _require_script_backend_capability(key: str, backend_name: str) -> None:
         )
 
 
+def remote_dialog_error(key: str, backend_name: str) -> str:
+    """Name the unsupported boundary shared by compilation and runtime."""
+    return (
+        f"Agent step '{key}' cannot use dialog on remote backend '{backend_name}': "
+        "dialog evaluation and conversation require a local provider until the "
+        "runner supports dialog."
+    )
+
+
 def _require_agent_backend_capability(
     key: str,
     backend_name: str,
@@ -514,6 +523,17 @@ def _require_agent_backend_capability(
             f"Agent step '{key}' resolves to remote backend '{backend_name}' with provider "
             f"'{effective_provider}'; supported inner providers: copilot, openai, claude. "
             "Other providers require a follow-up implementation."
+        )
+    if backend_name != "local" and agent.dialog is not None:
+        raise ConfigurationError(remote_dialog_error(key, backend_name))
+    if (
+        backend_name != "local"
+        and effective_provider == "copilot"
+        and runtime.max_tokens is not None
+    ):
+        raise ConfigurationError(
+            "Remote copilot does not support runtime.max_tokens; remove the output "
+            "token limit or use a provider that enforces it."
         )
     if backend_name == "docker" and (
         definition.docker is None or not definition.docker.runner_image
@@ -801,6 +821,18 @@ def _compile_mcp_secret_uses(
                     literal_headers=(),
                     secrets=[*step_secrets, *agent_server_secrets],
                 )
+                for server in config.workflow.runtime.mcp_servers.values():
+                    if server.type == "stdio":
+                        _check_delivery_collisions(
+                            key,
+                            literal_env=(
+                                secret.delivery.env
+                                for secret in server.secrets
+                                if secret.scope == "mcp" and secret.delivery.env is not None
+                            ),
+                            literal_headers=(),
+                            secrets=[*step_secrets, *agent_server_secrets],
+                        )
     return uses
 
 

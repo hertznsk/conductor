@@ -315,8 +315,9 @@ class DockerRunnerBackend:
         self._staged: dict[tuple[str, str], asyncio.Task[None]] = {}
         self._closed_leases: set[tuple[str, str]] = set()
         self._attempts: dict[tuple[str, str], int] = {}
-        self._runners: dict[tuple[tuple[str, str], str, str], asyncio.Task[_RunnerState]] = {}
-        self._runner_cleanup: dict[tuple[tuple[str, str], str, str], asyncio.Task[None]] = {}
+        self._runners: dict[tuple[tuple[str, str], str, str], list[asyncio.Task[_RunnerState]]] = {}
+        self._busy_runners: set[asyncio.Task[_RunnerState]] = set()
+        self._runner_cleanup: dict[tuple[str, str], set[asyncio.Task[None]]] = {}
         self._warned_missing_interrupt: set[str] = set()
 
     def capabilities(self) -> RunnerCapabilities:
@@ -326,7 +327,8 @@ class DockerRunnerBackend:
             and not task.cancelled()
             and task.exception() is None
             and "interrupt" in task.result().features
-            for task in self._runners.values()
+            for tasks in self._runners.values()
+            for task in tasks
         )
         return RunnerCapabilities(
             batch=True,
@@ -346,7 +348,7 @@ class DockerRunnerBackend:
         interrupt_signal: asyncio.Event | None = None,
         execute_local: Callable[[], Awaitable[AgentResult]] | None = None,
     ) -> AgentResult:
-        """Execute against a lease-owned runner, invalidating it on cancellation."""
+        """Reserve one runner per active call, reusing it only after the call ends."""
         if execute_local is not None:
             raise ConfigurationError("Docker agent execution does not accept a local closure")
         if lease is None or lease.backend != "docker" or spec.execution is None:
@@ -357,16 +359,27 @@ class DockerRunnerBackend:
         if lease_state is None or lease_state.run.bundle is None:
             raise ConfigurationError("Docker agent realm requires a published run bundle")
         key = self._runner_key(lease, spec.execution)
+        task = self._reserve_runner(lease, spec.execution)
         try:
-            runner = await self._ensure_runner(lease, spec.execution)
-            return await self._execute_agent(spec, lease, runner, on_event, interrupt_signal)
-        except asyncio.CancelledError:
-            cleanup = self._runner_cleanup.get(key)
-            if cleanup is None:
-                cleanup = asyncio.create_task(self._invalidate_runner(lease, key))
-                self._runner_cleanup[key] = cleanup
-            await _await_task_cleanup(cast(asyncio.Task[object], cleanup))
+            runner = await asyncio.shield(task)
+            result = await self._execute_agent(spec, lease, runner, on_event, interrupt_signal)
+        except BaseException:
+            cleanup = self._retire_runner(lease, key, task)
+            if await _await_task_cleanup(cast(asyncio.Task[object], cleanup)):
+                raise asyncio.CancelledError from None
             raise
+        else:
+            if (
+                interrupt_signal is not None
+                and interrupt_signal.is_set()
+                and ("interrupt" not in runner.features)
+            ):
+                cleanup = self._retire_runner(lease, key, task)
+                if await _await_task_cleanup(cast(asyncio.Task[object], cleanup)):
+                    raise asyncio.CancelledError from None
+            return result
+        finally:
+            self._busy_runners.discard(task)
 
     @staticmethod
     def _runner_key(
@@ -379,27 +392,19 @@ class DockerRunnerBackend:
             hashlib.sha256(options.encode()).hexdigest(),
         )
 
-    async def _ensure_runner(
+    def _reserve_runner(
         self, lease: WorkspaceLease, execution: ResolvedExecutionSpec
-    ) -> _RunnerState:
+    ) -> asyncio.Task[_RunnerState]:
         key = self._runner_key(lease, execution)
-        cleanup = self._runner_cleanup.get(key)
-        if cleanup is not None:
-            await asyncio.shield(cleanup)
-            if self._runner_cleanup.get(key) is cleanup:
-                self._runner_cleanup.pop(key, None)
         if key[0] in self._closed_leases:
             raise ConfigurationError("Docker lease is finalizing")
-        task = self._runners.get(key)
+        tasks = self._runners.setdefault(key, [])
+        task = next((item for item in tasks if item not in self._busy_runners), None)
         if task is None:
             task = asyncio.create_task(self._start_runner(lease, execution))
-            self._runners[key] = task
-        try:
-            return await asyncio.shield(task)
-        except Exception:
-            if self._runners.get(key) is task:
-                self._runners.pop(key, None)
-            raise
+            tasks.append(task)
+        self._busy_runners.add(task)
+        return task
 
     async def _start_runner(
         self, lease: WorkspaceLease, execution: ResolvedExecutionSpec
@@ -462,20 +467,31 @@ class DockerRunnerBackend:
                 await _await_task_cleanup(cast(asyncio.Task[object], cleanup))
             raise
 
-    async def _invalidate_runner(
-        self, lease: WorkspaceLease, key: tuple[tuple[str, str], str, str]
+    def _retire_runner(
+        self,
+        lease: WorkspaceLease,
+        key: tuple[tuple[str, str], str, str],
+        task: asyncio.Task[_RunnerState],
+    ) -> asyncio.Task[None]:
+        tasks = self._runners.get(key)
+        if tasks is not None and task in tasks:
+            tasks.remove(task)
+            if not tasks:
+                self._runners.pop(key)
+        cleanup = asyncio.create_task(self._cleanup_runner(lease, task))
+        cleanups = self._runner_cleanup.setdefault(key[0], set())
+        cleanups.add(cleanup)
+        cleanup.add_done_callback(cleanups.discard)
+        return cleanup
+
+    async def _cleanup_runner(
+        self, lease: WorkspaceLease, task: asyncio.Task[_RunnerState]
     ) -> None:
-        task = self._runners.pop(key, None)
-        if task is None:
-            return
-        if not task.done():
-            task.cancel()
-            await _await_task_cleanup(cast(asyncio.Task[object], task))
-        if (
-            not task.cancelled()
-            and task.exception() is None
-            and not await self._cleanup_container(lease, task.result().name, kill=True)
-        ):
+        try:
+            runner = await asyncio.shield(task)
+        except Exception:
+            return  # Startup already cleaned a partially created container.
+        if not await self._cleanup_container(lease, runner.name, kill=True):
             raise _DockerFailure("Previous Docker runner could not be removed")
 
     async def _bridge_health(self, name: str, image: str) -> dict[str, object]:
@@ -537,7 +553,7 @@ class DockerRunnerBackend:
                 timeout=15,
             )
             if rc != 0:
-                logger.warning("Docker runner interrupt failed: %s", _bounded(stderr))
+                raise ConfigurationError(f"Docker runner interrupt failed: {_bounded(stderr)}")
 
         if (
             interrupt_signal is not None
@@ -1051,14 +1067,14 @@ class DockerRunnerBackend:
         del outcome
         key = self._lease_key(lease)
         self._closed_leases.add(key)
-        for runner_key, cleanup in tuple(self._runner_cleanup.items()):
+        for cleanup in self._runner_cleanup.pop(key, set()):
+            await _await_task_cleanup(cast(asyncio.Task[object], cleanup))
+        for runner_key, tasks in tuple(self._runners.items()):
             if runner_key[0] == key:
-                await _await_task_cleanup(cast(asyncio.Task[object], cleanup))
-                self._runner_cleanup.pop(runner_key, None)
-        for runner_key in tuple(self._runners):
-            if runner_key[0] == key:
-                cleanup = asyncio.create_task(self._invalidate_runner(lease, runner_key))
-                await _await_task_cleanup(cast(asyncio.Task[object], cleanup))
+                for runner in tuple(tasks):
+                    cleanup = self._retire_runner(lease, runner_key, runner)
+                    await _await_task_cleanup(cast(asyncio.Task[object], cleanup))
+        self._runner_cleanup.pop(key, None)
         task = self._staged.pop(key, None)
         caller = asyncio.current_task()
         cancelling_before = caller.cancelling() if caller is not None else 0

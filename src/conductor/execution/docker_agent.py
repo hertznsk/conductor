@@ -16,30 +16,35 @@ from conductor.execution.types import AgentEventSink, AgentResult, AgentSpec
 
 _MAX_FRAME_BYTES = 1024 * 1024
 _MAX_STDERR_BYTES = 8192
+_INTERRUPT_TIMEOUT_SECONDS = 30
 _BRIDGE_COMMAND = ("python", "-m", "conductor.runner.bridge")
 
 
-async def _reap(process: asyncio.subprocess.Process, *, kill: bool) -> None:
-    """Reap even when the caller is cancelled again during teardown."""
-    if kill:
-        if sys.platform == "win32" and process.returncode is None:
-            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
-                await asyncio.to_thread(
-                    subprocess.run,
-                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=5,
-                    check=False,
-                )
-        with contextlib.suppress(ProcessLookupError):
-            process.kill()
+async def _reap(process: asyncio.subprocess.Process, *, kill: bool) -> bool:
+    """Wait normally after EOF; shield the wait only during kill/teardown."""
+    if not kill:
+        _ = await process.wait()
+        return False
+    if sys.platform == "win32" and process.returncode is None:
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            await asyncio.to_thread(
+                subprocess.run,
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+    with contextlib.suppress(ProcessLookupError):
+        process.kill()
     waiter = asyncio.create_task(process.wait())
+    cancelled = False
     while not waiter.done():
         try:
             await asyncio.shield(waiter)
         except asyncio.CancelledError:
-            continue
+            cancelled = True
+    return cancelled
 
 
 async def _stderr_tail(stream: asyncio.StreamReader) -> bytes:
@@ -106,6 +111,7 @@ async def stream_agent(
     assert process.stdin is not None and process.stdout is not None and process.stderr is not None
     stderr_task = asyncio.create_task(_stderr_tail(process.stderr))
     interrupt_task: asyncio.Task[None] | None = None
+    interrupt_deadline: float | None = None
     finished = False
 
     async def interrupt() -> None:
@@ -118,8 +124,6 @@ async def stream_agent(
         process.stdin.write(body)
         await process.stdin.drain()
         process.stdin.close()
-        if interrupt_signal is not None and can_interrupt:
-            interrupt_task = asyncio.create_task(interrupt())
         terminal: AgentResult | None = None
         while True:
             try:
@@ -137,10 +141,48 @@ async def stream_agent(
                         read_task.cancel()
                         signal_task.cancel()
                         await asyncio.gather(read_task, signal_task, return_exceptions=True)
+                elif interrupt_task is not None and not interrupt_task.done():
+                    read_task = asyncio.create_task(process.stdout.readline())
+                    try:
+                        done, _pending = await asyncio.wait(
+                            {read_task, interrupt_task}, return_when=asyncio.FIRST_COMPLETED
+                        )
+                        if interrupt_task in done:
+                            await interrupt_task
+                            interrupt_deadline = (
+                                asyncio.get_running_loop().time() + _INTERRUPT_TIMEOUT_SECONDS
+                            )
+                        if interrupt_deadline is None:
+                            line = await read_task
+                        else:
+                            line = await asyncio.wait_for(
+                                read_task,
+                                max(0, interrupt_deadline - asyncio.get_running_loop().time()),
+                            )
+                    finally:
+                        if not read_task.done():
+                            read_task.cancel()
+                        await asyncio.gather(read_task, return_exceptions=True)
                 else:
-                    line = await process.stdout.readline()
+                    if interrupt_task is not None:
+                        await interrupt_task
+                        if interrupt_deadline is None:
+                            interrupt_deadline = (
+                                asyncio.get_running_loop().time() + _INTERRUPT_TIMEOUT_SECONDS
+                            )
+                    if interrupt_deadline is None:
+                        line = await process.stdout.readline()
+                    else:
+                        line = await asyncio.wait_for(
+                            process.stdout.readline(),
+                            max(0, interrupt_deadline - asyncio.get_running_loop().time()),
+                        )
             except ValueError as exc:
                 raise ConfigurationError("Docker runner emitted an oversized NDJSON frame") from exc
+            except TimeoutError as exc:
+                raise ConfigurationError(
+                    "Docker runner interrupt was acknowledged without a partial result"
+                ) from exc
             if not line:
                 break
             if len(line) > _MAX_FRAME_BYTES:
@@ -157,6 +199,15 @@ async def stream_agent(
                 raise ConfigurationError("Docker runner emitted an invalid frame")
             frame_type = frame.get("type")
             data: dict[str, Any] = frame["data"]
+            if (
+                interrupt_signal is not None
+                and can_interrupt
+                and interrupt_task is None
+                and frame_type not in ("result", "error")
+            ):
+                interrupt_task = asyncio.create_task(interrupt())
+            if frame_type == "bridge_ready":
+                continue
             if frame_type == "result":
                 if terminal is not None:
                     raise ConfigurationError("Docker runner emitted multiple terminal frames")
@@ -184,21 +235,28 @@ async def stream_agent(
                 raise ConfigurationError("Docker runner emitted an event after its terminal frame")
             elif isinstance(frame_type, str) and on_event is not None:
                 on_event(frame_type, data)
-        await _reap(process, kill=False)
+        if interrupt_task is not None and interrupt_task.done():
+            await interrupt_task
+        cancelled = await _reap(process, kill=False)
         finished = True
         stderr = await stderr_task
+        if cancelled:
+            raise asyncio.CancelledError
         if process.returncode != 0:
             raise ConfigurationError(
                 f"Docker runner bridge exited {process.returncode}: {_scrub(stderr, spec)}"
             )
         if terminal is None:
             raise ConfigurationError("Docker runner stream ended without a terminal frame")
+        if interrupt_deadline is not None and not terminal.partial:
+            raise ConfigurationError(
+                "Docker runner interrupt was acknowledged without a partial result"
+            )
         return terminal
     finally:
         if interrupt_task is not None:
             interrupt_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await interrupt_task
+            await asyncio.gather(interrupt_task, return_exceptions=True)
         if not finished:
             await _reap(process, kill=True)
         if not stderr_task.done():

@@ -15,6 +15,9 @@ Local development: push the branch first, then build the base image with::
     docker build --build-arg CONDUCTOR_VERSION=<pushed-sha> \
       -t conductor-agent-realm:ci docker/aca-runner
 
+For a fork, also pass `--build-arg CONDUCTOR_REPOSITORY=https://github.com/<owner>/conductor.git`
+so the image installs the same commit that the CI job verifies.
+
 Set
 ``CONDUCTOR_TEST_RUNNER_IMAGE=conductor-agent-realm:ci`` before running this module. The
 CI lane uses the pushed PR head SHA, never GitHub's synthetic merge commit.
@@ -844,14 +847,14 @@ async def test_agent_interrupt_and_cancel_remove_owned_resources(
 
 
 @pytest.mark.asyncio
-async def test_agent_for_each_calls_overlap_on_one_runner(
+async def test_agent_for_each_calls_overlap_across_exclusive_runners(
     docker_daemon: str,
     runner_image: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Requirement: two for_each agents actually overlap (the fake waits for both
-    # arrivals before either may complete), using one persistent Docker runner.
+    # Requirement: two for_each agents overlap on separate runner containers
+    # while sharing the same staged workspace volume.
     del docker_daemon
     from conductor.providers.copilot import CopilotProvider
 
