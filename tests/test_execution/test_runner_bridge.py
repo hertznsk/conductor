@@ -170,7 +170,7 @@ async def test_bridge_ready_follows_execute_registration_before_targeted_interru
         return process.returncode, output, stderr
 
     try:
-        assert await interrupt() == (1, b"", b"runner interrupt HTTP 404\n")
+        assert await interrupt() == (1, b"", f"runner interrupt HTTP 404{os.linesep}".encode())
         execute = await asyncio.create_subprocess_exec(
             sys.executable,
             "-m",
