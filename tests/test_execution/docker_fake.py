@@ -149,8 +149,17 @@ def main() -> int:
             return 1
         name = _option(argv, "--name")
         assert name is not None
+        mount = next(
+            (
+                argv[index + 1]
+                for index, flag in enumerate(argv[:-1])
+                if flag == "-v" and argv[index + 1].endswith(":/workspace")
+            ),
+            None,
+        )
         state["containers"][name] = {
             "Name": f"/{name}",
+            "Volume": mount.rsplit(":", 1)[0] if mount else None,
             "Config": {"Labels": _labels(argv)},
             "State": {"ExitCode": int(os.environ.get("FAKE_DOCKER_EXIT_CODE", "0"))},
         }
@@ -161,6 +170,25 @@ def main() -> int:
         if scenario == "cpfail":
             print("copy failed", file=sys.stderr)
             return 1
+        # Remember the staging marker per volume so the backend's marker probe
+        # (docker cp <scratch>:/workspace/.conductor-staged) sees what was staged.
+        marker_path = ":/workspace/.conductor-staged"
+        markers = state.setdefault("markers", {})
+        if argv[-1].endswith(marker_path):
+            container = state["containers"].get(argv[-1][: -len(marker_path)], {})
+            if container.get("Volume"):
+                markers[container["Volume"]] = Path(argv[-2]).read_text(encoding="utf-8")
+                _save(state_path, state)
+        elif argv[1].endswith(marker_path):
+            name = argv[1][: -len(marker_path)]
+            marker = markers.get(state["containers"].get(name, {}).get("Volume"))
+            if marker is None:
+                print(
+                    f"Could not find the file /workspace/.conductor-staged in container {name}",
+                    file=sys.stderr,
+                )
+                return 1
+            Path(argv[2]).write_text(marker, encoding="utf-8")
         return 0
     if argv and argv[0] == "start":
         if scenario == "startfail":

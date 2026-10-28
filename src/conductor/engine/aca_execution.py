@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from conductor.config.environment import AcaProfileOptions
 from conductor.exceptions import ConfigurationError
 from conductor.execution.agent_wire import agent_spec_to_wire_body
+from conductor.execution.errors import ExecutionSpecError, WorkspaceAttachError
 from conductor.execution.types import (
     AgentEventSink,
     AgentResult,
@@ -21,6 +22,7 @@ from conductor.execution.types import (
     RunnerCapabilities,
     RunOutcome,
     RunSpec,
+    WorkspaceIdentity,
     WorkspaceLease,
 )
 
@@ -153,6 +155,8 @@ class AcaRunnerBackend:
         )
 
     async def prepare_run(self, run: RunSpec) -> WorkspaceLease:
+        if run.workspace_persistence is not None:
+            raise ExecutionSpecError("aca backend does not support retained workspaces")
         state = AcaIdentifierState()
         self._leases[state.salt] = state
         return WorkspaceLease(
@@ -165,8 +169,9 @@ class AcaRunnerBackend:
         lease: WorkspaceLease | None,
         *,
         diagnostics: Callable[[str], None] | None = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> CommandResult:
-        del spec, lease, diagnostics
+        del spec, lease, diagnostics, on_dispatch
         raise ConfigurationError("ACA profiles do not support batch commands")
 
     async def run_agent(
@@ -215,8 +220,19 @@ class AcaRunnerBackend:
         finally:
             state.release(logical_id, slot)
 
-    async def finalize_run(self, lease: WorkspaceLease, outcome: RunOutcome) -> None:
-        del outcome
+    async def attach_run(
+        self, run: RunSpec, identity: WorkspaceIdentity, *, expect_staged: bool = False
+    ) -> WorkspaceLease:
+        """Reject attach; ACA sessions own no workspace that outlives the process."""
+        del run, identity, expect_staged
+        raise WorkspaceAttachError("aca backend does not support retained workspaces")
+
+    async def finalize_run(
+        self, lease: WorkspaceLease, outcome: RunOutcome, *, retain: bool = False
+    ) -> None:
+        # ``retain`` is ignored: without the retained_workspace capability the session
+        # never prepares a retained lease here, matching LocalRunnerBackend.
+        del outcome, retain
         self._leases.pop(lease.incarnation, None)
         failures: list[Exception] = []
         for backend in (*self._children, self):
