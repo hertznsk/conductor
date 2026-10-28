@@ -40,7 +40,7 @@ def _option(argv: list[str], name: str) -> str | None:
 
 
 def _record(log_path: Path, argv: list[str], stdin: bytes) -> None:
-    record = {
+    record: dict[str, Any] = {
         "argv": argv,
         "env": dict(os.environ),
         "stdin": stdin.decode("utf-8", errors="replace"),
