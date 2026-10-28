@@ -48,10 +48,10 @@ async def test_live_child_claim_blocks_parent_until_child_exits(tmp_path, monkey
     # Requirement: a different process cannot claim a live owner, then can reap its stale claim.
     monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path))
     child_code = (
-        "import sys\n"
+        "import os, sys\n"
         "from conductor.engine.workspace_claim import acquire_workspace_claim\n"
         "acquire_workspace_claim('cross-process')\n"
-        "print('READY', flush=True)\n"
+        "print('READY', os.getpid(), flush=True)\n"
         "sys.stdin.buffer.read(1)\n"
     )
     child = await asyncio.create_subprocess_exec(
@@ -64,11 +64,13 @@ async def test_live_child_claim_blocks_parent_until_child_exits(tmp_path, monkey
     )
     try:
         assert child.stdout is not None
-        assert (
-            await asyncio.wait_for(child.stdout.readline(), timeout=10)
-            == ("READY" + os.linesep).encode()
+        ready, owner_pid = (
+            (await asyncio.wait_for(child.stdout.readline(), timeout=10)).decode().split()
         )
-        with pytest.raises(WorkspaceClaimError, match=str(child.pid)):
+        assert ready == "READY"
+        # A Windows venv python.exe is a launcher, so the claim holder's PID is the
+        # interpreter's, not child.pid.
+        with pytest.raises(WorkspaceClaimError, match=rf"\b{owner_pid}\b"):
             acquire_workspace_claim("cross-process")
         assert child.stdin is not None
         child.stdin.write(b"x")

@@ -54,6 +54,12 @@ from conductor.execution.errors import WorkspaceAttachError
 def docker_processes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[DockerRunnerBackend, str, Path, Path]:
+    return install_docker_processes(tmp_path, monkeypatch)
+
+
+def install_docker_processes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[DockerRunnerBackend, str, Path, Path]:
     """Give two backend instances the same persistent fake daemon and CLI log."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()

@@ -37,11 +37,19 @@ from conductor.providers.copilot import CopilotProvider
 from tests.test_execution.test_workspace_retention import (
     bundle,
     commands,
+    install_docker_processes,
     lifecycle_engine,
     restore,
 )
 
-pytest_plugins = ["tests.test_execution.test_workspace_retention"]
+
+@pytest.fixture
+def docker_processes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[DockerRunnerBackend, str, Path, Path]:
+    # A local fixture, not pytest_plugins: loading a test module as a plugin fails
+    # when pytest has already collected that module.
+    return install_docker_processes(tmp_path, monkeypatch)
 
 
 class _StopAfter:
