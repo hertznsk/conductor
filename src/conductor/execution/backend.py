@@ -24,6 +24,7 @@ from conductor.execution.types import (
     RunnerCapabilities,
     RunOutcome,
     RunSpec,
+    WorkspaceIdentity,
     WorkspaceLease,
 )
 
@@ -68,6 +69,7 @@ class RunnerBackend(Protocol):
         lease: WorkspaceLease | None,
         *,
         diagnostics: Callable[[str], None] | None = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> CommandResult:
         """Execute one command and return its data-shaped result.
 
@@ -83,6 +85,9 @@ class RunnerBackend(Protocol):
             diagnostics: Optional sink for human-facing progress lines
                 (e.g. verbose script logging); the backend calls it at its
                 own discretion.
+            on_dispatch: Optional notification fired after pre-dispatch checks,
+                immediately before creating the command process. Pre-dispatch
+                failures must not call it.
 
         Returns:
             The command's outcome, output, and timing as data.
@@ -121,7 +126,19 @@ class RunnerBackend(Protocol):
         """
         ...
 
-    async def finalize_run(self, lease: WorkspaceLease, outcome: RunOutcome) -> None:
+    async def attach_run(
+        self, run: RunSpec, identity: WorkspaceIdentity, *, expect_staged: bool = False
+    ) -> WorkspaceLease:
+        """Verify a retained workspace and return its process-local lease.
+
+        This operation checks existence, labels, and incarnation only. It must not
+        create, stage, delete, or replace any resource.
+        """
+        ...
+
+    async def finalize_run(
+        self, lease: WorkspaceLease, outcome: RunOutcome, *, retain: bool = False
+    ) -> None:
         """Release the workspace held by a finished run.
 
         Idempotent cleanup keyed by the lease: safe to call exactly once per
