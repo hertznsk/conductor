@@ -324,6 +324,7 @@ class _InnerProviderCache:
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> AgentProvider:
+        resolve_environment = inner_provider_settings is None
         settings = dict(inner_provider_settings or {})
         claude_auth_token = (
             settings.pop("bearer_token", None) if inner_provider == "claude" else None
@@ -355,6 +356,7 @@ class _InnerProviderCache:
                 tool_output=tool_config,
                 github_token=github_token,
                 temperature=temperature,
+                resolve_environment=resolve_environment,
             ),
             "openai": lambda: OpenAIProvider(
                 api_key=api_key_text,
@@ -363,6 +365,7 @@ class _InnerProviderCache:
                 tool_output=tool_config,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                resolve_environment=resolve_environment,
             ),
             "claude": lambda: ClaudeProvider(
                 api_key=api_key_text,
@@ -376,6 +379,7 @@ class _InnerProviderCache:
                 ),
                 temperature=temperature,
                 max_tokens=max_tokens,
+                resolve_environment=resolve_environment,
             ),
         }
         return factories[inner_provider]()

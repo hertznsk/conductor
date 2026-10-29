@@ -63,6 +63,8 @@ async def test_factory_executes_each_supported_provider(
         frames = _frames(response)
         assert [frame["type"] for frame in frames] == ["agent_turn_start", "result"]
         assert sum(frame["type"] in {"result", "error"} for frame in frames) == 1
+        assert frames[-1]["data"]["content"] == {"answer": f"{provider}-done"}
+        assert frames[-1]["data"]["model"] == f"{provider}-model"
         assert "model-key" not in response.text
         instance = DeliveryProvider.instances[0]
         assert (
@@ -81,6 +83,7 @@ async def test_factory_executes_each_supported_provider(
         assert instance.calls[0]["custom_agents"] == [{"name": "reviewer", "prompt": "Review."}]
         assert instance.calls[0]["interrupt_signal"] is None
         assert instance.settings["mcp_servers"] is None
+        assert instance.settings["resolve_environment"] is False
     assert DeliveryProvider.instances[0].closed
 
 
@@ -278,9 +281,9 @@ async def test_claude_bearer_credential_is_forwarded_to_auth_token(
     assert "claude-bearer" not in response.text
 
 
-@pytest.mark.parametrize("provider", ["copilot", "claude"])
+@pytest.mark.parametrize("provider", ["copilot", "openai", "claude"])
 async def test_host_credentials_survive_wire_to_matching_provider(
-    provider: Literal["copilot", "claude"],
+    provider: Literal["copilot", "openai", "claude"],
     monkeypatch: pytest.MonkeyPatch,
     runner_client_factory: RunnerClientFactory,
 ) -> None:
@@ -302,7 +305,7 @@ async def test_host_credentials_survive_wire_to_matching_provider(
         rendered_prompt="task",
         provider_credentials=resolve_realm_credentials(provider, settings),
         temperature=0.23,
-        max_tokens=1536 if provider == "claude" else None,
+        max_tokens=1536 if provider != "copilot" else None,
     )
     async with runner_client_factory() as client:
         response = await client.post("/execute", json=agent_spec_to_wire_body(spec))
@@ -312,6 +315,7 @@ async def test_host_credentials_survive_wire_to_matching_provider(
         type(instance)
         is {
             "copilot": CopilotDeliveryProvider,
+            "openai": OpenAIDeliveryProvider,
             "claude": ClaudeDeliveryProvider,
         }[provider]
     )
@@ -326,6 +330,10 @@ async def test_host_credentials_survive_wire_to_matching_provider(
         assert instance.settings["api_key"] == f"{provider}-key"
         assert instance.settings["max_tokens"] == 1536
     assert instance.settings["temperature"] == 0.23
+    assert instance.settings["resolve_environment"] is False
+    terminal = _frames(response)[-1]["data"]
+    assert terminal["content"] == {"answer": f"{provider}-done"}
+    assert terminal["model"] == f"{provider}-model"
 
 
 async def test_unexpected_exception_logs_redacted_trace_and_execution_identity(

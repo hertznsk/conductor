@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from typing import Any
+from typing import Any, ClassVar
 
 import httpx
 import pytest
@@ -20,6 +20,7 @@ class DeliveryProvider:
     """Canned provider for component delivery, concurrent overlays and cache lifetime."""
 
     instances: list[DeliveryProvider] = []
+    provider_name: ClassVar[str]
     started = asyncio.Event()
     release = asyncio.Event()
 
@@ -42,7 +43,11 @@ class DeliveryProvider:
             self.started.set()
         if mcp:
             await self.release.wait()
-        return AgentOutput(content={"answer": "done"}, raw_response=None, model="fake")
+        return AgentOutput(
+            content={"answer": f"{self.provider_name}-done"},
+            raw_response=None,
+            model=f"{self.provider_name}-model",
+        )
 
     async def close(self) -> None:
         self.closed = True
@@ -50,6 +55,8 @@ class DeliveryProvider:
 
 class CopilotDeliveryProvider(DeliveryProvider):
     """Record exactly the Copilot constructor contract."""
+
+    provider_name = "copilot"
 
     def __init__(
         self,
@@ -59,6 +66,7 @@ class CopilotDeliveryProvider(DeliveryProvider):
         tool_output: Any,
         github_token: str | None,
         temperature: float | None,
+        resolve_environment: bool = True,
     ) -> None:
         super().__init__(
             {
@@ -67,12 +75,15 @@ class CopilotDeliveryProvider(DeliveryProvider):
                 "tool_output": tool_output,
                 "github_token": github_token,
                 "temperature": temperature,
+                "resolve_environment": resolve_environment,
             }
         )
 
 
 class OpenAIDeliveryProvider(DeliveryProvider):
     """Record exactly the OpenAI constructor contract."""
+
+    provider_name = "openai"
 
     def __init__(
         self,
@@ -83,6 +94,7 @@ class OpenAIDeliveryProvider(DeliveryProvider):
         tool_output: Any,
         temperature: float | None,
         max_tokens: int | None,
+        resolve_environment: bool = True,
     ) -> None:
         super().__init__(
             {
@@ -92,12 +104,15 @@ class OpenAIDeliveryProvider(DeliveryProvider):
                 "tool_output": tool_output,
                 "temperature": temperature,
                 "max_tokens": max_tokens,
+                "resolve_environment": resolve_environment,
             }
         )
 
 
 class ClaudeDeliveryProvider(DeliveryProvider):
     """Record exactly the Claude constructor contract."""
+
+    provider_name = "claude"
 
     def __init__(
         self,
@@ -109,6 +124,7 @@ class ClaudeDeliveryProvider(DeliveryProvider):
         tool_output: Any,
         temperature: float | None,
         max_tokens: int | None,
+        resolve_environment: bool = True,
     ) -> None:
         super().__init__(
             {
@@ -119,6 +135,7 @@ class ClaudeDeliveryProvider(DeliveryProvider):
                 "tool_output": tool_output,
                 "temperature": temperature,
                 "max_tokens": max_tokens,
+                "resolve_environment": resolve_environment,
             }
         )
 

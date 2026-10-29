@@ -118,8 +118,10 @@ async def test_agent_secret_grader_and_retry_reach_actual_runner(
             tool_output: Any,
             github_token: str | None,
             temperature: float | None,
+            resolve_environment: bool = True,
         ) -> None:
             assert github_token == "model-token"
+            assert resolve_environment is False
             self.mcp_servers = mcp_servers
 
         async def execute(
