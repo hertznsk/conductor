@@ -716,6 +716,73 @@ async def test_cancellation_during_post_eof_reap_propagates(
             await asyncio.gather(task, return_exceptions=True)
 
 
+@pytest.mark.parametrize("phase", ["process_exit", "stderr"])
+@pytest.mark.parametrize(
+    ("interrupt_exit", "message"),
+    [
+        (1, "delivery failed"),
+        (0, "acknowledged without a partial result"),
+        (3, "conflicted without completing its terminal drain"),
+    ],
+)
+async def test_interrupt_is_monitored_through_post_eof_waits(
+    fake_realm: tuple[DockerRunnerBackend, Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    interrupt_exit: int,
+    message: str,
+) -> None:
+    # Requirement: delivery failure and its deadline remain observable after stdout EOF.
+    backend, _log, state = fake_realm
+    backend._cli_env["FAKE_DOCKER_SCENARIO"] = "realm-truncated"
+    lease = await backend.prepare_run(RunSpec(run_id="run_ABC-1", bundle=_bundle(tmp_path)))
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_docker = backend._run_docker
+    original_reap = docker_agent._reap
+    original_stderr = docker_agent._stderr_tail
+
+    async def run_docker(argv, **kwargs):
+        if "--interrupt" in argv:
+            return interrupt_exit, "", "delivery failed" if interrupt_exit == 1 else ""
+        return await original_docker(argv, **kwargs)
+
+    async def gated_reap(process: asyncio.subprocess.Process, *, kill: bool) -> bool:
+        if not kill:
+            entered.set()
+            await release.wait()
+        return await original_reap(process, kill=kill)
+
+    async def gated_stderr(stream: asyncio.StreamReader) -> bytes:
+        tail = await original_stderr(stream)
+        entered.set()
+        await release.wait()
+        return tail
+
+    monkeypatch.setattr(backend, "_run_docker", run_docker)
+    if phase == "process_exit":
+        monkeypatch.setattr(docker_agent, "_reap", gated_reap)
+    else:
+        monkeypatch.setattr(docker_agent, "_stderr_tail", gated_stderr)
+    if interrupt_exit != 1:
+        monkeypatch.setattr(docker_agent, "_INTERRUPT_TIMEOUT_SECONDS", 0)
+    signal = asyncio.Event()
+    task = asyncio.create_task(backend.run_agent(_spec(), lease, interrupt_signal=signal))
+    try:
+        await asyncio.wait_for(entered.wait(), 20)
+        signal.set()
+        with pytest.raises(ConfigurationError, match=message):
+            await asyncio.wait_for(task, 5)
+        assert json.loads(state.read_text(encoding="utf-8"))["containers"] == {}
+        await backend.finalize_run(lease, "failed")
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 @pytest.mark.asyncio
 async def test_interrupt_uses_second_exec_and_returns_partial(
     fake_realm: tuple[DockerRunnerBackend, Path, Path], tmp_path: Path
@@ -765,6 +832,106 @@ async def test_interrupt_uses_second_exec_and_returns_partial(
     finally:
         for writer in waiting:
             writer.close()
+        server.close()
+        await server.wait_closed()
+
+
+async def test_completed_result_does_not_send_a_late_interrupt(
+    fake_realm: tuple[DockerRunnerBackend, Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Requirement: a signal after terminal receipt cannot discard a completed result.
+    backend, log, _state = fake_realm
+    lease = await backend.prepare_run(RunSpec(run_id="run_ABC-1", bundle=_bundle(tmp_path)))
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    signal = asyncio.Event()
+    original_reap = docker_agent._reap
+
+    async def gated_reap(process: asyncio.subprocess.Process, *, kill: bool) -> bool:
+        if not kill:
+            entered.set()
+            await release.wait()
+        return await original_reap(process, kill=kill)
+
+    monkeypatch.setattr(docker_agent, "_reap", gated_reap)
+    task = asyncio.create_task(backend.run_agent(_spec(), lease, interrupt_signal=signal))
+    try:
+        await asyncio.wait_for(entered.wait(), 20)
+        signal.set()
+        # Run the signal's ready callbacks before releasing the post-terminal wait.
+        asyncio.get_running_loop().call_soon(release.set)
+        result = await asyncio.wait_for(task, 20)
+        assert result.content == {"answer": "agent"}
+        assert result.partial is False
+        assert not any("--interrupt" in row["argv"] for row in _rows(log))
+        await backend.finalize_run(lease, "succeeded")
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("partial", [False, True])
+async def test_interrupt_conflict_drains_the_racing_terminal_result(
+    fake_realm: tuple[DockerRunnerBackend, Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    partial: bool,
+) -> None:
+    # Requirement: typed HTTP 409 preserves either full or partial racing terminal output.
+    backend, _log, _state = fake_realm
+    connected = asyncio.Event()
+    release = asyncio.Event()
+    streamed = asyncio.Event()
+    original_docker = backend._run_docker
+
+    async def run_docker(argv, **kwargs):
+        if "--interrupt" in argv:
+            release.set()
+            return 3, "", "diagnostic text is not an outcome discriminator"
+        return await original_docker(argv, **kwargs)
+
+    async def handle(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        connected.set()
+        try:
+            await release.wait()
+            writer.write(b"I" if partial else b"1")
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    monkeypatch.setattr(backend, "_run_docker", run_docker)
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    task: asyncio.Task[AgentResult] | None = None
+    try:
+        backend._cli_env["FAKE_DOCKER_RELEASE_PORT"] = str(server.sockets[0].getsockname()[1])
+        lease = await backend.prepare_run(RunSpec(run_id="run_ABC-1", bundle=_bundle(tmp_path)))
+        signal = asyncio.Event()
+        task = asyncio.create_task(
+            backend.run_agent(
+                _spec(),
+                lease,
+                interrupt_signal=signal,
+                on_event=lambda _kind, _data: streamed.set(),
+            )
+        )
+        await asyncio.wait_for(streamed.wait(), 20)
+        await asyncio.wait_for(connected.wait(), 20)
+        signal.set()
+        result = await asyncio.wait_for(task, 20)
+        assert result.content == {"answer": "agent"}
+        assert result.partial is partial
+        await backend.finalize_run(lease, "succeeded")
+    finally:
+        release.set()
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         server.close()
         await server.wait_closed()
 

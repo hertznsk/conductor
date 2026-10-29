@@ -28,7 +28,7 @@ from typing import cast
 from uuid import uuid4
 
 from conductor.exceptions import ConfigurationError
-from conductor.execution.docker_agent import stream_agent
+from conductor.execution.docker_agent import InterruptOutcome, stream_agent
 from conductor.execution.docker_paths import map_agent_paths
 from conductor.execution.errors import ExecutionSpecError, WorkspaceAttachError
 from conductor.execution.types import (
@@ -352,6 +352,7 @@ class DockerRunnerBackend:
         on_event: AgentEventSink | None = None,
         interrupt_signal: asyncio.Event | None = None,
         execute_local: Callable[[], Awaitable[AgentResult]] | None = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> AgentResult:
         """Reserve one runner per active call, reusing it only after the call ends."""
         if execute_local is not None:
@@ -367,7 +368,9 @@ class DockerRunnerBackend:
         task = self._reserve_runner(lease, spec.execution)
         try:
             runner = await asyncio.shield(task)
-            result = await self._execute_agent(spec, lease, runner, on_event, interrupt_signal)
+            result = await self._execute_agent(
+                spec, lease, runner, on_event, interrupt_signal, on_dispatch
+            )
         except BaseException:
             cleanup = self._retire_runner(lease, key, task)
             if await _await_task_cleanup(cast(asyncio.Task[object], cleanup)):
@@ -533,6 +536,7 @@ class DockerRunnerBackend:
         runner: _RunnerState,
         on_event: AgentEventSink | None,
         interrupt_signal: asyncio.Event | None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> AgentResult:
         binary = self._resolved_binary()
         if binary is None:
@@ -542,7 +546,7 @@ class DockerRunnerBackend:
             raise ConfigurationError("Docker lease was not prepared by this backend")
         mapped = map_agent_paths(spec, state.run.bundle)
 
-        async def send_interrupt(execution_id: str) -> None:
+        async def send_interrupt(execution_id: str) -> InterruptOutcome:
             rc, _stdout, stderr = await self._run_docker(
                 (
                     "exec",
@@ -557,8 +561,13 @@ class DockerRunnerBackend:
                 stdin_bytes=b"",
                 timeout=15,
             )
-            if rc != 0:
-                raise ConfigurationError(f"Docker runner interrupt failed: {_bounded(stderr)}")
+            match rc:
+                case 0:
+                    return "accepted"
+                case 3:
+                    return "conflict"
+                case _:
+                    raise ConfigurationError(f"Docker runner interrupt failed: {_bounded(stderr)}")
 
         if (
             interrupt_signal is not None
@@ -567,6 +576,8 @@ class DockerRunnerBackend:
         ):
             logger.warning("Docker runner does not advertise interrupt; stopping the stream only")
             self._warned_missing_interrupt.add(runner.name)
+        if on_dispatch is not None:
+            on_dispatch()
         return await stream_agent(
             binary,
             self._cli_env,

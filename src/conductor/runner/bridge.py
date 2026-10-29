@@ -14,6 +14,8 @@ from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener
 
 _HEALTH_DEADLINE = 15.0
+# Interrupt HTTP 409 is a terminal/duplicate-signal conflict, not a delivery failure.
+INTERRUPT_CONFLICT_EXIT_CODE = 3
 
 
 def main() -> int:
@@ -66,7 +68,7 @@ def main() -> int:
     except HTTPError as exc:
         if args.interrupt is not None:
             print(f"runner interrupt HTTP {exc.code}", file=sys.stderr)
-            return 1
+            return INTERRUPT_CONFLICT_EXIT_CODE if exc.code == 409 else 1
         try:
             payload = json.loads(exc.read(65536))
             message = payload["error"]["message"]

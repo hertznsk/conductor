@@ -87,8 +87,10 @@ async def test_main_loop_interrupt_returns_partial_through_remote_realm(
             on_event: AgentEventSink | None = None,
             interrupt_signal: asyncio.Event | None = None,
             execute_local: Callable[[], Awaitable[AgentResult]] | None = None,
+            on_dispatch: Callable[[], None] | None = None,
         ) -> AgentResult:
             assert execute_local is None
+            assert on_dispatch is None
             assert lease is realm.lease
             assert interrupt_signal is interrupt
             started.set()

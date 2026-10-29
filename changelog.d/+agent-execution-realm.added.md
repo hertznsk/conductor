@@ -7,6 +7,12 @@ multi-provider execution (Copilot, OpenAI, Claude), and per-call agent-scope
 secret delivery (`env_overlay`) to stdio MCP processes without leaking into
 the runner process environment.
 
+Host-resolved credentials and endpoints stay authoritative inside the
+runner. Docker interrupt delivery remains monitored through transport
+shutdown, and a racing completion preserves its result. Retained Docker
+workspaces record agent dispatch so resume refuses a missing staging
+marker rather than overwriting agent-written files.
+
 **ACA execution profiles**: configure the pool and session scope under an
 environment profile's `aca` block, independently of the agent's model
 provider. The legacy `provider: aca` form remains available with a

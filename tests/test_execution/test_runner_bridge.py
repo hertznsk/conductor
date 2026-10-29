@@ -201,3 +201,41 @@ async def test_bridge_ready_follows_execute_registration_before_targeted_interru
         await asyncio.to_thread(server.shutdown)
         server.server_close()
         thread.join(timeout=5)
+
+
+@pytest.mark.parametrize(("status", "expected_exit"), [(409, 3), (401, 1), (404, 1), (500, 1)])
+async def test_bridge_interrupt_exit_distinguishes_conflict_from_failure(
+    status: int, expected_exit: int
+) -> None:
+    # Requirement: the host recognizes terminal conflicts by exit code, never stderr prose.
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_error(status)
+
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "conductor.runner.bridge",
+            "--port",
+            str(server.server_port),
+            "--interrupt",
+            "completed",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(process.communicate(), 20)
+        assert process.returncode == expected_exit
+        assert stdout == b""
+        assert str(status).encode() in stderr
+    finally:
+        await asyncio.to_thread(server.shutdown)
+        server.server_close()
+        thread.join(timeout=5)

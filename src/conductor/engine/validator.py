@@ -154,6 +154,7 @@ class OutputValidator:
         execution_backend: RunnerBackend | None = None,
         workspace_lease: WorkspaceLease | None = None,
         spec_factory: Callable[[AgentDef, str], AgentSpec] | None = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> ValidationOutcome:
         """Validate ``primary_output`` against ``agent.validator.criteria``.
 
@@ -201,6 +202,7 @@ class OutputValidator:
                     on_event=None,
                     interrupt_signal=interrupt_signal,
                     execute_local=None,
+                    on_dispatch=on_dispatch,
                 )
                 output = AgentExecutor.output_from_realm_result(result)
             else:

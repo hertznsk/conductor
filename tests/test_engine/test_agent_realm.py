@@ -69,8 +69,11 @@ class RecordingAgentBackend(LocalRunnerBackend):
         on_event: AgentEventSink | None = None,
         interrupt_signal: asyncio.Event | None = None,
         execute_local: Callable[[], Awaitable[AgentResult]] | None = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> AgentResult:
         assert execute_local is None
+        if on_dispatch is not None:
+            on_dispatch()
         self.specs.append(spec)
         self.leases.append(lease)
         if on_event is not None:

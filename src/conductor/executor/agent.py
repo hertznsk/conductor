@@ -417,6 +417,7 @@ class AgentExecutor:
         resolved_execution: ResolvedExecutionSpec | None = None,
         agent_env_overlay: Mapping[str, str] | None = None,
         realm_credential_resolver: Callable[[str], Mapping[str, Any] | None] | None = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> AgentOutput:
         """Execute an agent with the given context.
 
@@ -695,6 +696,7 @@ class AgentExecutor:
                 on_event=event_callback,
                 interrupt_signal=interrupt_signal,
                 execute_local=execute_local,
+                on_dispatch=on_dispatch,
             )
             assert local_output is not None
             output = local_output
@@ -723,6 +725,7 @@ class AgentExecutor:
                 on_event=on_event if event_callback is not None else None,
                 interrupt_signal=interrupt_signal,
                 execute_local=None,
+                on_dispatch=on_dispatch,
             )
             output = self.output_from_realm_result(result)
 

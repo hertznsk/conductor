@@ -185,6 +185,7 @@ class AgentRealm:
     credential_resolver: Callable[[str], Mapping[str, Any] | None]
     image: str | None
     name: str
+    on_dispatch: Callable[[], None] | None = None
 
 
 class _RealmKwargs(TypedDict, total=False):
@@ -193,6 +194,7 @@ class _RealmKwargs(TypedDict, total=False):
     resolved_execution: ResolvedExecutionSpec | None
     agent_env_overlay: Mapping[str, str]
     realm_credential_resolver: Callable[[str], Mapping[str, Any] | None]
+    on_dispatch: Callable[[], None] | None
 
 
 def _realm_kwargs(realm: AgentRealm | None) -> _RealmKwargs:
@@ -205,6 +207,7 @@ def _realm_kwargs(realm: AgentRealm | None) -> _RealmKwargs:
         "resolved_execution": realm.execution,
         "agent_env_overlay": realm.env_overlay,
         "realm_credential_resolver": realm.credential_resolver,
+        "on_dispatch": realm.on_dispatch,
     }
 
 
@@ -1989,6 +1992,9 @@ class WorkflowEngine:
             credential_resolver=self._realm_credentials_for,
             image=image,
             name=profile.backend,
+            on_dispatch=(lambda: self._execution_session.record_backend_execution(profile.backend))
+            if backend.capabilities().retained_workspace
+            else None,
         )
 
     async def _execute_script(
@@ -5721,6 +5727,7 @@ class WorkflowEngine:
                 execution_backend=realm.backend,
                 workspace_lease=realm.lease,
                 spec_factory=grader_spec,
+                on_dispatch=realm.on_dispatch,
             )
         try:
             if agent.timeout_seconds is not None:

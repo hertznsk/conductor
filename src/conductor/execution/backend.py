@@ -102,6 +102,7 @@ class RunnerBackend(Protocol):
         on_event: AgentEventSink | None = None,
         interrupt_signal: asyncio.Event | None = None,
         execute_local: Callable[[], Awaitable[AgentResult]] | None = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> AgentResult:
         """Execute one agent invocation in this backend's realm.
 
@@ -120,6 +121,8 @@ class RunnerBackend(Protocol):
             interrupt_signal: Optional signal for a graceful in-flight pause.
             execute_local: In-process invocation closure, including the provider
                 call and its event/interrupt wiring.
+            on_dispatch: Notification after pre-dispatch checks, immediately
+                before invoking the agent. Pre-dispatch failures must not call it.
 
         Returns:
             The agent result without converting cancellation into data.

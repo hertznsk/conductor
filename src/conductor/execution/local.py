@@ -127,6 +127,7 @@ class LocalRunnerBackend:
         on_event: AgentEventSink | None = None,
         interrupt_signal: asyncio.Event | None = None,
         execute_local: Callable[[], Awaitable[AgentResult]] | None = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> AgentResult:
         """Delegate an agent invocation to its in-process closure.
 
@@ -138,6 +139,8 @@ class LocalRunnerBackend:
         del spec, lease
         if execute_local is None:
             raise ConfigurationError("local agent execution requires execute_local")
+        if on_dispatch is not None:
+            on_dispatch()
         return await execute_local()
 
     async def run_command(

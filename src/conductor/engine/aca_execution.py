@@ -182,6 +182,7 @@ class AcaRunnerBackend:
         on_event: AgentEventSink | None = None,
         interrupt_signal: asyncio.Event | None = None,
         execute_local: Callable[[], Awaitable[AgentResult]] | None = None,
+        on_dispatch: Callable[[], None] | None = None,
         identifier_scope: str | None = None,
     ) -> AgentResult:
         if execute_local is not None:
@@ -214,6 +215,8 @@ class AcaRunnerBackend:
             if self.options is None and (interrupt_signal is None or not self._interrupt_available):
                 wire_version = 1
             body = agent_spec_to_wire_body(spec, protocol_version=wire_version)
+            if on_dispatch is not None:
+                on_dispatch()
             return await transport.execute_request(
                 body, identifier, interrupt_signal=interrupt_signal, on_event=on_event
             )

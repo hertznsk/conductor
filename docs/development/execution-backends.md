@@ -118,6 +118,10 @@ secret resolution and redaction; the [workflow engine](workflow-engine.md) guide
   local leases in Docker-backed runs must receive `workspace_persistence=None` in both
   `prepare_leases` and `ensure_backends`. On resume, retained identities go through
   `attach_run`, never a fresh `prepare_run` for the same backend.
+- Agent dispatch, including grading and retries, records a retained backend through
+  `run_agent(on_dispatch=...)` after staging and handshake, immediately before the
+  execute bridge starts. A checkpoint must retain that history even when the agent
+  fails, so resume refuses a missing staging marker instead of overwriting its workspace.
 - `src/conductor/engine/workspace_claim.py::WorkspaceClaim` fences concurrent resume on the
   local machine. Its advisory lock serializes acquisition and token-checked release; Windows
   locking covers the same fixed one-byte range on both operations.
@@ -184,6 +188,11 @@ secret resolution and redaction; the [workflow engine](workflow-engine.md) guide
   `RUNNER_PROTOCOL_VERSION` only for an incompatible change.
 - Wire v2 adds `execution_id`, `env_overlay`, `skill_directories`, and `custom_agents` to request payloads.
   The `/interrupt` endpoint targets specific invocations by `execution_id` without restarting the runner.
+- The Docker interrupt bridge exits 0 for an accepted signal and 3 for HTTP 409;
+  other failures remain errors. The host uses these machine outcomes, not stderr
+  text, and observes delivery plus one absolute drain deadline through stdout EOF,
+  process exit, and stderr completion. Terminal receipt stops new interrupts but
+  does not discard an already in-flight delivery outcome.
 - Credentials in `inner_provider_settings` are `SecretStr` everywhere except
   `request_to_wire_body`, the one place plaintext is produced.
 - In-container execution uses `src/conductor/runner/bridge.py` over `docker exec -i`,

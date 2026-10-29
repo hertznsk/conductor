@@ -120,6 +120,14 @@ The runner evaluates the request against its internal execution registry:
 * **409 Conflict**: The execution has already completed or previously received an interrupt signal.
 * **422 Unprocessable Entity**: The request body omitted the required `execution_id`.
 
+For Docker realms, the host stops issuing new interrupts once it receives a
+terminal result. An interrupt already in flight can race completion and return
+409; the host drains the execute stream and preserves its full or partial result.
+After either an accepted interrupt or a conflict, one 30-second deadline covers
+the remaining stream, bridge-process exit, and stderr drain. Delivery failures or
+an expired deadline fail the invocation and retire its runner. An accepted
+interrupt must produce a partial result; a conflict does not require one.
+
 ### Graceful Degradation on Older Images
 
 If a runner image does not advertise the `interrupt` feature in its `GET /health` handshake, Conductor handles interrupts by racing the stream reader against the interrupt event. When triggered, the host logs a single warning, ceases reading frames, and marks the turn as partial.

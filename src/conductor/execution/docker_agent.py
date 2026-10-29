@@ -8,7 +8,7 @@ import json
 import subprocess
 import sys
 from collections.abc import Awaitable, Callable, Mapping
-from typing import Any
+from typing import Any, Literal
 
 from conductor.exceptions import ConfigurationError, ProviderError
 from conductor.execution.agent_wire import agent_spec_to_wire_body
@@ -18,6 +18,7 @@ _MAX_FRAME_BYTES = 1024 * 1024
 _MAX_STDERR_BYTES = 8192
 _INTERRUPT_TIMEOUT_SECONDS = 30
 _BRIDGE_COMMAND = ("python", "-m", "conductor.runner.bridge")
+type InterruptOutcome = Literal["accepted", "conflict"]
 
 
 async def _reap(process: asyncio.subprocess.Process, *, kill: bool) -> bool:
@@ -74,7 +75,7 @@ async def stream_agent(
     on_event: AgentEventSink | None,
     interrupt_signal: asyncio.Event | None,
     can_interrupt: bool,
-    send_interrupt: Callable[[str], Awaitable[None]],
+    send_interrupt: Callable[[str], Awaitable[InterruptOutcome]],
 ) -> AgentResult:
     """Stream one Docker agent invocation through the runner bridge.
 
@@ -112,19 +113,53 @@ async def stream_agent(
     stderr_task = asyncio.create_task(_stderr_tail(process.stderr))
     interrupt_task: asyncio.Task[None] | None = None
     interrupt_deadline: float | None = None
+    interrupt_outcome: InterruptOutcome | None = None
+    interrupt_sending = False
+    terminal: AgentResult | None = None
     finished = False
 
     async def interrupt() -> None:
+        nonlocal interrupt_deadline, interrupt_outcome, interrupt_sending
         assert interrupt_signal is not None
         await interrupt_signal.wait()
-        await send_interrupt(spec.execution_id)
+        if terminal is not None:
+            return
+        interrupt_sending = True
+        interrupt_outcome = await send_interrupt(spec.execution_id)
+        interrupt_deadline = asyncio.get_running_loop().time() + _INTERRUPT_TIMEOUT_SECONDS
+
+    async def wait_transport[T](awaitable: Awaitable[T]) -> T:
+        """Observe interrupt delivery and its absolute deadline through every drain stage."""
+        task = asyncio.ensure_future(awaitable)
+        try:
+            if interrupt_task is not None:
+                if not interrupt_task.done():
+                    await asyncio.wait({task, interrupt_task}, return_when=asyncio.FIRST_COMPLETED)
+                if interrupt_task.done():
+                    await interrupt_task
+            if interrupt_deadline is None:
+                return await task
+            return await asyncio.wait_for(
+                task, max(0, interrupt_deadline - asyncio.get_running_loop().time())
+            )
+        except TimeoutError as exc:
+            message = (
+                "Docker runner interrupt conflicted without completing its terminal drain"
+                if interrupt_outcome == "conflict"
+                else "Docker runner interrupt was acknowledged without a partial result"
+            )
+            raise ConfigurationError(message) from exc
+        finally:
+            if task is not stderr_task:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
     try:
         body = json.dumps(agent_spec_to_wire_body(spec), ensure_ascii=True).encode("utf-8")
         process.stdin.write(body)
         await process.stdin.drain()
         process.stdin.close()
-        terminal: AgentResult | None = None
         while True:
             try:
                 if interrupt_signal is not None and not can_interrupt:
@@ -141,48 +176,10 @@ async def stream_agent(
                         read_task.cancel()
                         signal_task.cancel()
                         await asyncio.gather(read_task, signal_task, return_exceptions=True)
-                elif interrupt_task is not None and not interrupt_task.done():
-                    read_task = asyncio.create_task(process.stdout.readline())
-                    try:
-                        done, _pending = await asyncio.wait(
-                            {read_task, interrupt_task}, return_when=asyncio.FIRST_COMPLETED
-                        )
-                        if interrupt_task in done:
-                            await interrupt_task
-                            interrupt_deadline = (
-                                asyncio.get_running_loop().time() + _INTERRUPT_TIMEOUT_SECONDS
-                            )
-                        if interrupt_deadline is None:
-                            line = await read_task
-                        else:
-                            line = await asyncio.wait_for(
-                                read_task,
-                                max(0, interrupt_deadline - asyncio.get_running_loop().time()),
-                            )
-                    finally:
-                        if not read_task.done():
-                            read_task.cancel()
-                        await asyncio.gather(read_task, return_exceptions=True)
                 else:
-                    if interrupt_task is not None:
-                        await interrupt_task
-                        if interrupt_deadline is None:
-                            interrupt_deadline = (
-                                asyncio.get_running_loop().time() + _INTERRUPT_TIMEOUT_SECONDS
-                            )
-                    if interrupt_deadline is None:
-                        line = await process.stdout.readline()
-                    else:
-                        line = await asyncio.wait_for(
-                            process.stdout.readline(),
-                            max(0, interrupt_deadline - asyncio.get_running_loop().time()),
-                        )
+                    line = await wait_transport(process.stdout.readline())
             except ValueError as exc:
                 raise ConfigurationError("Docker runner emitted an oversized NDJSON frame") from exc
-            except TimeoutError as exc:
-                raise ConfigurationError(
-                    "Docker runner interrupt was acknowledged without a partial result"
-                ) from exc
             if not line:
                 break
             if len(line) > _MAX_FRAME_BYTES:
@@ -226,6 +223,10 @@ async def stream_agent(
                     session_seconds=data.get("session_seconds"),
                     partial=data.get("partial", False),
                 )
+                if interrupt_task is not None and not interrupt_sending:
+                    interrupt_task.cancel()
+                    await asyncio.gather(interrupt_task, return_exceptions=True)
+                    interrupt_task = None
             elif frame_type == "error":
                 raise ProviderError(
                     _scrub(str(data.get("message", "runner reported an error")).encode(), spec),
@@ -235,11 +236,11 @@ async def stream_agent(
                 raise ConfigurationError("Docker runner emitted an event after its terminal frame")
             elif isinstance(frame_type, str) and on_event is not None:
                 on_event(frame_type, data)
-        if interrupt_task is not None and interrupt_task.done():
+        cancelled = await wait_transport(_reap(process, kill=False))
+        stderr = await wait_transport(stderr_task)
+        if interrupt_task is not None:
             await interrupt_task
-        cancelled = await _reap(process, kill=False)
         finished = True
-        stderr = await stderr_task
         if cancelled:
             raise asyncio.CancelledError
         if process.returncode != 0:
@@ -248,7 +249,7 @@ async def stream_agent(
             )
         if terminal is None:
             raise ConfigurationError("Docker runner stream ended without a terminal frame")
-        if interrupt_deadline is not None and not terminal.partial:
+        if interrupt_outcome == "accepted" and not terminal.partial:
             raise ConfigurationError(
                 "Docker runner interrupt was acknowledged without a partial result"
             )
