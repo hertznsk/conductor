@@ -1,0 +1,104 @@
+name: Windows preflight
+run-name: Windows preflight (${{ github.ref_name }})
+
+on:
+  push:
+    tags:
+      - 'windows-preflight/*'
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    if: github.repository == 'hertznsk/conductor'
+    name: ${{ matrix.check }} (Windows, Python ${{ matrix.python }})
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - check: Test
+            python: '3.13'
+          - check: Install Scripts
+            python: '3.12'
+          - check: Web BG Smoke
+            python: '3.12'
+
+    steps:
+      - name: Read source commit from run tag
+        id: source
+        shell: pwsh
+        run: |
+          $target = [regex]::Match($env:GITHUB_REF_NAME, '^windows-preflight/([0-9a-f]{40})-[0-9]+$')
+          if (!$target.Success) {
+            throw 'Expected windows-preflight/<commit SHA>-<run ID>.'
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "sha=$($target.Groups[1].Value)"
+
+      - name: Check out the source commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.source.outputs.sha }}
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: latest
+
+      - name: Set up Python
+        run: uv python install ${{ matrix.python }}
+
+      - name: Install test dependencies
+        if: matrix.check == 'Test'
+        run: uv sync --group dev --extra claude-agent-sdk --extra telemetry
+
+      - name: Run tests with coverage
+        if: matrix.check == 'Test'
+        timeout-minutes: 20
+        run: uv run pytest -p no:cacheprovider -n 2 --dist loadfile --cov=src/conductor --cov-report=xml --cov-report=term-missing -m "not real_api and not install_scripts and not performance and not docker_integration"
+        env:
+          ANTHROPIC_API_KEY: sk-ant-test-fake-key-for-mocking
+          COPILOT_SKIP_CLI_DOWNLOAD: '1'
+
+      - name: Install dependencies for install script tests
+        if: matrix.check == 'Install Scripts'
+        run: uv sync --group dev
+
+      - name: Run install script tests
+        if: matrix.check == 'Install Scripts'
+        timeout-minutes: 10
+        run: uv run pytest -p no:cacheprovider -n 0 -m install_scripts -v
+
+      - name: Install into an isolated tool sandbox
+        if: matrix.check == 'Web BG Smoke'
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/uv-tool-dir" "$RUNNER_TEMP/uv-tool-bin-dir"
+          export UV_TOOL_DIR="$RUNNER_TEMP/uv-tool-dir"
+          export UV_TOOL_BIN_DIR="$RUNNER_TEMP/uv-tool-bin-dir"
+          echo "UV_TOOL_DIR=$UV_TOOL_DIR" >> "$GITHUB_ENV"
+          echo "$UV_TOOL_BIN_DIR" >> "$GITHUB_PATH"
+          uv tool install .
+
+      - name: Verify the background launcher
+        if: matrix.check == 'Web BG Smoke'
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          output=$(conductor run examples/wait-smoke.yaml --web-bg 2>&1) || status=$?
+          printf '%s\n' "$output"
+          if [ "$status" -ne 0 ]; then
+            echo "::error::conductor run --web-bg exited with code $status"
+            exit "$status"
+          fi
+          if grep -Eiq 'already in use|dashboard never became reachable|did not report a run record' <<<"$output"; then
+            echo "::error::The background launcher reported a startup failure."
+            exit 1
+          fi
