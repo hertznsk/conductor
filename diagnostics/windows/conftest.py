@@ -4,12 +4,15 @@ import hashlib
 import json
 import os
 import re
+import sys
 import tempfile
 from pathlib import Path
 
 import pytest
 from artifact_policy import MIB, SCHEMA, environment_sanitizer
 from diagnostic_sink import Sink
+from smoke.long_export import exported_paths
+from smoke.long_process import run_control
 
 _smoke_report: Sink | None = None
 
@@ -85,6 +88,77 @@ def pytest_sessionfinish() -> None:
             if artifact["status"] == "complete":
                 paths.append(str(root / case / name))
         paths.append(str(manifest_path))
+    long_paths = []
+    for case in ("long-w1", "long-w2"):
+        destination = root / case
+        if (destination / "manifest.json").exists():
+            long_paths.extend(exported_paths(destination))
+    assert sum(Path(path).stat().st_size for path in long_paths) <= MIB
+    assert sum(path.endswith(".jsonl") for path in long_paths) <= 8
+    paths.extend(long_paths)
     if destination := os.environ.get("GITHUB_OUTPUT"):
         with Path(destination).open("a", encoding="utf-8") as stream:
             stream.write("paths<<SMOKE_PATHS\n" + "\n".join(paths) + "\nSMOKE_PATHS\n")
+
+
+@pytest.fixture(scope="module")
+def completed_long_receipts(
+    tmp_path_factory: pytest.TempPathFactory, request: pytest.FixtureRequest
+) -> Path:
+    mode = getattr(request, "param", "pass")
+    code = {"pass": 0, "failure": 1, "internal": 3}[mode]
+    root = tmp_path_factory.mktemp("completed-long-" + mode)
+    (root / "project").mkdir()
+    (root / "artifacts").mkdir()
+    (root / "home").mkdir()
+    (root / "temp").mkdir()
+    target = root / "project" / "test_probe.py"
+    target.write_text("def test_probe():\n    assert 2 + 2 == 4\n")
+    if mode == "failure":
+        target.write_text(
+            "def test_probe():\n    raise OSError(13, 'password=private-probe-error')\n"
+        )
+    if mode == "internal":
+        (root / "project/conftest.py").write_text(
+            "def pytest_collection_modifyitems(config):\n"
+            "    if hasattr(config,'workerinput'):\n"
+            "        raise OSError(13,'password=private-probe-internal')\n"
+        )
+    with pytest.MonkeyPatch.context() as patch:
+        for key in tuple(os.environ):
+            if re.search(r"(?:TOKEN|PASSWORD|SECRET|API_KEY|CREDENTIAL|AUTH)", key, re.I):
+                patch.delenv(key)
+        for key in ("GITHUB_ENV", "GITHUB_OUTPUT"):
+            patch.setenv(key, str(root / key.lower()))
+        for key in ("XDG_CONFIG_HOME", "XDG_DATA_HOME"):
+            patch.setenv(key, str(root / "home"))
+        for key in ("HOME", "USERPROFILE", "XDG_CACHE_HOME"):
+            patch.setenv(key, str(root / "home"))
+        for key in ("TMPDIR", "TMP", "TEMP"):
+            patch.setenv(key, str(root / "temp"))
+        patch.setenv("SMOKE_EXPORT_ROOT", str(root / "export"))
+        command = [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-p",
+            "no:cacheprovider",
+            "-p",
+            "pr629_diag",
+            "-o",
+            "faulthandler_timeout=0",
+            "-q",
+            str(target),
+            "-n",
+            "2",
+            "--dist",
+            "loadfile",
+        ]
+        if code == 0:
+            assert run_control(command, root).returncode == 0
+        else:
+            with pytest.raises(AssertionError, match=f"exited with code {code}"):
+                run_control(command, root)
+    metadata = json.loads((root / "export/long-w2/manifest.json").read_bytes())
+    assert metadata["root_code"] == code and metadata["complete"] is True
+    return root

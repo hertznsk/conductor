@@ -14,6 +14,7 @@ from artifact_audit import audit
 from artifact_policy import COVERAGE_CAP, Sanitizer
 from artifact_snapshot import bounded_snapshot
 from diagnostic_sink import Sink
+from smoke.long_process import run_control
 from supervisor import pytest_argv
 
 DRIVER = Path(__file__).with_name("driver.py")
@@ -177,7 +178,7 @@ def test_long_parameter_cannot_cut_off_following_test(tmp_path: Path, workers: s
     )
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
-    result = subprocess.run(
+    result = run_control(
         [
             sys.executable,
             "-m",
@@ -196,11 +197,7 @@ def test_long_parameter_cannot_cut_off_following_test(tmp_path: Path, workers: s
             "--dist",
             "loadfile",
         ],
-        cwd=project,
-        env={**os.environ, "PR629_DIAG_DIR": str(artifacts)},
-        stdout=subprocess.DEVNULL,
-        timeout=45,
-        check=False,
+        tmp_path,
     )
     assert result.returncode == 0
     for phase in artifacts.glob("*.phase.jsonl"):
