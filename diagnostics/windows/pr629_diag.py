@@ -23,6 +23,8 @@ class Observation:
     def __init__(self) -> None:
         self.sink: Sink | None = None
         self.stack_fd: int | None = None
+        self.collection: tuple[str, ...] | None = None
+        self.indices: dict[str, int] = {}
         self.base: Record = {
             "pid": os.getpid(),
             "worker": os.environ.get("PYTEST_XDIST_WORKER", "controller"),
@@ -76,6 +78,33 @@ class Observation:
             except (OSError, ValueError, RuntimeError):
                 self.fail("stack-arm-unavailable")
 
+    def collect(self, nodeids: list[str]) -> None:
+        if len(nodeids) > 65536:
+            self.fail("collection-budget")
+            return
+        if self.collection is not None:
+            if self.collection != tuple(nodeids):
+                self.fail("collection-mismatch")
+            return
+        self.collection = tuple(nodeids)
+        self.indices = {nodeid: index for index, nodeid in enumerate(nodeids)}
+        if len(self.indices) != len(nodeids):
+            self.fail("collection-duplicate")
+            return
+        for nodeid in nodeids:
+            self.emit({"event": "collected", **self.item(nodeid)})
+        self.emit({"event": "configured", "collected": len(nodeids)})
+
+    def item(self, nodeid: str) -> Record:
+        index = self.indices.get(nodeid)
+        if index is None:
+            self.fail("item-index-unavailable")
+            return {}
+        return {
+            "item_index": index,
+            "label": nodeid.partition("[")[0].encode("utf-8")[:256].decode("utf-8", "ignore"),
+        }
+
     def threads(self, stage: str) -> None:
         for thread in threading.enumerate():
             self.emit(
@@ -113,54 +142,59 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 def pytest_collection_finish(session: pytest.Session) -> None:
-    for item in session.items:
-        OBSERVATION.emit({"event": "collected", "nodeid": item.nodeid})
-    OBSERVATION.emit({"event": "configured", "collected": len(session.items)})
+    if session.items or hasattr(session.config, "workerinput"):
+        OBSERVATION.collect([item.nodeid for item in session.items])
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_xdist_node_collection_finished(node: WorkerController, ids: list[str]) -> None:
+    OBSERVATION.collect(ids)
 
 
 @pytest.hookimpl(hookwrapper=True, tryfirst=True)
 def pytest_runtest_setup(item: pytest.Item) -> Generator[None]:
-    OBSERVATION.emit({"event": "setup.begin", "nodeid": item.nodeid})
+    OBSERVATION.emit({"event": "setup.begin", **OBSERVATION.item(item.nodeid)})
     try:
         yield
     finally:
-        OBSERVATION.emit({"event": "setup.end", "nodeid": item.nodeid})
+        OBSERVATION.emit({"event": "setup.end", **OBSERVATION.item(item.nodeid)})
 
 
 @pytest.hookimpl(hookwrapper=True, tryfirst=True)
 def pytest_runtest_call(item: pytest.Item) -> Generator[None]:
-    OBSERVATION.emit({"event": "call.begin", "nodeid": item.nodeid})
+    OBSERVATION.emit({"event": "call.begin", **OBSERVATION.item(item.nodeid)})
     try:
         yield
     finally:
-        OBSERVATION.emit({"event": "call.end", "nodeid": item.nodeid})
+        OBSERVATION.emit({"event": "call.end", **OBSERVATION.item(item.nodeid)})
 
 
 @pytest.hookimpl(hookwrapper=True, tryfirst=True)
 def pytest_runtest_teardown(item: pytest.Item) -> Generator[None]:
-    OBSERVATION.emit({"event": "teardown.begin", "nodeid": item.nodeid})
+    OBSERVATION.emit({"event": "teardown.begin", **OBSERVATION.item(item.nodeid)})
     try:
         yield
     finally:
-        OBSERVATION.emit({"event": "teardown.end", "nodeid": item.nodeid})
+        OBSERVATION.emit({"event": "teardown.end", **OBSERVATION.item(item.nodeid)})
 
 
 @pytest.hookimpl(hookwrapper=True, tryfirst=True)
 def pytest_runtest_protocol(item: pytest.Item) -> Generator[None]:
-    OBSERVATION.emit({"event": "runtest.begin", "nodeid": item.nodeid})
+    OBSERVATION.emit({"event": "runtest.begin", **OBSERVATION.item(item.nodeid)})
     try:
         yield
     finally:
-        OBSERVATION.emit({"event": "runtest.end", "nodeid": item.nodeid})
+        OBSERVATION.emit({"event": "runtest.end", **OBSERVATION.item(item.nodeid)})
 
 
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
     OBSERVATION.emit(
         {
             "event": "report",
-            "nodeid": report.nodeid,
+            **OBSERVATION.item(report.nodeid),
             "phase": report.when,
             "outcome": report.outcome,
+            "duration": report.duration,
         }
     )
 

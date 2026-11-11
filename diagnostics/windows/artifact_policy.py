@@ -1,4 +1,4 @@
-"""R3 structured-artifact policy. Actions output is deliberately outside this policy."""
+"""R8 structured-artifact policy. Actions output is deliberately outside this policy."""
 
 from __future__ import annotations
 
@@ -10,7 +10,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Final
 
-from record_schema import BOOL_FIELDS, EVENTS, INTEGER_FIELDS, NUMBER_FIELDS, STRING_FIELDS
+from record_schema import (
+    BOOL_FIELDS,
+    EVENTS,
+    INTEGER_FIELDS,
+    NUMBER_FIELDS,
+    STRING_FIELDS,
+)
 
 MIB: Final = 1024 * 1024
 RECORD_CAP: Final = 64 * 1024
@@ -20,7 +26,7 @@ STACK_CAP: Final = 16 * MIB
 COVERAGE_CAP: Final = 32 * MIB
 BUNDLE_CAP: Final = 512 * MIB
 LEVEL: Final = "PRELIMINARY_PYTHON_OS"
-SCHEMA: Final = "windows-preflight-r3"
+SCHEMA: Final = "windows-preflight-r8"
 MANDATORY_RECORDS: Final[tuple[str, ...]] = (
     "environment.jsonl",
     "supervisor.jsonl",
@@ -32,6 +38,44 @@ type Value = str | int | float | bool | None | list[str] | list[int]
 type Record = dict[str, Value]
 
 LIST_FIELDS: Final = frozenset(("argv", "cov_source", "expected_files", "affinity", "thread_ids"))
+CLOSE_FIELDS: Final = frozenset(
+    (
+        "event",
+        "sequence",
+        "monotonic",
+        "utc",
+        "identity",
+        "pid",
+        "role",
+        "status",
+        "first_exit",
+        "stage",
+        "reason",
+        "exception_type",
+        "errno",
+        "winerror",
+    )
+)
+CLOSE_TYPES: Final = frozenset(
+    (
+        "OSError",
+        "PermissionError",
+        "ProcessLookupError",
+        "FileNotFoundError",
+        "InterruptedError",
+        "BlockingIOError",
+        "TimeoutError",
+        "ChildProcessError",
+        "ConnectionError",
+        "BrokenPipeError",
+        "ConnectionAbortedError",
+        "ConnectionRefusedError",
+        "ConnectionResetError",
+        "FileExistsError",
+        "IsADirectoryError",
+        "NotADirectoryError",
+    )
+)
 
 
 @dataclass(slots=True)
@@ -108,6 +152,14 @@ class Sanitizer:
         event = raw.get("event")
         if not isinstance(event, str) or event not in EVENTS:
             raise UnsafeArtifact("unknown-event")
+        if event == "process.close_error" and (
+            set(raw) - CLOSE_FIELDS
+            or raw.get("stage") not in ("discover-duplicate", "observe-exited", "finish")
+            or raw.get("reason") != "process-handle-close-failed"
+            or raw.get("exception_type") not in CLOSE_TYPES
+            or len(json.dumps(raw).encode()) > 1024
+        ):
+            raise UnsafeArtifact("invalid-close-error")
         result: Record = {}
         for key, value in raw.items():
             if (
@@ -124,7 +176,7 @@ class Sanitizer:
                         r"[A-Za-z0-9_-]{1,80}", value
                     ):
                         raise UnsafeArtifact("invalid-diagnostic-code")
-                    result[key] = self.text(value)
+                    result[key] = self.text(value, 256 if key == "label" else FIELD_CAP)
                 case bool() if key in BOOL_FIELDS:
                     result[key] = value
                 case int() if type(value) is int and key in INTEGER_FIELDS | NUMBER_FIELDS:

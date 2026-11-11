@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -9,7 +10,13 @@ from pathlib import Path
 
 import pytest
 from artifact_policy import Sanitizer, UnsafeArtifact
-from artifact_snapshot import bounded_snapshot, coverage_snapshot, records, stack_snapshot
+from artifact_snapshot import (
+    bounded_snapshot,
+    coverage_snapshot,
+    prefix_records,
+    records,
+    stack_snapshot,
+)
 from diagnostic_sink import Sink
 
 
@@ -138,3 +145,94 @@ def test_none_stderr_and_field_cap_preserve_failure_latch(
     assert sink.emit({"event": "collected", "nodeid": "x" * 4097}) is False
     sink.close()
     assert sink.failure is not None
+
+
+@pytest.mark.parametrize(
+    "tail,reason",
+    [
+        (b'{"event":', "partial-jsonl-tail"),
+        (b"bad\n", "invalid-json"),
+        (b'{"event":"host","sequence":3,"monotonic":2}\n', "sequence-gap"),
+        (b'{"event":"host","sequence":1,"monotonic":0}\n', "timestamp-order"),
+        (b'{"event":"host","sequence":1,"monotonic":2,"handle":123}\n', "unknown-field"),
+    ],
+)
+def test_prefix_stops_at_first_invalid_record(
+    tmp_path: Path,
+    tail: bytes,
+    reason: str,
+) -> None:
+    # Requirement: corrupt/gapped/truncated streams keep only the sequential prefix, never a repair.
+    valid = b'{"event":"host","sequence":0,"monotonic":1}\n'
+    path = tmp_path / "prefix.jsonl"
+    path.write_bytes(
+        valid + tail + b'{"event":"exit","sequence":2,"monotonic":3}\n'
+        if reason != "partial-jsonl-tail"
+        else valid + tail
+    )
+    result = prefix_records(path, Sanitizer({}))
+    assert result.content == valid and result.records_consumed == 1
+    assert result.validated_bytes == len(valid)
+    assert result.discarded_tail_bytes == path.stat().st_size - len(valid)
+    assert result.error_counts == {reason: 1}
+    assert result.sha256 == hashlib.sha256(valid).hexdigest()
+    assert result.right_censored and not result.terminal_event_seen
+    with pytest.raises(UnsafeArtifact):
+        records(path.read_bytes(), Sanitizer({}))
+
+
+def test_prefix_race_discards_entire_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Requirement: racing metadata invalidates all measurements with one read and no retry.
+    path = tmp_path / "racing.jsonl"
+    path.write_bytes(b'{"event":"host","sequence":0,"monotonic":1}\n')
+    original = Path.stat
+    calls = 0
+
+    def racing_stat(target: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        nonlocal calls
+        result = original(target, follow_symlinks=follow_symlinks)
+        if target == path and follow_symlinks:
+            calls += 1
+            if calls == 2:
+                with path.open("ab") as stream:
+                    stream.write(b"x")
+                result = original(target, follow_symlinks=follow_symlinks)
+        return result
+
+    monkeypatch.setattr(Path, "stat", racing_stat)
+    result = prefix_records(path, Sanitizer({}))
+    assert calls == 2 and not result.content
+    assert result.measurement_status == "unavailable"
+    assert result.error_counts == {"racing-snapshot": 1}
+
+
+def test_prefix_byte_cap_preserves_only_valid_bounded_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Requirement: the input cap is a censor boundary, not permission to publish oversized input.
+    path = tmp_path / "capped.jsonl"
+    valid = b'{"event":"host","sequence":0,"monotonic":1}\n'
+    path.write_bytes(valid * 2)
+    monkeypatch.setattr("artifact_snapshot.LOG_CAP", len(valid))
+    result = prefix_records(path, Sanitizer({}))
+    assert result.content == valid and result.error_counts == {"input-cap": 1}
+    assert result.discarded_tail_bytes == len(valid) and result.right_censored
+
+
+@pytest.mark.parametrize(
+    "field,value", [("error", "private"), ("handle", 123), ("exception_type", "SecretCustomError")]
+)
+def test_close_error_policy_refuses_raw_exception_fields(field: str, value: str | int) -> None:
+    # Requirement: close failures exclude exception text, native handles and arbitrary classes.
+    raw = {
+        "event": "process.close_error",
+        "stage": "finish",
+        "reason": "process-handle-close-failed",
+        "exception_type": "OSError",
+        field: value,
+    }
+    with pytest.raises(UnsafeArtifact, match="invalid-close-error"):
+        Sanitizer({}).record(raw)

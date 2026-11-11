@@ -92,7 +92,7 @@ def supervise(command: list[str], artifacts: Path, budget: Budget) -> int:
         try:
             # This binding precedes the first poll/wait/reap on POSIX.
             identity = Identity.child(child)
-            ledger = Ledger(identity)
+            ledger = Ledger(identity, events)
             events.emit(identity.record("binding"))
         except BindingError as error:
             observer_failed = True
@@ -208,6 +208,16 @@ def supervise(command: list[str], artifacts: Path, budget: Budget) -> int:
                 events.emit({"event": "observer.error", "reason": "final-observation-unavailable"})
         post.emit(
             {
+                **(
+                    ledger.cleanup()
+                    if ledger is not None
+                    else {
+                        "close_errors_count": 0,
+                        "close_errors_recorded": 0,
+                        "close_error_evidence_complete": False,
+                        "observer_cleanup_status": "unknown",
+                    }
+                ),
                 "event": "post.end",
                 "root_code": root_code,
                 "complete": lifecycle,
@@ -219,6 +229,16 @@ def supervise(command: list[str], artifacts: Path, budget: Budget) -> int:
         )
         events.emit(
             {
+                **(
+                    ledger.cleanup()
+                    if ledger is not None
+                    else {
+                        "close_errors_count": 0,
+                        "close_errors_recorded": 0,
+                        "close_error_evidence_complete": False,
+                        "observer_cleanup_status": "unknown",
+                    }
+                ),
                 "event": "exit",
                 "root_code": root_code,
                 "interrupted": cancelled,

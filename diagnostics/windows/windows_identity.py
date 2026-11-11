@@ -43,6 +43,7 @@ class WindowsIdentity:
         self.handle = handle
         self.owned = owned
         self.closed = False
+        self.close_error: OSError | None = None
         self.kernel = kernel_api()
         self.pid = self.kernel.GetProcessId(handle)
         if not self.pid:
@@ -90,6 +91,9 @@ class WindowsIdentity:
 
     def close(self) -> None:
         if self.owned and not self.closed:
+            if self.close_error is not None:
+                raise self.close_error
             if not self.kernel.CloseHandle(self.handle):
-                raise ctypes.WinError(ctypes.get_last_error())
+                self.close_error = ctypes.WinError(ctypes.get_last_error())
+                raise self.close_error
             self.closed = True

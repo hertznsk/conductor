@@ -78,7 +78,8 @@ def pytest_sessionfinish() -> None:
             name = artifact["path"]
             assert re.fullmatch(
                 r"\d+-(?:controller|gw\d+)\.(?:phase\.jsonl|stack\.txt)|"
-                r"(?:environment|supervisor|processes|post-root|step)\.jsonl|coverage\.xml",
+                r"(?:environment|supervisor|processes|post-root|step)\.jsonl|coverage\.xml|"
+                r"(?:resource|timing)-summary\.json",
                 name,
             )
             if artifact["status"] == "complete":

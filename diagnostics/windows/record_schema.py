@@ -1,6 +1,28 @@
 """Finite field and event vocabulary for service-owned structured records."""
 
-from typing import Final
+from dataclasses import dataclass, field
+from typing import Final, TypedDict
+
+
+class OpenPhase(TypedDict):
+    item_index: int
+    phase: str
+    begin: float
+    observed_until: float | None
+
+
+@dataclass(slots=True)
+class TimingWorker:
+    """Accumulate bounded timing reductions for one clock domain."""
+
+    clock: str
+    phase_wall_seconds: dict[str, float] = field(default_factory=dict)
+    phase_intervals: dict[str, list[float]] = field(default_factory=dict)
+    reported_duration_sum: dict[str, float] = field(default_factory=dict)
+    completed_outcomes: dict[str, int] = field(default_factory=dict)
+    open_phases: list[OpenPhase] = field(default_factory=list)
+    last_active_item_index: int | None = None
+
 
 STRING_FIELDS: Final = frozenset(
     {
@@ -45,6 +67,9 @@ STRING_FIELDS: Final = frozenset(
         "lock_hash",
         "error",
         "policy",
+        "label",
+        "exception_type",
+        "observer_cleanup_status",
     }
 )
 
@@ -84,6 +109,12 @@ INTEGER_FIELDS: Final = frozenset(
         "exited",
         "live",
         "unavailable",
+        "item_index",
+        "sample_id",
+        "errno",
+        "winerror",
+        "close_errors_count",
+        "close_errors_recorded",
     }
 )
 
@@ -105,6 +136,9 @@ NUMBER_FIELDS: Final = frozenset(
         "step_budget",
         "grace",
         "durations_min",
+        "duration",
+        "cpu_total",
+        "cpu_idle",
     }
 )
 
@@ -123,6 +157,7 @@ BOOL_FIELDS: Final = frozenset(
         "uploaded",
         "observer_failed",
         "budget_exhausted",
+        "close_error_evidence_complete",
     }
 )
 
@@ -154,6 +189,7 @@ EVENTS: Final = frozenset(
         "launch",
         "binding",
         "observer.error",
+        "process.close_error",
         "process",
         "sample",
         "host",

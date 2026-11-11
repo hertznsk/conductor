@@ -16,7 +16,10 @@ from pathlib import Path
 import psutil
 import pytest
 from artifact_audit import audit
+from artifact_policy import Sanitizer
+from diagnostic_sink import Sink
 from process_identity import Identity, State
+from process_samples import Ledger
 from smoke.support import read_records, stop_owned, wait_until
 from windows_identity import WindowsIdentity, kernel_api, popen_handle
 
@@ -196,3 +199,68 @@ def test_setup_receipt_matches_real_source_checkout_and_service() -> None:
             if record["event"] == "version" and isinstance(package := record.get("package"), str)
         }
     )
+
+
+def test_owned_close_is_idempotent_and_borrowed_root_stays_usable() -> None:
+    # Requirement: only owned handles close, once; the Popen borrowed handle stays usable.
+    assert sys.platform == "win32"
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import sys;sys.stdin.buffer.read(1)"], stdin=subprocess.PIPE
+    )
+    owned = WindowsIdentity.descendant(child.pid)
+    borrowed = WindowsIdentity.child(child)
+    try:
+        assert child.stdin is not None
+        child.stdin.close()
+        assert child.wait(timeout=5) == 0
+        assert owned.exited()
+        owned.close()
+        assert owned.closed and owned.close_error is None
+        owned.close()
+        borrowed.close()
+        assert not borrowed.closed and borrowed.kernel.GetProcessId(borrowed.handle) == child.pid
+    finally:
+        owned.close()
+        stop_owned([child], time.monotonic() + 5)
+
+
+def test_protected_exited_handle_has_terminal_failed_close(tmp_path: Path) -> None:
+    # Requirement: real PROTECT_FROM_CLOSE refusal preserves exit and never retries a handle value.
+    assert sys.platform == "win32"
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import sys;sys.stdin.buffer.read(1)"], stdin=subprocess.PIPE
+    )
+    native = WindowsIdentity.descendant(child.pid)
+    identity = Identity(child.pid, psutil.Process(child.pid).create_time(), native, role="gw0")
+    sink = Sink(tmp_path / "supervisor.jsonl", Sanitizer({}))
+    api = native.kernel
+    api.SetHandleInformation.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD]
+    api.SetHandleInformation.restype = wintypes.BOOL
+    try:
+        assert child.stdin is not None
+        child.stdin.close()
+        assert child.wait(timeout=5) == 0
+        assert identity.observe() == State.EXITED
+        assert api.SetHandleInformation(native.handle, 2, 2)
+        ledger = Ledger(identity, sink)
+        ledger.observe(sink)
+        assert not ledger.failed and not native.closed
+        failure = native.close_error
+        assert failure is not None and failure.winerror is not None
+        # Remove protection before the repeated call: retrying now would incorrectly succeed.
+        assert api.SetHandleInformation(native.handle, 2, 0)
+        with pytest.raises(OSError) as caught:
+            native.close()
+        assert caught.value is failure and not native.closed
+        assert ledger.finish(sink) and ledger.close_errors_count == 1
+        assert ledger.cleanup()["observer_cleanup_status"] == "close-error"
+        errors = [r for r in read_records(sink.path) if r["event"] == "process.close_error"]
+        assert len(errors) == 1 and errors[0]["first_exit"] == identity.first_exit
+        assert errors[0]["winerror"] == failure.winerror
+    finally:
+        try:
+            assert api.SetHandleInformation(native.handle, 2, 0)
+            assert api.CloseHandle(native.handle)
+        finally:
+            sink.close()
+            stop_owned([child], time.monotonic() + 5)

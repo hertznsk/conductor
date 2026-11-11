@@ -98,7 +98,12 @@ def test_production_argv_runs_selection_coverage_and_audit(
     assert configured["faulthandler_zero"] is True
     assert configured["cov_source"] == ["src/conductor"]
     for events in phases:
-        assert not any("test_excluded" in event.get("nodeid", "") for event in events)
+        assert not any("test_excluded" in event.get("label", "") for event in events)
+        assert all("nodeid" not in event for event in events)
+        assert [r["item_index"] for r in events if r["event"] == "collected"] == [0, 1]
+        assert all(
+            isinstance(r["duration"], (int, float)) for r in events if r["event"] == "report"
+        )
     executed = {
         events[0]["worker"]
         for events in phases
@@ -134,6 +139,10 @@ def test_production_argv_runs_selection_coverage_and_audit(
     assert manifest["root_outcome"]["root_code"] == result.returncode
     assert manifest["raw_channel"]["uploaded_as_diagnostic_artifact"] is False
     assert manifest["raw_channel"]["service_redaction"] == "not_performed"
+    assert set(manifest["comparison_evidence"]) == {"resources", "timing"}
+    assert manifest["comparison_evidence"]["resources"]["status"] == "insufficient-samples"
+    for name in ("resource-summary.json", "timing-summary.json"):
+        assert 0 < (staging / name).stat().st_size <= 1024 * 1024
     assert not any(
         "stdout" in item["path"] or "stderr" in item["path"] for item in manifest["artifacts"]
     )
@@ -148,3 +157,81 @@ def test_production_argv_runs_selection_coverage_and_audit(
         json.loads((tmp_path / "refused/manifest.json").read_text())["root_outcome"]["root_code"]
         == result.returncode
     )
+
+
+@pytest.mark.parametrize("workers", ["1", "2"])
+def test_long_parameter_cannot_cut_off_following_test(tmp_path: Path, workers: str) -> None:
+    # Requirement: long secret-like parameters never enter diagnostics or stop subsequent records.
+    project = tmp_path / "project"
+    project.mkdir()
+    target = project / "test_long.py"
+    target.write_text(
+        "import pytest\n"
+        "@pytest.mark.parametrize('value', ['token=private-' + 'q' * 40000, *range(7228)])\n"
+        "def test_parameter(value):\n    assert value is not None\n"
+        "def test_following():\n    assert True\n"
+    )
+    (project / "test_more.py").write_text(
+        "import pytest\n@pytest.mark.parametrize('value', range(7229))\n"
+        "def test_more(value):\n    assert value >= 0\n"
+    )
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-p",
+            "no:cacheprovider",
+            "-p",
+            "pr629_diag",
+            "-o",
+            "faulthandler_timeout=0",
+            "-q",
+            str(target),
+            str(project / "test_more.py"),
+            "-n",
+            workers,
+            "--dist",
+            "loadfile",
+        ],
+        cwd=project,
+        env={**os.environ, "PR629_DIAG_DIR": str(artifacts)},
+        stdout=subprocess.DEVNULL,
+        timeout=45,
+        check=False,
+    )
+    assert result.returncode == 0
+    for phase in artifacts.glob("*.phase.jsonl"):
+        events = [json.loads(line) for line in phase.read_text().splitlines()]
+        assert events[-1]["event"] == "unconfigure.end"
+        assert sum(r["event"] == "collected" for r in events) == 14459
+        assert [r["item_index"] for r in events if r["event"] == "collected"] == list(range(14459))
+        if events[0]["worker"] == "controller":
+            assert sum(r["event"] == "report" and r["phase"] == "teardown" for r in events) == 14459
+        assert "private-" not in phase.read_text() and "q" * 4096 not in phase.read_text()
+    assert not list(artifacts.glob("*.failure"))
+
+
+@pytest.mark.parametrize("fault", ["mismatch", "overflow"])
+def test_collection_identity_refuses_mismatch_and_overflow(tmp_path: Path, fault: str) -> None:
+    # Requirement: unequal collections and oversized identity tables cannot claim completeness.
+    program = (
+        "import pr629_diag as p,sys;"
+        "p.OBSERVATION.collect(['test_a.py::test_a[token=private-parameter]']);"
+        "p.OBSERVATION.collect(['test_a.py::test_b'] if sys.argv[1]=='mismatch' else ['x']*65537);"
+        "assert p.OBSERVATION.sink.failure is not None"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", program, fault],
+        env={**os.environ, "PR629_DIAG_DIR": str(tmp_path)},
+        timeout=5,
+        check=False,
+    )
+    assert result.returncode == 0
+    phase = next(tmp_path.glob("*.phase.jsonl"))
+    text = phase.read_text()
+    events = [json.loads(line) for line in text.splitlines()]
+    assert events[-1]["reason"] == "collection-" + ("mismatch" if fault == "mismatch" else "budget")
+    assert "private-parameter" not in text and "nodeid" not in text

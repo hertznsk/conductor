@@ -30,8 +30,16 @@ from artifact_policy import (
     UnsafeArtifact,
     environment_sanitizer,
 )
-from artifact_snapshot import Parsed, bounded_snapshot, coverage_snapshot, records, stack_snapshot
+from artifact_snapshot import (
+    Parsed,
+    bounded_snapshot,
+    coverage_snapshot,
+    prefix_records,
+    records,
+    stack_snapshot,
+)
 from audit_contract import assess
+from comparison_summary import summarize_resources, summarize_timing
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,7 +152,86 @@ def audit(source: Path, staging: Path) -> bool:
                     source_bytes=source_bytes,
                 )
             )
-    assessment = assess(summaries, [phase.name for phase in phase_paths])
+    prefixes = {
+        name: prefix_records(source / name, sanitizer)
+        for name in expected
+        if not name.startswith("private/") and name != "step.jsonl"
+    }
+    outcome_summaries: dict[str, Parsed] = {}
+    for name in ("supervisor.jsonl", "post-root.jsonl"):
+        if name not in summaries and prefixes[name].content:
+            try:
+                _, outcome_summaries[name] = records(prefixes[name].content, sanitizer)
+            except UnsafeArtifact:
+                # Only validated whole records may corroborate a root outcome.
+                continue
+    assessment = assess(summaries, [phase.name for phase in phase_paths], outcome_summaries)
+    comparisons = {}
+    for label, reducer, selected in (
+        (
+            "resources",
+            summarize_resources,
+            {
+                k: v
+                for k, v in prefixes.items()
+                if k in ("supervisor.jsonl", "processes.jsonl", "post-root.jsonl")
+            },
+        ),
+        (
+            "timing",
+            summarize_timing,
+            {
+                k: v
+                for k, v in prefixes.items()
+                if k == "supervisor.jsonl" or k.endswith(".phase.jsonl")
+            },
+        ),
+    ):
+        summary = reducer(selected, sanitizer)
+        payload = json.dumps(asdict(summary), sort_keys=True).encode()
+        filename = ("resource" if label == "resources" else "timing") + "-summary.json"
+        try:
+            if len(payload) > MIB:
+                raise UnsafeArtifact("comparison-summary-cap")
+            if total + len(payload) > BUNDLE_CAP - MIB:
+                raise UnsafeArtifact("bundle-cap")
+            sanitizer.published(payload.decode(), MIB)
+            destination = staging / filename
+            destination.write_bytes(payload)
+            paths.append(str(destination))
+            total += len(payload)
+            inventory.append(
+                Artifact(
+                    filename,
+                    "comparison",
+                    "complete",
+                    len(payload),
+                    hashlib.sha256(payload).hexdigest(),
+                )
+            )
+            comparisons[label] = {
+                "status": summary.measurement_status,
+                "reasons": summary.reasons,
+                "bounds": summary.bounds,
+                "path": filename,
+            }
+        except UnsafeArtifact as error:
+            complete = False
+            inventory.append(
+                Artifact(
+                    filename,
+                    "comparison",
+                    "withheld",
+                    reason=error.reason,
+                    source_bytes=len(payload),
+                )
+            )
+            comparisons[label] = {
+                "status": "unavailable",
+                "reasons": [error.reason],
+                "bounds": summary.bounds,
+                "path": filename,
+            }
     complete = complete and assessment.structured_complete and not any(source.glob("*.failure"))
     lifecycle = assessment.lifecycle_complete
     root, provenance, timeline = assessment.root, assessment.provenance, assessment.timeline
@@ -220,6 +307,10 @@ def audit(source: Path, staging: Path) -> bool:
         "expected_roles": sorted(required_roles),
         "missing_roles": sorted(assessment.missing_roles),
         "physical_timeline": timeline,
+        **assessment.cleanup,
+        "close_errors": assessment.close_errors,
+        "diagnostic_warnings": ["exited-process-close-failed"] if assessment.close_warning else [],
+        "comparison_evidence": comparisons,
         "artifacts": [asdict(item) for item in inventory],
         "published_bytes": total,
         "budgets": {
@@ -235,16 +326,60 @@ def audit(source: Path, staging: Path) -> bool:
         "Actions output is not sanitized by this service. Private spool is uncapped.",
     }
     payload = json.dumps(manifest, indent=2).encode()
-    if len(payload) > MIB:
-        raise UnsafeArtifact("manifest-cap")
+    manifest_path = str(staging / "manifest.json")
+    output_receipt = (
+        "paths<<DIAGNOSTIC_PATHS\n" + "\n".join([*paths, manifest_path]) + "\nDIAGNOSTIC_PATHS\n"
+    )
+    if len(payload) > MIB or total + len(payload) + len(output_receipt.encode()) > BUNDLE_CAP:
+        # Nothing outside the explicit path receipt is uploaded. Leave owned staging bytes private.
+        reason = "manifest-cap" if len(payload) > MIB else "bundle-cap"
+        complete = False
+        counts = {
+            status: sum(item.status == status for item in inventory)
+            for status in ("complete", "withheld", "missing", "error", "not-applicable")
+        }
+        manifest = {
+            "schema": SCHEMA,
+            "level": LEVEL,
+            "native_capture": "disabled",
+            "full_C6": "unmet",
+            "full_C7": "unmet",
+            "structured_artifacts_complete": False,
+            "observed_lifecycle_complete": lifecycle,
+            "root_outcome": root,
+            "provenance": {
+                key: provenance.get(key)
+                for key in ("scope", "sha", "tree", "checkout_head", "service_sha", "service_head")
+            },
+            "publication_failure": reason,
+            "published_bytes": 0,
+            "source_artifact_counts": counts,
+            "artifact_details_omitted": len(inventory),
+            "artifacts": [
+                asdict(Artifact(item["path"], "comparison", "withheld", reason=reason))
+                for item in comparisons.values()
+            ],
+            "comparison_evidence": {
+                key: {
+                    "status": "unavailable",
+                    "reasons": [reason],
+                    "bounds": value["bounds"],
+                    "path": value["path"],
+                }
+                for key, value in comparisons.items()
+            },
+            "budgets": {"manifest": MIB, "bundle": BUNDLE_CAP},
+        }
+        paths = []
+        payload = json.dumps(manifest, indent=2).encode()
+        output_receipt = "paths<<DIAGNOSTIC_PATHS\n" + manifest_path + "\nDIAGNOSTIC_PATHS\n"
     sanitizer.published(payload.decode(), MIB)
     temporary = staging / "manifest.pending"
     temporary.write_bytes(payload)
     temporary.replace(staging / "manifest.json")
-    paths.append(str(staging / "manifest.json"))
     if output := os.environ.get("GITHUB_OUTPUT"):
-        with Path(output).open("a", encoding="utf-8") as stream:
-            stream.write("paths<<DIAGNOSTIC_PATHS\n" + "\n".join(paths) + "\nDIAGNOSTIC_PATHS\n")
+        with Path(output).open("ab") as stream:
+            stream.write(output_receipt.encode("utf-8"))
     return complete and lifecycle
 
 
