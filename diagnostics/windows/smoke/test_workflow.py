@@ -19,6 +19,27 @@ WORKFLOW = Path(
 BASE = "101e7e9fdb2c9dbd64d9721e14318ca66ecf4a32"
 
 
+def test_diagnostic_checkout_fetches_baseline_history() -> None:
+    # Requirement: service checkout retains baseline history before isolated source checkout.
+    workflow = YAML(typ="safe").load(WORKFLOW)
+    steps = workflow["jobs"]["windows"]["steps"]
+    named_steps = {step["name"]: step for step in steps}
+    service = named_steps["Check out diagnostic service scripts"]
+    materialize = named_steps["Materialize diagnostics outside the source checkout"]
+    source = named_steps["Check out the source commit"]
+
+    assert service["uses"] == "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+    assert type(service["with"]["fetch-depth"]) is int
+    assert service["with"]["fetch-depth"] == 0
+    assert service["with"]["ref"] == "${{ github.sha }}"
+    assert service["with"]["path"] == ".windows-preflight-service"
+    assert service["with"]["persist-credentials"] is False
+    assert service["if"] == ("matrix.check == 'Test' && steps.source.outputs.diagnostic == 'true'")
+    assert steps.index(service) < steps.index(materialize) < steps.index(source)
+    assert source["with"]["ref"] == "${{ steps.source.outputs.sha }}"
+    assert source["with"]["persist-credentials"] is False
+
+
 def test_diagnostic_finalization_uses_valid_status_and_audited_upload() -> None:
     # Requirement: valid cancellation status and guarded finalization preserve audited uploads.
     workflow = YAML(typ="safe").load(WORKFLOW)
