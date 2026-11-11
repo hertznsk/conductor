@@ -29,13 +29,53 @@ jobs:
     steps:
       - name: Read source commit from run tag
         id: source
+        shell: python
+        run: |
+          import os
+          import re
+          import time
+          target = re.fullmatch(
+              r'^windows-preflight/([0-9a-f]{40})-([0-9]+)(?:-diag-w([12])(-tail)?)?$',
+              os.environ['GITHUB_REF_NAME'],
+          )
+          if target is None:
+              raise SystemExit('Expected windows-preflight/<SHA>-<digits>[-diag-w1|-diag-w2].')
+          if target[4]:
+              raise SystemExit('The -tail suffix is reserved and is not enabled.')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f'sha={target[1]}\n')
+              output.write(f'diagnostic={str(target[3] is not None).lower()}\n')
+              output.write(f'workers={target[3] or "2"}\n')
+          if target[3] and (job_environment := os.environ.get('GITHUB_ENV')):
+              with open(job_environment, 'a', encoding='utf-8') as environment:
+                  environment.write(f'DIAG_JOB_START={time.time()}\n')
+
+      - name: Check out diagnostic service scripts
+        if: matrix.check == 'Test' && steps.source.outputs.diagnostic == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: .windows-preflight-service
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Materialize diagnostics outside the source checkout
+        if: matrix.check == 'Test' && steps.source.outputs.diagnostic == 'true'
         shell: pwsh
         run: |
-          $target = [regex]::Match($env:GITHUB_REF_NAME, '^windows-preflight/([0-9a-f]{40})-[0-9]+$')
-          if (!$target.Success) {
-            throw 'Expected windows-preflight/<commit SHA>-<run ID>.'
+          $destination = Join-Path $env:RUNNER_TEMP 'windows-preflight-diagnostic'
+          New-Item -ItemType Directory -Path "$destination/artifacts" -Force | Out-Null
+          $env:GIT_MASTER = '1'
+          $serviceHead = git -C '.windows-preflight-service' rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $serviceHead -ne $env:GITHUB_SHA) {
+            throw 'Diagnostic service checkout does not match the run SHA.'
           }
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "sha=$($target.Groups[1].Value)"
+          $serviceHead | Set-Content "$destination/artifacts/service-checkout-head.txt"
+          Copy-Item '.windows-preflight-service/diagnostics/windows/*' $destination -Recurse
+          Copy-Item '.windows-preflight-service/.github/workflows/windows-preflight.yml' "$destination/service-workflow.yml"
+          git -C '.windows-preflight-service' show '101e7e9fdb2c9dbd64d9721e14318ca66ecf4a32:.github/workflows/windows-preflight.yml' |
+            Set-Content "$destination/ordinary-workflow.yml" -Encoding utf8
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Check out the source commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -56,12 +96,98 @@ jobs:
         run: uv sync --group dev --extra claude-agent-sdk --extra telemetry
 
       - name: Run tests with coverage
-        if: matrix.check == 'Test'
+        if: matrix.check == 'Test' && steps.source.outputs.diagnostic != 'true'
         timeout-minutes: 20
         run: uv run pytest -p no:cacheprovider -n 2 --dist loadfile --cov=src/conductor --cov-report=xml --cov-report=term-missing -m "not real_api and not install_scripts and not performance and not docker_integration"
         env:
           ANTHROPIC_API_KEY: sk-ant-test-fake-key-for-mocking
           COPILOT_SKIP_CLI_DOWNLOAD: '1'
+
+      - name: Record diagnostic environment
+        if: matrix.check == 'Test' && steps.source.outputs.diagnostic == 'true'
+        shell: pwsh
+        timeout-minutes: 2
+        env:
+          DIAG_SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          DIAG_SERVICE_SHA: ${{ github.sha }}
+          DIAG_WORKERS: ${{ steps.source.outputs.workers }}
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'windows-preflight-diagnostic'
+          uv run python "$root/receipt.py"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify the diagnostic service on hosted Windows
+        id: hosted_smoke
+        if: matrix.check == 'Test' && steps.source.outputs.diagnostic == 'true'
+        timeout-minutes: 4
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'windows-preflight-diagnostic'
+          $env:PYTHONPATH = $root
+          $env:PYTHONDONTWRITEBYTECODE = '1'
+          $env:SMOKE_EXPORT_ROOT = "$root/smoke-published"
+          $env:SERVICE_WORKFLOW_CURRENT = "$root/service-workflow.yml"
+          $env:SERVICE_WORKFLOW_BASE = "$root/ordinary-workflow.yml"
+          & "$env:GITHUB_WORKSPACE/.venv/Scripts/python.exe" -m pytest -p no:cacheprovider "$root/smoke" "$root/hosted" --basetemp="$root/smoke-state" -v
+          exit $LASTEXITCODE
+
+      - name: Upload hosted smoke evidence
+        if: always() && matrix.check == 'Test' && steps.source.outputs.diagnostic == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-diagnostic-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.hosted_smoke.outputs.paths }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Run diagnostic tests with coverage
+        id: diagnostic_test
+        if: matrix.check == 'Test' && steps.source.outputs.diagnostic == 'true'
+        timeout-minutes: 20
+        shell: pwsh
+        env:
+          ANTHROPIC_API_KEY: sk-ant-test-fake-key-for-mocking
+          COPILOT_SKIP_CLI_DOWNLOAD: '1'
+          DIAG_WORKERS: ${{ steps.source.outputs.workers }}
+        run: |
+          $remaining = 1800 - ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0 - [double]$env:DIAG_JOB_START)
+          if ($remaining -lt 1440) {
+            throw 'Insufficient job budget for a full 20-minute Test and bounded finalization.'
+          }
+          $env:DIAG_STEP_START = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0
+          uv run python "$env:RUNNER_TEMP/windows-preflight-diagnostic/supervisor.py"
+          exit $LASTEXITCODE
+
+      - name: Record diagnostic step outcome
+        if: always() && matrix.check == 'Test' && steps.source.outputs.diagnostic == 'true'
+        shell: pwsh
+        timeout-minutes: 1
+        env:
+          DIAG_STEP_OUTCOME: ${{ steps.diagnostic_test.outcome }}
+          DIAG_CANCELLED: ${{ cancelled() }}
+        run: |
+          $artifacts = "$env:RUNNER_TEMP/windows-preflight-diagnostic/artifacts"
+          New-Item -ItemType Directory -Path $artifacts -Force | Out-Null
+          uv run python "$env:RUNNER_TEMP/windows-preflight-diagnostic/step_receipt.py"
+          exit $LASTEXITCODE
+
+      - name: Audit diagnostic evidence independently
+        id: audit
+        if: always() && matrix.check == 'Test' && steps.source.outputs.diagnostic == 'true'
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          uv run python "$env:RUNNER_TEMP/windows-preflight-diagnostic/artifact_audit.py"
+          exit $LASTEXITCODE
+
+      - name: Upload diagnostic evidence
+        if: always() && matrix.check == 'Test' && steps.source.outputs.diagnostic == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-diagnostic-w${{ steps.source.outputs.workers }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.audit.outputs.paths }}
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Install dependencies for install script tests
         if: matrix.check == 'Install Scripts'
