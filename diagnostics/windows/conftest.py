@@ -1,5 +1,6 @@
 """Keep nested pytest/xdist state inside the explicitly selected smoke basetemp."""
 
+import hashlib
 import json
 import os
 import re
@@ -58,6 +59,15 @@ def pytest_sessionfinish() -> None:
     _smoke_report.close()
     root = Path(os.environ["SMOKE_EXPORT_ROOT"])
     paths = [str(root / "smoke-report.jsonl")]
+    for topology in ("parent", "chain"):
+        for mode in ("natural", "live", "interrupted"):
+            receipt = root / f"peer-{topology}-{mode}.jsonl"
+            if receipt.exists():
+                digest = receipt.with_suffix(".sha256")
+                assert (
+                    digest.read_text().strip() == hashlib.sha256(receipt.read_bytes()).hexdigest()
+                )
+                paths.extend((str(receipt), str(digest)))
     for case in ("w1-pass", "w2-pass", "w1-fail", "w2-fail"):
         manifest_path = root / case / "manifest.json"
         if not manifest_path.exists():
