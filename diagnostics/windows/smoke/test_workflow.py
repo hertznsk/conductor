@@ -19,6 +19,27 @@ WORKFLOW = Path(
 BASE = "101e7e9fdb2c9dbd64d9721e14318ca66ecf4a32"
 
 
+def test_diagnostic_finalization_uses_valid_status_and_audited_upload() -> None:
+    # Requirement: valid cancellation status and guarded finalization preserve audited uploads.
+    workflow = YAML(typ="safe").load(WORKFLOW)
+    steps = workflow["jobs"]["windows"]["steps"]
+    named_steps = {step["name"]: step for step in steps}
+    receipt = named_steps["Record diagnostic step outcome"]
+    audit = named_steps["Audit diagnostic evidence independently"]
+    upload = named_steps["Upload diagnostic evidence"]
+
+    assert receipt["env"]["DIAG_CANCELLED"] == "${{ job.status == 'cancelled' }}"
+    assert receipt["env"]["DIAG_STEP_OUTCOME"] == "${{ steps.diagnostic_test.outcome }}"
+    for step in (receipt, audit, upload):
+        assert step["if"] == (
+            "always() && matrix.check == 'Test' && steps.source.outputs.diagnostic == 'true'"
+        )
+    assert audit["id"] == "audit"
+    assert upload["with"]["path"] == "${{ steps.audit.outputs.paths }}"
+    assert upload["with"]["if-no-files-found"] == "error"
+    assert steps.index(receipt) < steps.index(audit) < steps.index(upload)
+
+
 @pytest.mark.parametrize(
     ("suffix", "code", "diagnostic", "workers"),
     [

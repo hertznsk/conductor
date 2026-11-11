@@ -164,7 +164,7 @@ jobs:
         timeout-minutes: 1
         env:
           DIAG_STEP_OUTCOME: ${{ steps.diagnostic_test.outcome }}
-          DIAG_CANCELLED: ${{ cancelled() }}
+          DIAG_CANCELLED: ${{ job.status == 'cancelled' }}
         run: |
           $artifacts = "$env:RUNNER_TEMP/windows-preflight-diagnostic/artifacts"
           New-Item -ItemType Directory -Path $artifacts -Force | Out-Null
