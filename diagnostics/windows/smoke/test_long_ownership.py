@@ -13,7 +13,7 @@ import psutil
 import pytest
 from artifact_policy import Sanitizer, UnsafeArtifact
 from diagnostic_sink import Sink
-from smoke import long_process
+from smoke import long_ownership, long_process
 from smoke.long_diagnostics import control_note
 from smoke.long_export import checked_control
 from smoke.long_records import control_records
@@ -47,6 +47,7 @@ def run_fault(root: Path, patch: pytest.MonkeyPatch, mode: str) -> tuple[str, li
     target.write_text("def test_probe():\n    assert True\n")
     real_popen, real_process, real_glob = subprocess.Popen, psutil.Process, Path.glob
     real_bind, real_close = ProcessProbe.bind, ProcessProbe.close
+    real_acquire = long_ownership.CreatorBindings.acquire
     peer = real_popen(
         [sys.executable, "-c", "import sys;sys.stdin.buffer.read(1)"], stdin=subprocess.PIPE
     )
@@ -58,6 +59,8 @@ def run_fault(root: Path, patch: pytest.MonkeyPatch, mode: str) -> tuple[str, li
         args: list[str], *, cwd: Path, env: Mapping[str, str], stdout: int
     ) -> subprocess.Popen[bytes]:
         nonlocal root_pid
+        child = real_popen(args, cwd=cwd, env=env, stdout=stdout)
+        root_pid = child.pid
         path = root / "long-control-private/0-unknown.jsonl"
         if mode in ("empty", "invalid", "many"):
             path.write_bytes(b"not-json\n" if mode == "invalid" else b"")
@@ -73,7 +76,7 @@ def run_fault(root: Path, patch: pytest.MonkeyPatch, mode: str) -> tuple[str, li
                     "stage": "startup",
                     "status": "live",
                     "pid": peer.pid,
-                    "parent": os.getpid(),
+                    "parent": root_pid if mode in ("bind", "key", "close") else os.getpid(),
                     "created": peer_probe.created + (mode == "birth"),
                     "identity": peer_probe.key
                     if mode not in ("key", "close")
@@ -84,8 +87,6 @@ def run_fault(root: Path, patch: pytest.MonkeyPatch, mode: str) -> tuple[str, li
                 }
             )
             sink.close()
-        child = real_popen(args, cwd=cwd, env=env, stdout=stdout)
-        root_pid = child.pid
         return child
 
     def ordered(path: Path, pattern: str):
@@ -124,12 +125,12 @@ def run_fault(root: Path, patch: pytest.MonkeyPatch, mode: str) -> tuple[str, li
             return Candidate()
         return real_process(pid)
 
-    def bind(process) -> ProcessProbe:
+    def acquire(owner, process, created) -> ProcessProbe:
         if process.pid == peer.pid:
             events.append("bind")
             if mode == "bind":
                 raise PermissionError(13, "password=private-bind")
-        return real_bind(process)
+        return real_acquire(owner, process, created)
 
     def close(probe: ProcessProbe) -> None:
         real_close(probe)
@@ -143,13 +144,13 @@ def run_fault(root: Path, patch: pytest.MonkeyPatch, mode: str) -> tuple[str, li
             owned.setattr(subprocess, "Popen", launch)
             owned.setattr(Path, "glob", ordered)
             owned.setattr(
-                long_process,
+                long_ownership,
                 "psutil",
                 SimpleNamespace(
                     Process=lookup, NoSuchProcess=psutil.NoSuchProcess, Error=psutil.Error
                 ),
             )
-            owned.setattr(ProcessProbe, "bind", bind)
+            owned.setattr(long_ownership.CreatorBindings, "acquire", acquire)
             owned.setattr(ProcessProbe, "close", close)
             with pytest.raises(UnsafeArtifact) as caught:
                 long_process.run_control(command(target), root)
@@ -190,7 +191,8 @@ def test_actual_owner_branch_retains_first_fault(
 ) -> None:
     # Requirement: actual refusals retain their first discriminator without query reordering.
     note, events = run_fault(tmp_path, monkeypatch, mode)
-    assert "outcome=normal:0 cleanup=false error=ownership-unavailable" in note
+    error = "cleanup-close-failed" if mode == "close" else "ownership-unavailable"
+    assert f"outcome=normal:0 cleanup=false error={error}" in note
     scan = "final" if mode == "empty" else "run"
     assert f"owner={scan}:{stage}:" in note
     if mode == "birth":

@@ -15,9 +15,10 @@ from artifact_policy import UnsafeArtifact, environment_sanitizer
 from smoke.long_diagnostics import OwnershipFailure, render_note
 from smoke.long_export import checked_control, publish
 from smoke.long_manifest import ControlResult, Normal, Outcome, Timeout, Unknown
+from smoke.long_ownership import CreatorBindings
 from smoke.long_protocol import CASE_PROCESSES, PROCESS_CAP
 from smoke.long_records import control_records
-from smoke.support import ProcessProbe, stop_owned
+from smoke.support import stop_owned
 
 
 def run_control(
@@ -37,7 +38,7 @@ def run_control(
     }
     observed_command = [*command, "-p", "smoke.long_probe"]
     child: subprocess.Popen[bytes] | None = None
-    probes: dict[str, ProcessProbe] = {}
+    owner: CreatorBindings | None = None
     slots: dict[Path, bytes | None] = {}
     overflow = False
     ownership: list[str] = []
@@ -81,35 +82,22 @@ def run_control(
                 slots[path] = None
                 first = control_records(first_line, environment_sanitizer()).startup
                 role = first.role
-                pid, created, identity = first.pid, first.created, first.identity
                 if scan != "run" or time.monotonic() >= end or child.returncode is not None:
                     raise UnsafeArtifact("startup-not-bound-before-stop")
-                if identity in probes:
-                    continue
-                stage = "process-lookup"
-                process = psutil.Process(pid)
-                stage = "birth-query"
-                actual_created = process.create_time()
-                stage = "birth-check"
-                if actual_created != created:
+                if first.role not in ("controller", *(f"gw{i}" for i in range(workers))):
                     raise UnsafeArtifact("ownership-mismatch")
-                stage = "parent-query"
-                actual_parent = process.ppid()
-                stage = "parent-check"
-                if actual_parent != child.pid:
-                    raise UnsafeArtifact("ownership-mismatch")
-                stage = "bind"
-                if time.monotonic() >= end or child.returncode is not None:
+                if owner is None:
                     raise UnsafeArtifact("startup-not-bound-before-stop")
-                probe = ProcessProbe.bind(process)
-                native_bound = probe.native is not None
-                stage = "key-check"
-                if probe.key != identity:
-                    stage = "candidate-close"
-                    probe.close()
-                    stage = "key-check"
-                    raise UnsafeArtifact("ownership-mismatch")
-                probes[identity] = probe
+                refusal = owner.admit(
+                    first, OwnershipFailure(scan, stage, role, read_bytes, line_complete)
+                )
+                if refusal is not None:
+                    code, failure = refusal
+                    ownership.append(code)
+                    if first_failure is None:
+                        first_failure = failure
+                    else:
+                        further_failures = min(CASE_PROCESSES, further_failures + 1)
             except psutil.NoSuchProcess:
                 slots[path] = None
                 # A self-recorded identity whose PID is already absent is not a cleanup target.
@@ -129,8 +117,7 @@ def run_control(
             observed_command, cwd=root / "project", env=env, stdout=subprocess.DEVNULL
         )
         end = time.monotonic() + seconds
-        root_probe = ProcessProbe.bind(psutil.Process(child.pid))
-        probes[root_probe.key] = root_probe
+        owner = CreatorBindings(child, end)
         while True:
             capture()
             remaining = end - time.monotonic()
@@ -148,26 +135,30 @@ def run_control(
     finally:
         primary = sys.exception()
         deferred: KeyboardInterrupt | None = None
-        cleanup_errors: list[str] = []
+        cleanup_errors = owner.errors if owner is not None else []
+        if owner is not None:
+            owner.sealed = True
         deadline = time.monotonic() + 3
         try:
             if child is not None:
                 stop_owned(
                     [child],
                     deadline,
-                    [p.process for p in probes.values() if p.process.pid != child.pid],
+                    [node.probe.process for node in owner.nodes.values() if node.kind == "source"]
+                    if owner is not None
+                    else [],
                 )
-            for probe in probes.values():
-                if probe.record("cleanup")["status"] != "proved-exited":
-                    cleanup_errors.append("cleanup-unconfirmed")
         except (OSError, psutil.Error, AssertionError, UnsafeArtifact):
             cleanup_errors.append("cleanup-unavailable")
         finally:
-            for probe in probes.values():
+            if owner is not None:
                 try:
-                    probe.close()
-                except OSError:
-                    cleanup_errors.append("cleanup-close-failed")
+                    owner.finish(deadline)
+                except KeyboardInterrupt as error:
+                    if primary is None:
+                        primary = deferred = error
+                    else:
+                        primary.add_note("Secondary KeyboardInterrupt during owned cleanup.")
         try:
             capture("final")
         except KeyboardInterrupt as error:

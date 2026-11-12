@@ -18,6 +18,7 @@ from smoke.long_export import exported_paths
 from smoke.long_process import run_control
 
 _smoke_report: Sink | None = None
+_smoke_output: str | None = None
 
 
 @pytest.fixture(autouse=True)
@@ -40,11 +41,17 @@ def isolated_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def pytest_sessionstart() -> None:
-    global _smoke_report
+    global _smoke_report, _smoke_output
+    _smoke_report = None
+    _smoke_output = os.environ.get("GITHUB_OUTPUT")
     if destination := os.environ.get("SMOKE_EXPORT_ROOT"):
         root = Path(destination)
         root.mkdir(exist_ok=True)
         _smoke_report = Sink(root / "smoke-report.jsonl", environment_sanitizer(), MIB)
+        # Keep the bounded report reachable even if final export cannot finish.
+        if _smoke_output and _smoke_report.fd is not None:
+            with Path(_smoke_output).open("a", encoding="utf-8") as stream:
+                stream.write(f"paths<<SMOKE_PATHS\n{_smoke_report.path}\nSMOKE_PATHS\n")
 
 
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
@@ -60,10 +67,13 @@ def pytest_runtest_logreport(report: pytest.TestReport) -> None:
 
 
 def pytest_sessionfinish() -> None:
-    if _smoke_report is None:
+    global _smoke_report, _smoke_output
+    report, output = _smoke_report, _smoke_output
+    _smoke_report, _smoke_output = None, None
+    if report is None:
         return
-    _smoke_report.close()
-    root = Path(os.environ["SMOKE_EXPORT_ROOT"])
+    report.close()
+    root = report.path.parent
     paths = [str(root / "smoke-report.jsonl")]
     for topology in ("parent", "chain"):
         for mode in ("natural", "live", "interrupted"):
@@ -99,8 +109,8 @@ def pytest_sessionfinish() -> None:
     assert sum(Path(path).stat().st_size for path in long_paths) <= MIB
     assert sum(path.endswith(".jsonl") for path in long_paths) <= 8
     paths.extend(long_paths)
-    if destination := os.environ.get("GITHUB_OUTPUT"):
-        with Path(destination).open("a", encoding="utf-8") as stream:
+    if output:
+        with Path(output).open("a", encoding="utf-8") as stream:
             stream.write("paths<<SMOKE_PATHS\n" + "\n".join(paths) + "\nSMOKE_PATHS\n")
 
 

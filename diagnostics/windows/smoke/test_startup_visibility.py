@@ -11,7 +11,7 @@ from pathlib import Path
 
 import psutil
 import pytest
-from smoke import long_process
+from smoke import long_ownership, long_process
 from smoke.long_export import checked_control
 from smoke.support import ProcessProbe, stop_owned
 from smoke.test_long_ownership import command, run_fault
@@ -92,6 +92,7 @@ def test_real_startup_commits_before_single_semantic_attempt(
     events = []
     real_open, real_popen = Path.open, subprocess.Popen
     real_parse, real_bind = long_process.control_records, ProcessProbe.bind
+    real_acquire = long_ownership.CreatorBindings.acquire
 
     class Stream:
         def __init__(self, stream):
@@ -133,10 +134,10 @@ def test_real_startup_commits_before_single_semantic_attempt(
             events.append(["parse", len(data), data.endswith(b"\n")])
         return result
 
-    def bound(process):
+    def acquired(owner, process, created):
         if peers and process.pid == peers[0].process.pid:
             events.append(["bind", process.pid, released.is_set()])
-        return real_bind(process)
+        return real_acquire(owner, process, created)
 
     with socket.socket() as server:
         server.bind(("127.0.0.1", 0))
@@ -162,7 +163,7 @@ def test_real_startup_commits_before_single_semantic_attempt(
                 patch.setattr(Path, "open", opened)
                 patch.setattr(subprocess, "Popen", spawned)
                 patch.setattr(long_process, "control_records", parsed)
-                patch.setattr(ProcessProbe, "bind", bound)
+                patch.setattr(long_ownership.CreatorBindings, "acquire", acquired)
                 reader.start()
                 args = command(target) + ["-p", "writer_schedule"]
                 with pytest.raises(AssertionError):
@@ -172,13 +173,13 @@ def test_real_startup_commits_before_single_semantic_attempt(
             assert released.is_set() and (project / "body.ready").exists()
             assert children[0].returncode == 1 and metadata["root_code"] == 1
             assert all(c.terminal for c in view.controls)
-            if direct[0]:
+            if direct[0] or os.name == "nt":
                 assert metadata["cleanup_complete"] and metadata["complete"]
             else:
                 assert not metadata["cleanup_complete"]
                 assert metadata["error"] == "ownership-unavailable"
             assert len([e for e in events if e[0] == "parse"]) == 1
-            assert len([e for e in events if e[0] == "bind"]) == int(direct[0])
+            assert len([e for e in events if e[0] == "bind"]) == int(direct[0] or os.name == "nt")
             assert any(e[0] == "read" and not e[2] for e in events)
             assert all(e[2] for e in events if e[0] == "bind")
             (tmp_path / "barrier-proof.json").write_text(

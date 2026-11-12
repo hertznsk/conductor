@@ -73,11 +73,12 @@ def controller(root: Path, mode: str) -> None:
     if mode.endswith("publication"):
         (root / "long-export").mkdir()
         (root / "long-export/long-w1").write_bytes(b"blocked")
-    roots, held, grants, closes, stops, reads, barriers = [], [], [], [], [], [], []
+    roots, held, owners, closes, stops, reads, barriers = [], [], [], [], [], [], []
     first = secondary = active = caught = root_birth = None
     pending = root / "long-control-private/0-pending.jsonl"
     real_spawn, real_open = subprocess.Popen, Path.open
     real_bind, real_close, real_stop = ProcessProbe.bind, ProcessProbe.close, source.stop_owned
+    real_init = source.CreatorBindings.__init__
 
     def snapshot():
         try:
@@ -89,7 +90,7 @@ def controller(root: Path, mode: str) -> None:
             "root_code": roots[0].returncode,
             "peer": held[0].record("before-rescue")["status"],
             "peer_os_state": peer_state,
-            "grants": grants.copy(),
+            "grants": {n.probe.process.pid: n.kind for o in owners for n in o.nodes.values()},
             "closes": closes.copy(),
             "stops": stops.copy(),
             "eof": (root / "worker.eof").exists(),
@@ -203,10 +204,9 @@ def controller(root: Path, mode: str) -> None:
                 return Reader(real_open(path, *args, **kwargs))
             return real_open(path, *args, **kwargs)
 
-        def bound(process):
-            result = real_bind(process)
-            grants.append(process.pid)
-            return result
+        def initialized(owner, child, end):
+            real_init(owner, child, end)
+            owners.append(owner)
 
         def closed(probe):
             real_close(probe)
@@ -224,7 +224,7 @@ def controller(root: Path, mode: str) -> None:
             with (
                 patch.object(subprocess, "Popen", launch),
                 patch.object(Path, "open", opened),
-                patch.object(ProcessProbe, "bind", bound),
+                patch.object(source.CreatorBindings, "__init__", initialized),
                 patch.object(ProcessProbe, "close", closed),
                 patch.object(source, "stop_owned", stopped),
             ):

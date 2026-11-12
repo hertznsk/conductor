@@ -115,7 +115,7 @@ def assert_repaired(row) -> None:
     assert row["peer"] == "proved-exited"
     assert len(row["stops"]) == 1
     assert 0 < row["stops"][0]["deadline"] - row["stops"][0]["at"] <= 3
-    assert sorted(row["grants"]) == sorted(row["closes"])
+    assert sorted(map(int, row["grants"])) == sorted(row["closes"])
     repeat = row["mode"] in ("repeat", "bound", "repeat-publication")
     if repeat:
         assert any(r["scan"] == "final" and r["bytes"] == 0 for r in row["reads"])
@@ -124,7 +124,7 @@ def assert_repaired(row) -> None:
         first, second = row["sender"]["events"]
         assert first["stage"] == "wait-timeout" and second["stage"] == "final-empty-read"
         assert len(second["stops"]) == 1 and not second["root_live"]
-        assert sorted(second["grants"]) == sorted(second["closes"])
+        assert sorted(map(int, second["grants"])) == sorted(second["closes"])
         secondary_notes = [n for n in row["notes"] if "KeyboardInterrupt" in n and "final" in n]
         assert len(secondary_notes) == 1 and "password=" not in secondary_notes[0]
     elif row["mode"] == "normal1":
@@ -139,7 +139,7 @@ def assert_repaired(row) -> None:
         assert "owner=final:read:" in row["note"] and ":OSError:5:" in row["note"]
     if row["mode"] == "late":
         assert any(r["scan"] == "final" and r["bytes"] > 0 for r in row["reads"])
-    granted_peer = row["worker"]["pid"] in row["grants"]
+    granted_peer = row["grants"].get(str(row["worker"]["pid"])) == "source"
     assert granted_peer == (row["mode"] == "bound")
     assert row["stops"][0]["peers"] == ([row["worker"]["pid"]] if granted_peer else [])
     if not granted_peer:
