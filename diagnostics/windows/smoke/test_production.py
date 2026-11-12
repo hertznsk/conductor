@@ -166,10 +166,19 @@ def test_long_parameter_cannot_cut_off_following_test(tmp_path: Path, workers: s
     project = tmp_path / "project"
     project.mkdir()
     target = project / "test_long.py"
+    (project / "pytest.ini").write_text(
+        "[pytest]\ndisable_test_id_escaping_and_forfeit_all_rights_to_community_support=True\n"
+    )
     target.write_text(
         "import pytest\n"
-        "@pytest.mark.parametrize('value', ['token=private-' + 'q' * 40000, *range(7228)])\n"
-        "def test_parameter(value):\n    assert value is not None\n"
+        "@pytest.mark.parametrize('value', ['token=private-' + 'q' * 40000, *range(7228)],"
+        f"ids=['token=private-id-' + {ascii(chr(0x4E00))}*11000, *map(str,range(7228))])\n"
+        "def test_parameter(value, request):\n    assert value is not None\n"
+        "    if isinstance(value,str):\n"
+        "        assert value == 'token=private-' + 'q'*40000\n"
+        "        assert len(request.node.nodeid.encode('utf-8')) > 32*1024\n"
+        "        full='PYTEST_CURRENT_TEST='+request.node.nodeid+' (teardown)'\n"
+        "        assert len(full.encode('utf-16-le'))//2 < 16000\n"
         "def test_following():\n    assert True\n"
     )
     (project / "test_more.py").write_text(

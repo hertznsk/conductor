@@ -38,23 +38,29 @@ def run_control(
     observed_command = [*command, "-p", "smoke.long_probe"]
     child: subprocess.Popen[bytes] | None = None
     probes: dict[str, ProcessProbe] = {}
-    attempted: set[Path] = set()
+    slots: dict[Path, bytes | None] = {}
+    overflow = False
     ownership: list[str] = []
     outcome: Outcome = Unknown()
     first_failure: OwnershipFailure | None = None
     further_failures = 0
 
     def capture(scan: str = "run") -> None:
-        nonlocal first_failure, further_failures
+        nonlocal first_failure, further_failures, overflow
         if child is None:
             return
-        for path in islice(private.glob("*.jsonl"), CASE_PROCESSES + 1):
-            if path in attempted:
+        candidates = dict.fromkeys((*slots, *islice(private.glob("*.jsonl"), CASE_PROCESSES + 1)))
+        for path in candidates:
+            if path not in slots:
+                if len(slots) == CASE_PROCESSES:
+                    if not overflow:
+                        ownership.append("ownership-count-cap")
+                        overflow = True
+                    continue
+                slots[path] = b""
+            prefix = slots[path]
+            if prefix is None:
                 continue
-            attempted.add(path)
-            if len(attempted) > CASE_PROCESSES:
-                ownership.append("ownership-count-cap")
-                return
             stage, role = "open", "unknown"
             read_bytes, line_complete, native_bound = None, None, None
             try:
@@ -63,9 +69,21 @@ def run_control(
                     first_line = stream.readline(PROCESS_CAP + 1)
                 read_bytes, line_complete = len(first_line), first_line.endswith(b"\n")
                 stage = "startup-parse"
+                if read_bytes > PROCESS_CAP:
+                    raise UnsafeArtifact("oversize")
+                if not first_line.startswith(prefix):
+                    raise UnsafeArtifact("startup-prefix-changed")
+                if not line_complete:
+                    if scan != "run" or time.monotonic() >= end or child.returncode is not None:
+                        raise UnsafeArtifact("startup-not-bound-before-stop")
+                    slots[path] = first_line
+                    continue
+                slots[path] = None
                 first = control_records(first_line, environment_sanitizer()).startup
                 role = first.role
                 pid, created, identity = first.pid, first.created, first.identity
+                if scan != "run" or time.monotonic() >= end or child.returncode is not None:
+                    raise UnsafeArtifact("startup-not-bound-before-stop")
                 if identity in probes:
                     continue
                 stage = "process-lookup"
@@ -81,6 +99,8 @@ def run_control(
                 if actual_parent != child.pid:
                     raise UnsafeArtifact("ownership-mismatch")
                 stage = "bind"
+                if time.monotonic() >= end or child.returncode is not None:
+                    raise UnsafeArtifact("startup-not-bound-before-stop")
                 probe = ProcessProbe.bind(process)
                 native_bound = probe.native is not None
                 stage = "key-check"
@@ -91,9 +111,11 @@ def run_control(
                     raise UnsafeArtifact("ownership-mismatch")
                 probes[identity] = probe
             except psutil.NoSuchProcess:
+                slots[path] = None
                 # A self-recorded identity whose PID is already absent is not a cleanup target.
                 continue
             except (OSError, psutil.Error, UnsafeArtifact) as error:
+                slots[path] = None
                 ownership.append("ownership-unavailable")
                 if first_failure is None:
                     first_failure = OwnershipFailure(
@@ -125,10 +147,10 @@ def run_control(
         return subprocess.CompletedProcess(observed_command, normal)
     finally:
         primary = sys.exception()
+        deferred: KeyboardInterrupt | None = None
         cleanup_errors: list[str] = []
         deadline = time.monotonic() + 3
         try:
-            capture("final")
             if child is not None:
                 stop_owned(
                     [child],
@@ -146,6 +168,16 @@ def run_control(
                     probe.close()
                 except OSError:
                     cleanup_errors.append("cleanup-close-failed")
+        try:
+            capture("final")
+        except KeyboardInterrupt as error:
+            ownership.append("ownership-unavailable")
+            if primary is None:
+                primary = deferred = error
+            else:
+                primary.add_note("Secondary KeyboardInterrupt during final startup observation.")
+        except (OSError, psutil.Error, AssertionError, UnsafeArtifact):
+            cleanup_errors.append("cleanup-unavailable")
         complete = False
         publication_error: BaseException | None = None
         result = ControlResult(
@@ -186,3 +218,5 @@ def run_control(
                 if note is not None:
                     failure.add_note(note)
                 raise failure
+        if deferred is not None:
+            raise deferred

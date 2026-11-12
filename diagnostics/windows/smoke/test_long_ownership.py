@@ -168,7 +168,7 @@ def run_fault(root: Path, patch: pytest.MonkeyPatch, mode: str) -> tuple[str, li
 @pytest.mark.parametrize(
     ("mode", "stage", "reason"),
     [
-        ("empty", "startup-parse", "long-startup-missing"),
+        ("empty", "startup-parse", "startup-not-bound-before-stop"),
         ("invalid", "startup-parse", "invalid-json"),
         ("birth", "birth-check", "ownership-mismatch"),
         ("parent", "parent-check", "ownership-mismatch"),
@@ -178,7 +178,7 @@ def run_fault(root: Path, patch: pytest.MonkeyPatch, mode: str) -> tuple[str, li
         ("close", "candidate-close", "none"),
         ("subclass", "birth-query", "none"),
         ("unsafe", "birth-query", "other-unsafe"),
-        ("many", "startup-parse", "long-startup-missing"),
+        ("many", "startup-parse", "invalid-json"),
     ],
 )
 def test_actual_owner_branch_retains_first_fault(
@@ -191,15 +191,16 @@ def test_actual_owner_branch_retains_first_fault(
     # Requirement: actual refusals retain their first discriminator without query reordering.
     note, events = run_fault(tmp_path, monkeypatch, mode)
     assert "outcome=normal:0 cleanup=false error=ownership-unavailable" in note
-    assert f"owner=run:{stage}:" in note
+    scan = "final" if mode == "empty" else "run"
+    assert f"owner={scan}:{stage}:" in note
     if mode == "birth":
         assert events == ["lookup", "birth"]
     if mode == "parent":
         assert events == ["lookup", "birth", "parent"]
     if mode == "empty":
-        assert ":long-startup-missing:0:false:unknown:" in note
+        assert ":startup-not-bound-before-stop:0:false:unknown:" in note
     if mode == "many":
-        assert ":long-startup-missing:0:false:unknown:more=3" in note
+        assert ":invalid-json:9:true:unknown:more=3" in note
     if mode == "subclass":
         assert ":unknown:unknown:unknown:none:" in note
     assert f":{reason}:" in note

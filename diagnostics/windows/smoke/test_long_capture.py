@@ -33,6 +33,9 @@ def test_long_failure_and_timeout_publish_safe_evidence(
         "{'pid':p.pid,'created':p.create_time()}))\n"
     )
     target = project / "test_probe.py"
+    (project / "pytest.ini").write_text(
+        "[pytest]\ndisable_test_id_escaping_and_forfeit_all_rights_to_community_support=True\n"
+    )
     body = (
         "    raise OSError(13, 'password=private-probe-exception')\n"
         if mode == "failure"
@@ -40,8 +43,15 @@ def test_long_failure_and_timeout_publish_safe_evidence(
     )
     target.write_text(
         "import pathlib,threading,pytest\n"
-        "@pytest.mark.parametrize('value',['token=private-probe-parameter'+'z'*40000])\n"
-        "def test_probe(value):\n" + body
+        "@pytest.mark.parametrize('value',['token=private-probe-parameter'+'z'*40000],"
+        f"ids=['token=private-id-'+{ascii(chr(0x4E00))}*11000])\n"
+        "def test_probe(value):\n" + body + "@pytest.fixture(autouse=True)\n"
+        "def check_identity(request):\n"
+        "    assert request.node.callspec.params['value']=="
+        "'token=private-probe-parameter'+'z'*40000\n"
+        "    assert len(request.node.nodeid.encode('utf-8')) > 32*1024\n"
+        "    full='PYTEST_CURRENT_TEST='+request.node.nodeid+' (teardown)'\n"
+        "    assert len(full.encode('utf-16-le'))//2 < 16000\n"
     )
     command = [
         sys.executable,

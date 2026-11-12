@@ -29,6 +29,8 @@ OWNER_REASONS = frozenset(
         "sequence-gap",
         "long-identity-invalid",
         "ownership-mismatch",
+        "startup-prefix-changed",
+        "startup-not-bound-before-stop",
     )
 )
 OWNER_TYPES = tuple(getattr(builtins, name) for name in CLOSE_TYPES) + (
