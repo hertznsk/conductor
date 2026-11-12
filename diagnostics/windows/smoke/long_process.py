@@ -6,12 +6,13 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from itertools import islice
 from pathlib import Path
 
 import psutil
 from artifact_policy import UnsafeArtifact, environment_sanitizer
-from smoke.long_diagnostics import render_note
+from smoke.long_diagnostics import OwnershipFailure, render_note
 from smoke.long_export import checked_control, publish
 from smoke.long_manifest import ControlResult, Normal, Outcome, Timeout, Unknown
 from smoke.long_protocol import CASE_PROCESSES, PROCESS_CAP
@@ -40,8 +41,11 @@ def run_control(
     attempted: set[Path] = set()
     ownership: list[str] = []
     outcome: Outcome = Unknown()
+    first_failure: OwnershipFailure | None = None
+    further_failures = 0
 
-    def capture() -> None:
+    def capture(scan: str = "run") -> None:
+        nonlocal first_failure, further_failures
         if child is None:
             return
         for path in islice(private.glob("*.jsonl"), CASE_PROCESSES + 1):
@@ -51,26 +55,52 @@ def run_control(
             if len(attempted) > CASE_PROCESSES:
                 ownership.append("ownership-count-cap")
                 return
+            stage, role = "open", "unknown"
+            read_bytes, line_complete, native_bound = None, None, None
             try:
                 with path.open("rb") as stream:
+                    stage = "read"
                     first_line = stream.readline(PROCESS_CAP + 1)
+                read_bytes, line_complete = len(first_line), first_line.endswith(b"\n")
+                stage = "startup-parse"
                 first = control_records(first_line, environment_sanitizer()).startup
+                role = first.role
                 pid, created, identity = first.pid, first.created, first.identity
                 if identity in probes:
                     continue
+                stage = "process-lookup"
                 process = psutil.Process(pid)
-                if process.create_time() != created or process.ppid() != child.pid:
+                stage = "birth-query"
+                actual_created = process.create_time()
+                stage = "birth-check"
+                if actual_created != created:
                     raise UnsafeArtifact("ownership-mismatch")
+                stage = "parent-query"
+                actual_parent = process.ppid()
+                stage = "parent-check"
+                if actual_parent != child.pid:
+                    raise UnsafeArtifact("ownership-mismatch")
+                stage = "bind"
                 probe = ProcessProbe.bind(process)
+                native_bound = probe.native is not None
+                stage = "key-check"
                 if probe.key != identity:
+                    stage = "candidate-close"
                     probe.close()
+                    stage = "key-check"
                     raise UnsafeArtifact("ownership-mismatch")
                 probes[identity] = probe
             except psutil.NoSuchProcess:
                 # A self-recorded identity whose PID is already absent is not a cleanup target.
                 continue
-            except (OSError, psutil.Error, UnsafeArtifact):
+            except (OSError, psutil.Error, UnsafeArtifact) as error:
                 ownership.append("ownership-unavailable")
+                if first_failure is None:
+                    first_failure = OwnershipFailure(
+                        scan, stage, role, read_bytes, line_complete, native_bound
+                    ).caused_by(error)
+                else:
+                    further_failures = min(CASE_PROCESSES, further_failures + 1)
 
     try:
         child = subprocess.Popen(
@@ -98,7 +128,7 @@ def run_control(
         cleanup_errors: list[str] = []
         deadline = time.monotonic() + 3
         try:
-            capture()
+            capture("final")
             if child is not None:
                 stop_owned(
                     [child],
@@ -128,15 +158,20 @@ def run_control(
         except (OSError, UnsafeArtifact, ValueError) as error:
             publication_error = error
         note = None
+        detail = (
+            replace(first_failure, additional=further_failures)
+            if first_failure is not None
+            else None
+        )
         if primary is not None or publication_error is not None or not complete:
             view = None
             category = "publication-refused" if publication_error is not None else "checked"
             try:
                 if publication_error is None:
                     view = checked_control(destination)
-                note = render_note(result, view, category)
+                note = render_note(result, view, category, ownership=detail)
             except (OSError, ValueError, TypeError, UnsafeArtifact):
-                note = render_note(result, None, "summary-unavailable")
+                note = render_note(result, None, "summary-unavailable", ownership=detail)
             if primary is not None:
                 primary.add_note(note)
         if publication_error is not None or not complete:
