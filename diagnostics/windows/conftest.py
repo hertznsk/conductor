@@ -6,11 +6,14 @@ import os
 import re
 import sys
 import tempfile
+from collections.abc import Generator
 from pathlib import Path
 
 import pytest
+from _pytest.capture import CaptureManager
 from artifact_policy import MIB, SCHEMA, environment_sanitizer
 from diagnostic_sink import Sink
+from smoke.long_diagnostics import control_note, transfer_note
 from smoke.long_export import exported_paths
 from smoke.long_process import run_control
 
@@ -124,6 +127,7 @@ def completed_long_receipts(
             "    if hasattr(config,'workerinput'):\n"
             "        raise OSError(13,'password=private-probe-internal')\n"
         )
+    primary: BaseException | None = None
     with pytest.MonkeyPatch.context() as patch:
         for key in tuple(os.environ):
             if re.search(r"(?:TOKEN|PASSWORD|SECRET|API_KEY|CREDENTIAL|AUTH)", key, re.I):
@@ -157,8 +161,31 @@ def completed_long_receipts(
         if code == 0:
             assert run_control(command, root).returncode == 0
         else:
-            with pytest.raises(AssertionError, match=f"exited with code {code}"):
+            with pytest.raises(AssertionError, match=f"exited with code {code}") as caught:
                 run_control(command, root)
-    metadata = json.loads((root / "export/long-w2/manifest.json").read_bytes())
-    assert metadata["root_code"] == code and metadata["complete"] is True
+            primary = caught.value
+    try:
+        metadata = json.loads((root / "export/long-w2/manifest.json").read_bytes())
+        assert metadata["root_code"] == code and metadata["complete"] is True
+    except (AssertionError, OSError) as secondary:
+        transfer_note(primary, secondary)
+        raise
     return root
+
+
+@pytest.hookimpl(wrapper=True, trylast=True)
+def pytest_runtest_makereport(
+    item: pytest.Item, call: pytest.CallInfo[None]
+) -> Generator[None, pytest.TestReport, pytest.TestReport]:
+    report = yield
+    if report.failed and report.when in ("setup", "call") and call.excinfo is not None:
+        error = call.excinfo.value
+        note = control_note(error)
+        capture = item.config.pluginmanager.getplugin("capturemanager")
+        if note is not None and isinstance(capture, CaptureManager):
+            with capture.global_and_fixture_disabled():
+                try:
+                    print(note, file=sys.stderr, flush=True)
+                except (OSError, ValueError):
+                    error.add_note("Safe control stderr unavailable.")
+    return report

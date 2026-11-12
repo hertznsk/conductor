@@ -11,7 +11,8 @@ from pathlib import Path
 
 import psutil
 from artifact_policy import UnsafeArtifact, environment_sanitizer
-from smoke.long_export import publish
+from smoke.long_diagnostics import render_note
+from smoke.long_export import checked_control, publish
 from smoke.long_manifest import ControlResult, Normal, Outcome, Timeout, Unknown
 from smoke.long_protocol import CASE_PROCESSES, PROCESS_CAP
 from smoke.long_records import control_records
@@ -117,22 +118,36 @@ def run_control(
                     cleanup_errors.append("cleanup-close-failed")
         complete = False
         publication_error: BaseException | None = None
+        result = ControlResult(
+            workers,
+            outcome,
+            cleanup_errors[0] if cleanup_errors else ownership[0] if ownership else None,
+        )
         try:
-            complete = publish(
-                private,
-                destination,
-                ControlResult(
-                    workers,
-                    outcome,
-                    cleanup_errors[0] if cleanup_errors else ownership[0] if ownership else None,
-                ),
-            )
+            complete = publish(private, destination, result)
         except (OSError, UnsafeArtifact, ValueError) as error:
             publication_error = error
+        note = None
+        if primary is not None or publication_error is not None or not complete:
+            view = None
+            category = "publication-refused" if publication_error is not None else "checked"
+            try:
+                if publication_error is None:
+                    view = checked_control(destination)
+                note = render_note(result, view, category)
+            except (OSError, ValueError, TypeError, UnsafeArtifact):
+                note = render_note(result, None, "summary-unavailable")
+            if primary is not None:
+                primary.add_note(note)
         if publication_error is not None or not complete:
             if primary is not None:
                 primary.add_note("Long control evidence is incomplete.")
             elif publication_error is not None:
+                if note is not None:
+                    publication_error.add_note(note)
                 raise publication_error
             else:
-                raise UnsafeArtifact("long-control-evidence-incomplete")
+                failure = UnsafeArtifact("long-control-evidence-incomplete")
+                if note is not None:
+                    failure.add_note(note)
+                raise failure

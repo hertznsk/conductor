@@ -8,6 +8,7 @@ from pathlib import Path
 
 import psutil
 import pytest
+from smoke.long_diagnostics import transfer_note
 from smoke.long_process import run_control
 from smoke.support import ProcessProbe, stop_owned
 
@@ -60,11 +61,13 @@ def test_long_failure_and_timeout_publish_safe_evidence(
         "loadfile",
     ]
     probes: list[ProcessProbe] = []
+    primary: BaseException | None = None
     try:
         expected_error = AssertionError if mode == "failure" else subprocess.TimeoutExpired
-        with pytest.raises(expected_error):
+        with pytest.raises(expected_error) as caught:
             result = run_control(command, tmp_path, 5)
             assert result.returncode == 0
+        primary = caught.value
         manifest = export / "long-w2" / "manifest.json"
         assert manifest.is_file(), "Failed long control lost its evidence before assertion."
         metadata = json.loads(manifest.read_bytes())
@@ -97,6 +100,9 @@ def test_long_failure_and_timeout_publish_safe_evidence(
                     process.create_time() != birth["created"]
                     or process.status() == psutil.STATUS_ZOMBIE
                 )
+    except (AssertionError, OSError) as secondary:
+        transfer_note(primary, secondary)
+        raise
     finally:
         # Rescue a genuine pre-instrumentation RED using only early fixture-owned birth receipts.
         for path in project.glob("*.qa-ready.json"):

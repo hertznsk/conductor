@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections import Counter
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from itertools import islice
 from pathlib import Path
 
@@ -117,7 +117,14 @@ def publish(source: Path, destination: Path, result: ControlResult) -> bool:
     return manifest.complete
 
 
-def exported_paths(directory: Path) -> list[str]:
+@dataclass(frozen=True, slots=True)
+class CheckedControl:
+    manifest: Manifest
+    controls: tuple[ParsedControl, ...]
+    paths: tuple[str, ...]
+
+
+def checked_control(directory: Path) -> CheckedControl:
     """Reparse actual bytes and corroborate parent outcome with the controller session witness."""
     if directory.is_symlink():
         raise UnsafeArtifact("long-directory-refused")
@@ -148,4 +155,9 @@ def exported_paths(directory: Path) -> list[str]:
     if total > MIB // 2:
         raise UnsafeArtifact("long-export-cap")
     consistent(manifest, tuple(controls))
-    return paths
+    return CheckedControl(manifest, tuple(controls), tuple(paths))
+
+
+def exported_paths(directory: Path) -> list[str]:
+    """Return the unchanged exact whitelist from the same strict checked view."""
+    return list(checked_control(directory).paths)
