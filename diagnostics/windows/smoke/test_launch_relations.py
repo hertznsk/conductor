@@ -26,6 +26,11 @@ READINESS_SECONDS: Final = 10
 SNAPSHOT_SECONDS: Final = 2
 
 
+def birth_seconds(ticks: int) -> float:
+    """Match psutil's FILETIME conversion for exact birth comparisons."""
+    return float(ticks - 116444736000000000) / 10_000_000
+
+
 class Receipt(TypedDict):
     stage: Literal["early"]
     outcome: Literal["incomplete", "positive"]
@@ -61,10 +66,7 @@ def query(pid: int, held: dict[int, Node], handles: ExitStack) -> Node:
     if sys.platform == "win32":
         if probe.native is None:
             raise UnsafeArtifact("native-unavailable")
-        if (
-            probe.native.pid != pid
-            or probe.native.ticks / 10_000_000 - 11_644_473_600 != probe.created
-        ):
+        if probe.native.pid != pid or birth_seconds(probe.native.ticks) != probe.created:
             raise UnsafeArtifact("native-birth")
     node = Node(probe, psutil.Process(pid).ppid())
     held[pid] = node
@@ -223,8 +225,11 @@ def test_early_launch_relations(tmp_path: Path, request: pytest.FixtureRequest) 
         try:
             identity = Identity.child(child)
             handles.callback(identity.close)
+            created = identity.created
+            if identity.native is not None:
+                created = birth_seconds(identity.native.ticks)
             root = Node(
-                ProcessProbe(psutil.Process(child.pid), identity.created, identity.native),
+                ProcessProbe(psutil.Process(child.pid), created, identity.native),
                 os.getpid(),
             )
             wait_until(
