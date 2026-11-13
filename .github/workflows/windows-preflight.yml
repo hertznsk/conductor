@@ -1,5 +1,5 @@
 name: Windows preflight
-run-name: TARGETED_QA_PROFILE (${{ github.ref_name }})
+run-name: PARENT_RESOURCE_PROBE (${{ github.ref_name }})
 
 on:
   push:
@@ -31,7 +31,7 @@ jobs:
         id: source
         shell: python
         env:
-          TARGETED_QA_PROFILE: '1'
+          PARENT_RESOURCE_PROBE: '1'
         run: |
           import os
           import re
@@ -44,8 +44,8 @@ jobs:
               raise SystemExit('Expected windows-preflight/<SHA>-<digits>[-diag-w1|-diag-w2].')
           if target[4]:
               raise SystemExit('The -tail suffix is reserved and is not enabled.')
-          if os.environ.get('TARGETED_QA_PROFILE') == '1' and target[3] != '2':
-              raise SystemExit('TARGETED_QA_PROFILE requires -diag-w2.')
+          if os.environ.get('PARENT_RESOURCE_PROBE') == '1' and target[3] != '2':
+              raise SystemExit('PARENT_RESOURCE_PROBE requires -diag-w2.')
           with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
               output.write(f'sha={target[1]}\n')
               output.write(f'diagnostic={str(target[3] is not None).lower()}\n')
@@ -136,19 +136,10 @@ jobs:
           $env:SMOKE_EXPORT_ROOT = "$root/smoke-published"
           $env:SERVICE_WORKFLOW_CURRENT = "$root/service-workflow.yml"
           $env:SERVICE_WORKFLOW_BASE = "$root/ordinary-workflow.yml"
-          Write-Host 'TARGETED_QA_PROFILE: oracle NEW + unresolved D14 tail; product E2 disabled; not full acceptance.'
+          Write-Host 'PARENT_RESOURCE_PROBE: seven unchanged parent cases; product E2 disabled; not a repair.'
           $pytestArgs = @(
-            '-m', 'pytest', '-p', 'no:cacheprovider', "$root/smoke", "$root/hosted",
-            "--basetemp=$root/smoke-state", '-v',
-            "--ignore=$root/smoke/test_comparison.py",
-            "--ignore=$root/smoke/test_identity.py",
-            "--ignore=$root/smoke/test_launch_relations.py",
-            "--ignore=$root/smoke/test_long_capture.py",
-            "--ignore=$root/smoke/test_long_delivery.py",
-            "--ignore=$root/smoke/test_long_manifest.py",
-            "--ignore=$root/smoke/test_long_outcomes.py",
-            "--ignore=$root/smoke/test_long_receipts.py",
-            "--ignore=$root/smoke/test_observer.py"
+            '-m', 'pytest', '-p', 'no:cacheprovider', '-p', 'smoke.parent_resource_probe',
+            "$root/smoke/test_parent_ownership.py", "--basetemp=$root/smoke-state", '-v'
           )
           & "$env:GITHUB_WORKSPACE/.venv/Scripts/python.exe" @pytestArgs
           exit $LASTEXITCODE
