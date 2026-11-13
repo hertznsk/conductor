@@ -14,30 +14,15 @@ import pytest
 from artifact_policy import Sanitizer, UnsafeArtifact
 from diagnostic_sink import Sink
 from smoke import long_ownership, long_process
-from smoke.long_diagnostics import control_note
+from smoke.long_diagnostics import OwnershipFailure, control_note
 from smoke.long_export import checked_control
-from smoke.long_records import control_records
+from smoke.long_records import Startup, control_records
 from smoke.support import ProcessProbe, stop_owned
 
 
 def command(target: Path) -> list[str]:
-    return [
-        sys.executable,
-        "-m",
-        "pytest",
-        "-p",
-        "no:cacheprovider",
-        "-p",
-        "pr629_diag",
-        "-o",
-        "faulthandler_timeout=0",
-        "-q",
-        str(target),
-        "-n",
-        "1",
-        "--dist",
-        "loadfile",
-    ]
+    options = ["-o", "faulthandler_timeout=0", "-q", str(target), "-n", "1", "--dist", "loadfile"]
+    return [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-p", "pr629_diag"] + options
 
 
 def run_fault(root: Path, patch: pytest.MonkeyPatch, mode: str) -> tuple[str, list[str]]:
@@ -48,6 +33,9 @@ def run_fault(root: Path, patch: pytest.MonkeyPatch, mode: str) -> tuple[str, li
     real_popen, real_process, real_glob = subprocess.Popen, psutil.Process, Path.glob
     real_bind, real_close = ProcessProbe.bind, ProcessProbe.close
     real_acquire = long_ownership.CreatorBindings.acquire
+    real_admit = long_ownership.CreatorBindings.admit
+    admissions: list[long_ownership.CreatorBindings] = []
+    queries: list[tuple[long_ownership.CreatorBindings, ProcessProbe]] = []
     peer = real_popen(
         [sys.executable, "-c", "import sys;sys.stdin.buffer.read(1)"], stdin=subprocess.PIPE
     )
@@ -121,16 +109,26 @@ def run_fault(root: Path, patch: pytest.MonkeyPatch, mode: str) -> tuple[str, li
 
     def lookup(pid: int | None = None):
         if pid == peer.pid:
-            events.append("lookup")
+            events.append("fresh" if queries else "lookup")
             return Candidate()
         return real_process(pid)
+
+    def admit(
+        owner: long_ownership.CreatorBindings, first: Startup, context: OwnershipFailure
+    ) -> tuple[str, OwnershipFailure] | None:
+        if first.pid == peer.pid:
+            admissions.append(owner)
+        return real_admit(owner, first, context)
 
     def acquire(owner, process, created) -> ProcessProbe:
         if process.pid == peer.pid:
             events.append("bind")
             if mode == "bind":
                 raise PermissionError(13, "password=private-bind")
-        return real_acquire(owner, process, created)
+        probe = real_acquire(owner, process, created)
+        if process.pid == peer.pid:
+            queries.append((owner, probe))
+        return probe
 
     def close(probe: ProcessProbe) -> None:
         real_close(probe)
@@ -151,12 +149,25 @@ def run_fault(root: Path, patch: pytest.MonkeyPatch, mode: str) -> tuple[str, li
                 ),
             )
             owned.setattr(long_ownership.CreatorBindings, "acquire", acquire)
+            owned.setattr(long_ownership.CreatorBindings, "admit", admit)
             owned.setattr(ProcessProbe, "close", close)
             with pytest.raises(UnsafeArtifact) as caught:
                 long_process.run_control(command(target), root)
         note = control_note(caught.value)
         assert note is not None
         assert peer.poll() is None
+        if mode == "parent":
+            # Requirement: one refused admission may revalidate one query, closed before QA rescue.
+            assert len(admissions) == 1 and len(queries) <= 1, note
+            assert events[:3] == ["lookup", "birth", "parent"], note
+            assert events.count("lookup") == 1 and events.count("bind") == len(queries), note
+            assert events.count("fresh") == len(queries), note
+            assert events.count("birth") == events.count("parent") == 1 + len(queries), note
+            for owner, probe in queries:
+                assert probe.key not in owner.nodes, note
+                assert probe.native is None or (
+                    probe.native.closed and probe.native.close_error is None
+                ), note
         return note, events
     finally:
         stop_owned([peer], time.monotonic() + 3)
@@ -197,8 +208,6 @@ def test_actual_owner_branch_retains_first_fault(
     assert f"owner={scan}:{stage}:" in note
     if mode == "birth":
         assert events == ["lookup", "birth"]
-    if mode == "parent":
-        assert events == ["lookup", "birth", "parent"]
     if mode == "empty":
         assert ":startup-not-bound-before-stop:0:false:unknown:" in note
     if mode == "many":
