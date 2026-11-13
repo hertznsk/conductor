@@ -99,7 +99,7 @@ jobs:
         if: matrix.check == 'Test' && steps.source.outputs.diagnostic != 'true'
         timeout-minutes: 20
         # Expose the first failing nodeid before the deadline, even if worker shutdown stalls.
-        run: uv run pytest -p no:cacheprovider -n 2 --dist loadfile -v --tb=short --maxfail=1 --cov=src/conductor --cov-report=xml --cov-report=term-missing -m "not real_api and not install_scripts and not performance and not docker_integration"
+        run: uv run pytest -p no:cacheprovider -n 2 --dist loadfile -v --tb=short --cov=src/conductor --cov-report=xml --cov-report=term-missing -m "not real_api and not install_scripts and not performance and not docker_integration"
         env:
           ANTHROPIC_API_KEY: sk-ant-test-fake-key-for-mocking
           COPILOT_SKIP_CLI_DOWNLOAD: '1'
