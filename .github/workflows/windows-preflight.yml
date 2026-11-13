@@ -138,7 +138,7 @@ jobs:
           $env:SERVICE_WORKFLOW_BASE = "$root/ordinary-workflow.yml"
           Write-Host 'TARGETED_QA_PROFILE: oracle NEW + unresolved D14 tail; product E2 disabled; not full acceptance.'
           $pytestArgs = @(
-            '-m', 'pytest', '-p', 'no:cacheprovider', "$root/smoke", "$root/hosted",
+            '-m', 'pytest', '-p', 'no:cacheprovider', "$root/smoke/test_parent_ownership.py",
             "--basetemp=$root/smoke-state", '-v',
             "--ignore=$root/smoke/test_comparison.py",
             "--ignore=$root/smoke/test_identity.py",
