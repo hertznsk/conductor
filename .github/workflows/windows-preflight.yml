@@ -54,6 +54,20 @@ jobs:
               with open(job_environment, 'a', encoding='utf-8') as environment:
                   environment.write(f'DIAG_JOB_START={time.time()}\n')
 
+      - name: Check out ordinary reporting service
+        if: matrix.check == 'Test' && steps.source.outputs.diagnostic != 'true'
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Materialize ordinary reporter outside the source checkout
+        id: reporting_setup
+        if: matrix.check == 'Test' && steps.source.outputs.diagnostic != 'true'
+        continue-on-error: true
+        run: ./diagnostics/windows/f3_bootstrap.ps1 -Phase Prepare
+
       - name: Check out diagnostic service scripts
         if: matrix.check == 'Test' && steps.source.outputs.diagnostic == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -102,11 +116,21 @@ jobs:
       - name: Run tests with coverage
         if: matrix.check == 'Test' && steps.source.outputs.diagnostic != 'true'
         timeout-minutes: 20
-        # Ordinary tags run the full baseline; diagnostic tags use the targeted profile.
-        run: uv run pytest -p no:cacheprovider -n 2 --dist loadfile --cov=src/conductor --cov-report=xml --cov-report=term-missing -m "not real_api and not install_scripts and not performance and not docker_integration"
+        # The optional observer never substitutes its own result for pytest's exit.
+        run: ${{ steps.reporting_setup.outcome == 'success' && '& "$env:RUNNER_TEMP/windows-preflight-reporting/f3_bootstrap.ps1" -Phase Run' || 'uv run pytest -p no:cacheprovider -n 2 --dist loadfile --cov=src/conductor --cov-report=xml --cov-report=term-missing -m "not real_api and not install_scripts and not performance and not docker_integration"' }}
         env:
           ANTHROPIC_API_KEY: sk-ant-test-fake-key-for-mocking
           COPILOT_SKIP_CLI_DOWNLOAD: '1'
+
+      - name: Upload ordinary reporting evidence
+        if: always() && matrix.check == 'Test' && steps.source.outputs.diagnostic != 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-ordinary-reporting-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-preflight-reporting/records
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Record diagnostic environment
         if: matrix.check == 'Test' && steps.source.outputs.diagnostic == 'true'
