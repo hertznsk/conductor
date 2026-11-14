@@ -1,5 +1,5 @@
 name: Windows preflight
-run-name: TARGETED_QA_PROFILE (${{ github.ref_name }})
+run-name: ${{ contains(github.ref_name, '-diag-w2') && 'TARGETED_QA_PROFILE' || 'Windows preflight' }} (${{ github.ref_name }})
 
 on:
   push:
@@ -44,7 +44,7 @@ jobs:
               raise SystemExit('Expected windows-preflight/<SHA>-<digits>[-diag-w1|-diag-w2].')
           if target[4]:
               raise SystemExit('The -tail suffix is reserved and is not enabled.')
-          if os.environ.get('TARGETED_QA_PROFILE') == '1' and target[3] != '2':
+          if target[3] and os.environ.get('TARGETED_QA_PROFILE') == '1' and target[3] != '2':
               raise SystemExit('TARGETED_QA_PROFILE requires -diag-w2.')
           with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
               output.write(f'sha={target[1]}\n')
@@ -102,7 +102,7 @@ jobs:
       - name: Run tests with coverage
         if: matrix.check == 'Test' && steps.source.outputs.diagnostic != 'true'
         timeout-minutes: 20
-        # QA-only routing rejects ordinary tags before this preserved baseline command.
+        # Ordinary tags run the full baseline; diagnostic tags use the targeted profile.
         run: uv run pytest -p no:cacheprovider -n 2 --dist loadfile --cov=src/conductor --cov-report=xml --cov-report=term-missing -m "not real_api and not install_scripts and not performance and not docker_integration"
         env:
           ANTHROPIC_API_KEY: sk-ant-test-fake-key-for-mocking
