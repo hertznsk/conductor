@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import stat
 import sys
 from pathlib import Path
@@ -21,6 +22,8 @@ def fake_realm(
     bin_dir.mkdir()
     helper = Path(__file__).with_name("docker_fake.py")
     if sys.platform == "win32":
+        # Requirement: snapshot CMD's default prompt without replacing an operator's value.
+        monkeypatch.setenv("PROMPT", os.environ.get("PROMPT", "$P$G"))
         binary = bin_dir / "docker.cmd"
         binary.write_text(f'@"{sys.executable}" "{helper}" %*\n', encoding="utf-8")
     else:

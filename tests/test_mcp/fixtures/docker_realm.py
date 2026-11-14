@@ -48,6 +48,9 @@ def create_realm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Realm:
         for key, value in os.environ.items()
         if key.upper() in {"SYSTEMROOT", "COMSPEC", "PATHEXT", "WINDIR"}
     }
+    if sys.platform == "win32":
+        # Requirement: snapshot CMD's default prompt without replacing an operator's value.
+        platform_env["PROMPT"] = os.environ.get("PROMPT", "$P$G")
     for key in tuple(os.environ):
         monkeypatch.delenv(key)
     operator = {

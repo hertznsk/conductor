@@ -591,6 +591,7 @@ async def test_timeout_with_unconfirmed_termination_warns_and_preserves_outcome(
     ) -> bool:
         absorbed = await kill_and_reap(process, communicate_task)
         assert process.returncode is not None and communicate_task.done()
+        assert not communicate_task.cancelled() and communicate_task.exception() is None
         reaped.append(process)
         return absorbed
 
@@ -608,13 +609,31 @@ async def test_timeout_with_unconfirmed_termination_warns_and_preserves_outcome(
                 20,
             )
             assert connected.done() and len(native_start) == 2, "Native start readiness missing"
+            assert len(reaped) == 1
             reader, _writer = connected.result()
-            assert await wait_for(reader.read(), 10) == b""
+            try:
+                assert await wait_for(reader.read(), 10) == b""
+            except ConnectionResetError as exc:
+                # Requirement: a reaped Windows peer may close with ERROR_NETNAME_DELETED.
+                if not (sys.platform == "win32" and exc.winerror == 64):
+                    raise
         finally:
+            primary = sys.exception()
             if connected.done() and not connected.cancelled():
                 _reader, writer = connected.result()
-                writer.close()
-                await wait_for(writer.wait_closed(), 10)
+                try:
+                    writer.close()
+                    try:
+                        await wait_for(writer.wait_closed(), 10)
+                    except ConnectionResetError as exc:
+                        if not (
+                            sys.platform == "win32" and exc.winerror == 64 and len(reaped) == 1
+                        ):
+                            raise
+                finally:
+                    # Requirement: observer teardown must preserve the original failure.
+                    if primary is not None:
+                        raise primary
     assert len(reaped) == 1
     if sys.platform != "win32":
         assert reaped[0].pid == int(native_start[0])

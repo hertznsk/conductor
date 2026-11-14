@@ -12,17 +12,18 @@ import subprocess
 import sys
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 sys.dont_write_bytecode = True
 
 
 class PeerReceipt(BaseModel):
-    """The server's independent observation of its own process."""
+    """The server's environment, separating the explicit host runtime carrier."""
 
     model_config = ConfigDict(frozen=True)
     pid: int
     env: dict[str, str]
+    runtime_env: dict[str, str] = Field(default_factory=dict)
     called: bool
     closed: bool
 
@@ -42,13 +43,24 @@ class LaunchReceipt(BaseModel):
     exit_code: int
 
 
-def peer(receipt: Path) -> int:
+def peer(receipt: Path, *, system_root_carrier: bool = False) -> int:
     """Record the actual server environment and acknowledge a real tool request."""
     if os.environ.get("PEER_FAILURE", "").startswith("diagnostic-"):
         from diagnostic_stdio import diagnostic_peer
 
         return diagnostic_peer(receipt)
-    snapshot = {"pid": os.getpid(), "env": dict(os.environ), "called": False, "closed": False}
+    observed_env = dict(os.environ)
+    runtime_env: dict[str, str] = {}
+    if system_root_carrier:
+        # Keep the logical payload exact while recording the actual runtime-only addition.
+        runtime_env["SYSTEMROOT"] = observed_env.pop("SYSTEMROOT")
+    snapshot = {
+        "pid": os.getpid(),
+        "env": observed_env,
+        "runtime_env": runtime_env,
+        "called": False,
+        "closed": False,
+    }
     receipt.write_text(json.dumps(snapshot), encoding="utf-8")
     if os.environ.get("PEER_INITIALIZE_FILE"):
         # This is a disk-backed daemon model, not evidence of a native Docker mount.
@@ -91,7 +103,7 @@ def main() -> int:
     """Keep Docker control traffic out of the SDK's protocol channel."""
     argv = sys.argv[1:]
     if argv[0] == "--peer":
-        return peer(Path(argv[1]))
+        return peer(Path(argv[1]), system_root_carrier="--system-root-carrier" in argv[2:])
     helper = Path(__file__).resolve().parents[2] / "test_execution" / "docker_fake.py"
     control = subprocess.run(
         [sys.executable, str(helper), *argv],
@@ -117,9 +129,16 @@ def main() -> int:
         argv[argv.index("--name") + 1] + ".json"
     )
     launcher = receipt.with_suffix(".launcher.json")
+    peer_env = dict(payload)
+    peer_args = [sys.executable, str(Path(__file__).resolve()), "--peer", str(receipt)]
+    if sys.platform == "win32" and not any(key.upper() == "SYSTEMROOT" for key in payload):
+        # Requirement: Windows Python needs SystemRoot for native SDK imports, not ambient access.
+        # https://docs.python.org/3.12/library/subprocess.html#subprocess.Popen
+        peer_env["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
+        peer_args.append("--system-root-carrier")
     with subprocess.Popen(
-        [sys.executable, str(Path(__file__).resolve()), "--peer", str(receipt)],
-        env=payload,
+        peer_args,
+        env=peer_env,
     ) as child:
         launch = {
             "pid": os.getpid(),
