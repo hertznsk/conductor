@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from conductor.execution.docker import DockerRunnerBackend
+from conductor.execution.types import BundleRef, McpServerSpec, ResolvedExecutionSpec, RunSpec
 
 
 @pytest.fixture
@@ -34,3 +35,40 @@ def fake_realm(
     monkeypatch.setenv("FAKE_DOCKER_LOG", str(log))
     monkeypatch.setenv("FAKE_DOCKER_STATE", str(state))
     return DockerRunnerBackend(binary.name), log, state
+
+
+@pytest.fixture
+def mcp_run(tmp_path: Path) -> RunSpec:
+    """Provide a fenced bundle without consulting a real Docker daemon."""
+    tree = tmp_path / "bundle/tree/main"
+    tree.mkdir(parents=True)
+    (tree / "payload").write_text("shared", encoding="utf-8")
+    return RunSpec(
+        "mcp-test",
+        bundle=BundleRef("sha256:mcp", str(tree.parent.parent)),
+        mcp_fence_execution=ResolvedExecutionSpec("server:image"),
+    )
+
+
+@pytest.fixture
+def mcp_spec() -> McpServerSpec:
+    """Exercise the direct target's payload and full profile option boundary."""
+    return McpServerSpec(
+        "files",
+        ("server", "--stdio"),
+        {"ONLY_PAYLOAD": "TOP_SECRET"},
+        working_dir="nested",
+        execution=ResolvedExecutionSpec(
+            "server:image",
+            network="none",
+            user="1000",
+            init=True,
+            read_only=True,
+            cap_drop_all=True,
+            no_new_privileges=True,
+            tmpfs="16m",
+            cpu=1.5,
+            memory="128m",
+            pids=32,
+        ),
+    )
