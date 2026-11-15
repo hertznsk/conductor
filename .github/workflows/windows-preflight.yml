@@ -118,7 +118,7 @@ jobs:
         timeout-minutes: 20
         # The optional observer never substitutes its own result for pytest's exit.
         run: |
-          uv run pytest -p no:cacheprovider -n 4 --dist loadfile -v --tb=short --cov=src/conductor --cov-report=xml --cov-report=term-missing -m "not real_api and not install_scripts and not performance and not docker_integration"
+          uv run pytest -p no:cacheprovider -n 2 --dist loadfile -v --tb=short --cov=src/conductor --cov-report=xml --cov-report=term-missing -m "not real_api and not install_scripts and not performance and not docker_integration"
           exit $LASTEXITCODE
         env:
           ANTHROPIC_API_KEY: sk-ant-test-fake-key-for-mocking
