@@ -2,6 +2,70 @@
 
 from __future__ import annotations
 
+# Temporary TASK21 metadata only; no environment grants or protocol changes.
+import _thread as _task21_thread
+import json as _task21_json
+import os as _task21_os
+import sys as _task21_sys
+import time as _task21_time
+
+_task21_import_ns = _task21_time.monotonic_ns()
+_task21_lock = _task21_thread.allocate_lock()
+_task21_blocks: dict[str, tuple[str, int]] = {}
+
+
+def _task21_note(stage: str, root: str | None = None, **fields: str | int | bool | None) -> bool:
+    """Append capped private metadata only when this exact test has opened its gate."""
+    directory = _task21_os.path.dirname(_task21_sys.argv[0])
+    if root is None:
+        parent = _task21_os.path.dirname(directory)
+        root = _task21_os.path.dirname(parent) if _task21_os.path.basename(parent) in (
+            ".launchers", ".scopes"
+        ) else directory
+    directory = _task21_os.path.join(root, ".task21")
+    if not _task21_os.path.isdir(directory):
+        return False
+    try:
+        with _task21_lock:
+            block, count = _task21_blocks.get(directory, ("", 16))
+            if count == 16:
+                block = ""
+                for slot in range(16):
+                    candidate = _task21_os.path.join(directory, f"{slot:02}.jsonl")
+                    try:
+                        with open(candidate, "xb"):
+                            pass
+                    except FileExistsError:
+                        continue
+                    block, count = candidate, 0
+                    break
+                if not block:
+                    with open(_task21_os.path.join(directory, "truncated"), "ab"):
+                        pass
+                    return False
+            payload = _task21_json.dumps(
+                {"stage": stage, "pid": _task21_os.getpid(),
+                 "ns": _task21_time.monotonic_ns(), **fields}, separators=(",", ":")
+            ).encode() + b"\n"
+            if len(payload) > 384:
+                with open(_task21_os.path.join(directory, "truncated"), "ab"):
+                    pass
+                payload = b'{"stage":"oversize"}\n'
+            _task21_blocks[directory] = (block, count + 1)
+            with open(block, "ab") as stream:
+                stream.write(payload)
+        return True
+    except (OSError, TypeError, ValueError):
+        try:
+            with open(_task21_os.path.join(directory, "io-failed"), "ab"):
+                pass
+        except OSError:
+            return False
+        return False
+
+
+_task21_note("import_begin", first_ns=_task21_import_ns)
+
 import ctypes
 import hashlib
 import json
@@ -13,6 +77,8 @@ from pathlib import Path
 from types import CodeType
 
 type Json = None | bool | int | float | str | list[Json] | dict[str, Json]
+
+_task21_note("peer_import_end")
 
 
 def install_audit() -> None:
@@ -59,6 +125,7 @@ def install_audit() -> None:
 
 def record(event: str, **fields: Json) -> dict[str, Json]:
     """Write only fixture inputs and observed process state, never an ambient environment dump."""
+    _task21_note("peer_record_begin", event=event)
     arguments: list[Json] = list(sys.argv[1:])
     value: dict[str, Json] = {
         "event": event,
@@ -107,6 +174,7 @@ def record(event: str, **fields: Json) -> dict[str, Json]:
             value["extra_file"] = buffer.value if count else None
     path = Path(os.environ["WINDOWS_PEER_RECEIPTS"]) / f"{os.getpid()}-{event}.json"
     path.write_text(json.dumps(value), encoding="utf-8")
+    _task21_note("peer_record_written", event=event)
     return value
 
 
@@ -120,8 +188,10 @@ def send(payload: dict[str, Json], *, framed: bool = False) -> None:
 
 def claude() -> None:
     if sys.argv[1:] == ["-v"]:
+        _task21_note("peer_version_enter")
         record("version")
         print("2.1.263 (hermetic fixture)", flush=True)
+        _task21_note("peer_version_stdout")
         return
     if "auth" in sys.argv[1:]:
         record("auth")

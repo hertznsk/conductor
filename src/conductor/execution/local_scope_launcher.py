@@ -7,6 +7,70 @@ so the installed helper also works with a minimal target environment.
 
 from __future__ import annotations
 
+# Temporary TASK21 metadata only; no environment grants or protocol changes.
+import _thread as _task21_thread
+import json as _task21_json
+import os as _task21_os
+import sys as _task21_sys
+import time as _task21_time
+
+_task21_import_ns = _task21_time.monotonic_ns()
+_task21_lock = _task21_thread.allocate_lock()
+_task21_blocks: dict[str, tuple[str, int]] = {}
+
+
+def _task21_note(stage: str, root: str | None = None, **fields: str | int | bool | None) -> bool:
+    """Append capped private metadata only when this exact test has opened its gate."""
+    directory = _task21_os.path.dirname(_task21_sys.argv[0])
+    if root is None:
+        parent = _task21_os.path.dirname(directory)
+        root = _task21_os.path.dirname(parent) if _task21_os.path.basename(parent) in (
+            ".launchers", ".scopes"
+        ) else directory
+    directory = _task21_os.path.join(root, ".task21")
+    if not _task21_os.path.isdir(directory):
+        return False
+    try:
+        with _task21_lock:
+            block, count = _task21_blocks.get(directory, ("", 16))
+            if count == 16:
+                block = ""
+                for slot in range(16):
+                    candidate = _task21_os.path.join(directory, f"{slot:02}.jsonl")
+                    try:
+                        with open(candidate, "xb"):
+                            pass
+                    except FileExistsError:
+                        continue
+                    block, count = candidate, 0
+                    break
+                if not block:
+                    with open(_task21_os.path.join(directory, "truncated"), "ab"):
+                        pass
+                    return False
+            payload = _task21_json.dumps(
+                {"stage": stage, "pid": _task21_os.getpid(),
+                 "ns": _task21_time.monotonic_ns(), **fields}, separators=(",", ":")
+            ).encode() + b"\n"
+            if len(payload) > 384:
+                with open(_task21_os.path.join(directory, "truncated"), "ab"):
+                    pass
+                payload = b'{"stage":"oversize"}\n'
+            _task21_blocks[directory] = (block, count + 1)
+            with open(block, "ab") as stream:
+                stream.write(payload)
+        return True
+    except (OSError, TypeError, ValueError):
+        try:
+            with open(_task21_os.path.join(directory, "io-failed"), "ab"):
+                pass
+        except OSError:
+            return False
+        return False
+
+
+_task21_note("import_begin", first_ns=_task21_import_ns)
+
 import contextlib
 import ctypes
 import hashlib
@@ -36,6 +100,8 @@ type Json = None | bool | int | float | str | list[Json] | dict[str, Json]
 
 MAX_CONTROL = 8 * 1024 * 1024
 CHUNK = 65536
+
+_task21_note("helper_import_end")
 
 
 class Channel(Protocol):
@@ -236,6 +302,7 @@ def _pump(source: NativeStream, target: NativeStream, finished: Callable[[], Non
 
 
 def _facade(descriptor: dict[str, Json]) -> int:
+    _task21_note("facade_connect")
     with connect(descriptor) as control:
         argv: list[Json] = list(sys.argv[1:])
         env: dict[str, Json] = dict(os.environ)
@@ -249,6 +316,7 @@ def _facade(descriptor: dict[str, Json]) -> int:
             "cwd": os.getcwd(),
         }
         send_frame(control, hello)
+        _task21_note("hello_sent", version=sys.argv[1:] == ["-v"])
         if sys.platform == "linux":
             with contextlib.ExitStack() as stack:
                 fd = os.pidfd_open(os.getpid())
@@ -287,9 +355,11 @@ def _facade(descriptor: dict[str, Json]) -> int:
         else:
             raise OSError("Managed local custody requires Linux pidfd or Windows handles")
         registered = receive_frame(control)
+        _task21_note("facade_registered", accepted=registered["event"] == "REGISTERED")
         if registered["event"] != "REGISTERED":
             return 125
         scope = text(registered, "scope")
+        _task21_note("facade_scope", scope=scope)
         with contextlib.ExitStack() as stack:
             channels: list[Channel] = []
             for name in ("stdin", "stdout", "stderr"):
@@ -332,6 +402,7 @@ def _facade(descriptor: dict[str, Json]) -> int:
             for thread in outputs:
                 thread.start()
             result = receive_frame(control)
+            _task21_note("facade_result", integer_exit=isinstance(result.get("code"), int))
             for thread in outputs:
                 thread.join()
             code = result.get("code")
@@ -638,6 +709,7 @@ if sys.platform == "win32":
                     raise ctypes.WinError(ctypes.get_last_error())
 
         def start(self, argv: list[str], env: dict[str, str], cwd: str) -> None:
+            _task21_note("native_start_begin")
             application, command_line = windows_create_process_arguments(
                 ProcessLaunchSpec(tuple(argv), env, cwd)
             )
@@ -665,12 +737,14 @@ if sys.platform == "win32":
                     cwd,
                     startup,
                 )
+                _task21_note("native_created", child_pid=_pid)
                 try:
                     if not _kernel.AssignProcessToJobObject(self.job, process):
                         _winapi.TerminateProcess(process, 125)
                         _winapi.WaitForSingleObject(process, _winapi.INFINITE)
                         raise CustodyError("Cannot assign suspended payload to custody job")
                     self.handle = process
+                    _task21_note("native_assigned", child_pid=_pid)
                     self.stdin = os.fdopen(os.dup(parent_in), "wb", buffering=0)
                     self.stdout = os.fdopen(os.dup(parent_out), "rb", buffering=0)
                     self.stderr = os.fdopen(os.dup(parent_err), "rb", buffering=0)
@@ -680,6 +754,7 @@ if sys.platform == "win32":
                         _winapi.TerminateProcess(process, 125)
                         _winapi.WaitForSingleObject(process, _winapi.INFINITE)
                         raise CustodyError("Cannot resume assigned payload")
+                    _task21_note("native_resumed", child_pid=_pid)
                 except OSError:
                     _winapi.CloseHandle(process)
                     raise
@@ -741,6 +816,7 @@ if sys.platform == "win32":
 
 
 def _custodian(descriptor: dict[str, Json]) -> int:
+    _task21_note("custodian_enter", scope=text(descriptor, "scope"))
     tree = _WindowsTree() if sys.platform == "win32" else _LinuxTree()
     with connect(descriptor) as control:
         lock = threading.Lock()
@@ -751,6 +827,7 @@ def _custodian(descriptor: dict[str, Json]) -> int:
         deadline: float | None = None
 
         def emit(event: str, **values: Json) -> None:
+            _task21_note("custodian_event", event=event)
             with lock, contextlib.suppress(BrokenPipeError, OSError):
                 send_frame(control, {"event": event, **values})
 
@@ -763,6 +840,7 @@ def _custodian(descriptor: dict[str, Json]) -> int:
         cwd = text(configuration, "cwd")
         emit("CUSTODIAN_READY")
         command = receive_frame(control)
+        _task21_note("custodian_gate", go=command["event"] == "GO", rejected=command["event"] == "REJECTED")
         if command["event"] == "REJECTED":
             tree.reap()
             if not tree.empty:
