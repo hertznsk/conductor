@@ -117,7 +117,9 @@ jobs:
         if: matrix.check == 'Test' && steps.source.outputs.diagnostic != 'true'
         timeout-minutes: 20
         # The optional observer never substitutes its own result for pytest's exit.
-        run: ${{ steps.reporting_setup.outcome == 'success' && '& "$env:RUNNER_TEMP/windows-preflight-reporting/f3_bootstrap.ps1" -Phase Run' || 'uv run pytest -p no:cacheprovider -n 2 --dist loadfile --cov=src/conductor --cov-report=xml --cov-report=term-missing -m "not real_api and not install_scripts and not performance and not docker_integration"' }}
+        run: |
+          uv run pytest -p no:cacheprovider -n 2 --dist loadfile --cov=src/conductor --cov-report=xml --cov-report=term-missing -m "not real_api and not install_scripts and not performance and not docker_integration"
+          exit $LASTEXITCODE
         env:
           ANTHROPIC_API_KEY: sk-ant-test-fake-key-for-mocking
           COPILOT_SKIP_CLI_DOWNLOAD: '1'
