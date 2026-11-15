@@ -689,7 +689,8 @@ async def test_delayed_startup_retains_actual_sdk_owner_after_root_deadline(
             await asyncio.wait_for(target_closed.wait(), 5)
             assert session.cleanup_uncertain and entry.cleanup_unconfirmed
             assert processes == [] and engine._mcp_step_managers == {}
-            assert "workspace and fence retained" in caplog.text
+            assert "workspace and fence state requires independent verification" in caplog.text
+            assert "workspace and fence retained" not in caplog.text
             release.set()
             try:
                 await asyncio.wait_for(opening, 10)

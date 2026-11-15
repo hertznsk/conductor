@@ -123,7 +123,7 @@ class McpRunLifecycle:
         if not already_uncertain:
             logger.warning(
                 "Docker MCP root cleanup is unconfirmed; "
-                "workspace and fence retained, reuse refused"
+                "workspace and fence state requires independent verification, reuse refused"
             )
 
     async def _observe[T](self, task: asyncio.Task[T]) -> bool:
