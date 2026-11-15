@@ -1,0 +1,99 @@
+name: Task21 native version diagnostic
+run-name: TASK21_NATIVE_DIAGNOSTIC_FULL_LOAD_OBSERVE_FIVE (${{ github.ref_name }})
+
+on:
+  push:
+    tags:
+      - 'task21-version-diag/*'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostic:
+    if: github.repository == 'hertznsk/conductor'
+    name: Task21 full ordinary Main with five observed nodes
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Read exact diagnostic source SHA
+        id: source
+        shell: python
+        run: |
+          import os
+          import re
+          match = re.fullmatch(r'task21-version-diag/([0-9a-f]{40})-[0-9]+', os.environ['GITHUB_REF_NAME'])
+          if match is None:
+              raise SystemExit('Invalid Task21-only diagnostic tag')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as stream:
+              stream.write(f'sha={match[1]}\n')
+
+      - name: Check out exact diagnostic source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.source.outputs.sha }}
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: latest
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Install test dependencies
+        run: uv sync --group dev --extra claude-agent-sdk --extra telemetry
+
+      - name: Record immutable diagnostic input identities
+        shell: python
+        env:
+          TASK21_SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import subprocess
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'task21-records'
+          root.mkdir()
+          result = {
+              'mode': 'TASK21_NATIVE_DIAGNOSTIC_FULL_LOAD_OBSERVE_FIVE',
+              'source': os.environ['TASK21_SOURCE_SHA'],
+              'service': os.environ['GITHUB_SHA'],
+              'checkout': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+              'versions': json.loads(subprocess.check_output([
+                  'uv', 'run', 'python', '-c',
+                  "import importlib.metadata as m,json; print(json.dumps({n:m.version(n) for n in ('claude-agent-sdk','anyio','pytest','pytest-xdist')}))"
+              ], text=True)),
+              'files': {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in (
+                  pathlib.Path('tests/test_execution/test_local_windows_launch.py'),
+                  pathlib.Path('tests/task21_version_probe.py'),
+                  pathlib.Path('tests/test_execution/windows_launch_fixture.py'),
+                  pathlib.Path('src/conductor/execution/local_scope_launcher.py'),
+                  pathlib.Path('uv.lock'),
+              )},
+          }
+          (root / 'inputs.json').write_text(json.dumps(result), encoding='utf-8')
+          assert result['checkout'] == result['source']
+          assert result['versions']['claude-agent-sdk'] == '0.2.121'
+          assert result['versions']['anyio'] == '4.14.2'
+
+      - name: Run full ordinary n4 selection with five observed nodes
+        timeout-minutes: 20
+        run: |
+          uv run pytest -p no:cacheprovider -p tests.task21_version_probe -n 4 --dist loadfile -v --tb=short --cov=src/conductor --cov-report=xml --cov-report=term-missing -m "not real_api and not install_scripts and not performance and not docker_integration"
+          exit $LASTEXITCODE
+        env:
+          ANTHROPIC_API_KEY: sk-ant-test-fake-key-for-mocking
+          COPILOT_SKIP_CLI_DOWNLOAD: '1'
+
+      - name: Upload bounded private Task21 metadata
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: task21-native-five-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/task21-records
+          if-no-files-found: warn
+          retention-days: 7
