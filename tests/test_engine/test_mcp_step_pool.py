@@ -172,7 +172,9 @@ async def test_docker_incarnation_replaces_stale_pool_identity(realm) -> None:
 
 
 @pytest.mark.parametrize("expired", [False, True])
-async def test_allocation_docker_only_root_owns_late_target(realm, monkeypatch, expired) -> None:
+async def test_allocation_docker_only_root_owns_late_target(
+    realm, monkeypatch, expired, request
+) -> None:
     # Requirement: pending allocation is not empty cleanup; late targets never publish or launch.
     from dataclasses import replace
 
@@ -212,7 +214,14 @@ async def test_allocation_docker_only_root_owns_late_target(realm, monkeypatch, 
     async with placement_engine(config, realm) as engine:
         session = engine._execution_session
         opening = asyncio.create_task(engine._get_mcp_step_manager("srv", None, step_key="call"))
-        await asyncio.wait_for(allocated.wait(), 5)
+        try:
+            await asyncio.wait_for(allocated.wait(), 5)
+        except BaseException:
+            # Temporary diagnostic: inspect allocation without retrieving its result or exception.
+            from tests.windows_failure_context import MarkerProbe, marker_failure
+
+            marker_failure(request, MarkerProbe(allocated, opening, session.mcp_lifecycle))
+            raise
         session.begin_teardown("cancelled", retain=expired)
         deadline = session.cleanup_deadline
         assert session.sealed and deadline is not None

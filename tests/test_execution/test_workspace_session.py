@@ -26,7 +26,7 @@ from conductor.execution.types import BundleRef, CommandSpec
 
 @pytest.mark.parametrize("pending", ["staging", "sdk"])
 async def test_fence_refuses_new_session_after_expired_owner_with_empty_inventory(
-    tmp_path, monkeypatch, pending
+    tmp_path, monkeypatch, pending, request
 ):
     # Requirement: a new controller home cannot bypass a retained guard using empty MCP inventory.
     import asyncio
@@ -115,7 +115,14 @@ async def test_fence_refuses_new_session_after_expired_owner_with_empty_inventor
         monkeypatch.setattr(manager_module, "stdio_client", held_stdio)
     opening = asyncio.create_task(engine.run({}))
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+        except BaseException:
+            # Temporary diagnostic: retain primary context before the existing finally runs.
+            from tests.windows_failure_context import MarkerProbe, marker_failure
+
+            marker_failure(request, MarkerProbe(entered, opening, session.mcp_lifecycle))
+            raise
         session = engine._execution_session
         lease = session.leases["docker"]
         session.begin_teardown("cancelled", retain=True)

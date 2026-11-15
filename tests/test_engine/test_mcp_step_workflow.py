@@ -622,7 +622,7 @@ async def test_docker_only_multiple_entries_share_budget_and_new_root_gets_fresh
 
 
 async def test_delayed_startup_retains_actual_sdk_owner_after_root_deadline(
-    realm, monkeypatch, caplog
+    realm, monkeypatch, caplog, request
 ):
     # Requirement: terminal strict-close observation cannot conceal an SDK owner still starting.
     from contextlib import asynccontextmanager
@@ -660,7 +660,14 @@ async def test_delayed_startup_retains_actual_sdk_owner_after_root_deadline(
     async with placement_engine(placement_config(), realm) as engine:
         session = engine._execution_session
         opening = asyncio.create_task(engine._get_mcp_step_manager("srv", None, step_key="call"))
-        await asyncio.wait_for(entered.wait(), 5)
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+        except BaseException:
+            # Temporary diagnostic: snapshot before placement cleanup can mask this failure.
+            from tests.windows_failure_context import MarkerProbe, marker_failure
+
+            marker_failure(request, MarkerProbe(entered, opening, session.mcp_lifecycle))
+            raise
         entry = session.mcp_lifecycle.attempts[0].entries[0]
         target = entry.target
         assert target is not None

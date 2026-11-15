@@ -277,7 +277,7 @@ async def test_close_starts_independent_resources_before_waiting(
 
 
 async def test_close_collects_original_errors_and_scrubs_diagnostics(
-    provider: Provider, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+    provider: Provider, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog, request
 ) -> None:
     # Requirement: independent ordinary failures are all reported, scrubbed, and sticky on repeat.
     secret = "registered-independent-cleanup-secret"
@@ -319,7 +319,14 @@ async def test_close_collects_original_errors_and_scrubs_diagnostics(
         formatted = "\n".join(logging.Formatter().format(record) for record in caplog.records)
         assert secret not in formatted and REDACTED_MARKER in formatted
         assert "workspace denied" in formatted and "HTTP cleanup failed" in formatted
-        assert all(record.exc_info is None for record in caplog.records)
+        try:
+            assert all(record.exc_info is None for record in caplog.records)
+        except BaseException:
+            # Temporary diagnostic: preserve the assertion and identify only its offending records.
+            from tests.windows_failure_context import log_failure
+
+            log_failure(request, caplog.records)
+            raise
         assert client.is_closed()
 
 
