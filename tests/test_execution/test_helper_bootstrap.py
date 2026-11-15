@@ -69,7 +69,9 @@ sys.meta_path.insert(0, Guard())
 
     assert result.returncode == 125, result.stderr.decode(errors="replace")
     assert result.stdout == b""
-    assert result.stderr == b"conductor-local-scope: infrastructure failure\n"
+    assert result.stderr == (
+        b"conductor-local-scope: infrastructure failure" + os.linesep.encode("ascii")
+    )
 
 
 def test_public_package_exports_preserve_real_values_and_identity(tmp_path: Path) -> None:
