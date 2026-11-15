@@ -10,8 +10,10 @@ import json
 import os
 import subprocess
 import sys
+from itertools import pairwise
 from pathlib import Path
 
+import psutil
 from pydantic import BaseModel, ConfigDict, Field
 
 sys.dont_write_bytecode = True
@@ -22,10 +24,18 @@ class PeerReceipt(BaseModel):
 
     model_config = ConfigDict(frozen=True)
     pid: int
+    parent_pids: list[int]
     env: dict[str, str]
     runtime_env: dict[str, str] = Field(default_factory=dict)
     called: bool
     closed: bool
+
+    def is_owned_by(self, launcher_pid: int, child_pid: int) -> bool:
+        """Require the actual Popen child-to-launcher edge in the peer's native ancestry."""
+        chain = [self.pid, *self.parent_pids]
+        return self.pid != launcher_pid and any(
+            child == child_pid and parent == launcher_pid for child, parent in pairwise(chain)
+        )
 
 
 class LaunchReceipt(BaseModel):
@@ -56,6 +66,7 @@ def peer(receipt: Path, *, system_root_carrier: bool = False) -> int:
         runtime_env["SYSTEMROOT"] = observed_env.pop("SYSTEMROOT")
     snapshot = {
         "pid": os.getpid(),
+        "parent_pids": [parent.pid for parent in psutil.Process().parents()],
         "env": observed_env,
         "runtime_env": runtime_env,
         "called": False,

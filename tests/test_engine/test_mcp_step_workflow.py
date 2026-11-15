@@ -54,7 +54,7 @@ from conductor.engine.context import WorkflowContext
 from conductor.engine.workflow import WorkflowEngine
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.exceptions import ExecutionError, InterruptError
-from tests.test_engine.mcp_placement import placement_config, placement_engine
+from tests.test_engine.mcp_placement import owned_opening, placement_config, placement_engine
 
 
 @pytest.fixture
@@ -659,61 +659,67 @@ async def test_delayed_startup_retains_actual_sdk_owner_after_root_deadline(
     monkeypatch.setattr(sdk, "_create_platform_compatible_process", record_spawn)
     async with placement_engine(placement_config(), realm) as engine:
         session = engine._execution_session
-        opening = asyncio.create_task(engine._get_mcp_step_manager("srv", None, step_key="call"))
-        await asyncio.wait_for(entered.wait(), 5)
-        entry = session.mcp_lifecycle.attempts[0].entries[0]
-        target = entry.target
-        assert target is not None
-        target_closed = asyncio.Event()
+        # Complete prerequisite staging before timing the held SDK startup boundary.
+        execution = engine._execution_resolver.manifest.profiles["call"].execution
+        assert execution is not None
+        await realm.backend._ensure_staged(session.leases["docker"], execution, None)
+        async with owned_opening(
+            engine._get_mcp_step_manager("srv", None, step_key="call"), release
+        ) as opening:
+            await asyncio.wait_for(entered.wait(), 5)
+            entry = session.mcp_lifecycle.attempts[0].entries[0]
+            target = entry.target
+            assert target is not None
+            target_closed = asyncio.Event()
 
-        async def close_target():
-            order.append("target")
+            async def close_target():
+                order.append("target")
+                try:
+                    await target.aclose()
+                finally:
+                    target_closed.set()
+
+            entry.target = replace(target, aclose=close_target)
+            session.begin_teardown("cancelled", retain=True)
+            deadline = session.cleanup_deadline
+            loop = asyncio.get_running_loop()
+            clock = loop.time
+            monkeypatch.setattr(loop, "time", lambda: clock() + 31)
+            await session.finalize_leases("cancelled")
+            await asyncio.wait_for(target_closed.wait(), 5)
+            assert session.cleanup_uncertain and entry.cleanup_unconfirmed
+            assert processes == [] and engine._mcp_step_managers == {}
+            assert "workspace and fence retained" in caplog.text
+            release.set()
             try:
-                await target.aclose()
-            finally:
-                target_closed.set()
-
-        entry.target = replace(target, aclose=close_target)
-        session.begin_teardown("cancelled", retain=True)
-        deadline = session.cleanup_deadline
-        loop = asyncio.get_running_loop()
-        clock = loop.time
-        monkeypatch.setattr(loop, "time", lambda: clock() + 31)
-        await session.finalize_leases("cancelled")
-        await asyncio.wait_for(target_closed.wait(), 5)
-        assert session.cleanup_uncertain and entry.cleanup_unconfirmed
-        assert processes == [] and engine._mcp_step_managers == {}
-        assert "workspace and fence retained" in caplog.text
-        release.set()
-        try:
-            await asyncio.wait_for(opening, 10)
-        except (RuntimeError, asyncio.CancelledError):
-            # The actual SDK reports EOF after the late fake CLI discovers
-            # that its already-released payload file is unavailable.
-            order.append("startup-terminal")
-        owners = tuple(entry.manager._owners)
-        done, pending = await asyncio.wait(owners, timeout=10)
-        assert done and not pending
-        for owner in done:
-            if not owner.cancelled():
-                owner.exception()
-        assert entry._cleanup is not None
-        await asyncio.wait_for(asyncio.shield(entry._cleanup), 5)
-        assert processes and all(process.returncode is not None for process in processes)
-        assert all(sink.closed for sink in sinks)
-        assert session.cleanup_deadline == deadline and session.quarantined
-        assert engine._mcp_step_managers == {}
-        state = json.loads((realm.root / "state.json").read_text())
-        assert state["volumes"] and state["containers"]
-        print(
-            {
-                "scenario": "delayed-startup",
-                "deadline": deadline,
-                "sdk_pids": [process.pid for process in processes],
-                "returncodes": [process.returncode for process in processes],
-                "order": order,
-            }
-        )
+                await asyncio.wait_for(opening, 10)
+            except (RuntimeError, asyncio.CancelledError):
+                # The actual SDK reports EOF after the late fake CLI discovers
+                # that its already-released payload file is unavailable.
+                order.append("startup-terminal")
+            owners = tuple(entry.manager._owners)
+            done, pending = await asyncio.wait(owners, timeout=10)
+            assert done and not pending
+            for owner in done:
+                if not owner.cancelled():
+                    owner.exception()
+            assert entry._cleanup is not None
+            await asyncio.wait_for(asyncio.shield(entry._cleanup), 5)
+            assert processes and all(process.returncode is not None for process in processes)
+            assert all(sink.closed for sink in sinks)
+            assert session.cleanup_deadline == deadline and session.quarantined
+            assert engine._mcp_step_managers == {}
+            state = json.loads((realm.root / "state.json").read_text())
+            assert state["volumes"] and state["containers"]
+            print(
+                {
+                    "scenario": "delayed-startup",
+                    "deadline": deadline,
+                    "sdk_pids": [process.pid for process in processes],
+                    "returncodes": [process.returncode for process in processes],
+                    "order": order,
+                }
+            )
 
 
 @pytest.mark.parametrize("failure", ["transport", "malformed", "protocol", "output", "is_error"])

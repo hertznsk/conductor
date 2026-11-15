@@ -40,6 +40,7 @@ async def test_fence_refuses_new_session_after_expired_owner_with_empty_inventor
     from conductor.engine.workflow import RunContext, WorkflowEngine
     from conductor.execution.docker import DockerRunnerBackend
     from conductor.execution.errors import WorkspaceAttachError
+    from tests.test_engine.mcp_placement import owned_opening, preserve_primary
     from tests.test_execution.test_workspace_retention import restore
     from tests.test_mcp.fixtures.docker_realm import create_realm
 
@@ -109,101 +110,116 @@ async def test_fence_refuses_new_session_after_expired_owner_with_empty_inventor
     checkpoints = tmp_path / "checkpoints"
     checkpoints.mkdir()
     monkeypatch.setattr(CheckpointManager, "get_checkpoints_dir", lambda: checkpoints)
+    staged: asyncio.Future[None] = asyncio.get_running_loop().create_future()
     if pending == "staging":
         monkeypatch.setattr(realm.backend, "_stage_workspace", held_stage)
     else:
         monkeypatch.setattr(manager_module, "stdio_client", held_stdio)
-    opening = asyncio.create_task(engine.run({}))
+        execute_loop = engine._execute_loop
+
+        async def staged_loop(current_agent_name):
+            # run() resets lifecycle views before preparation: stage its actual root lease here.
+            execution = engine._execution_resolver.manifest.profiles["call"].execution
+            assert execution is not None
+            await realm.backend._ensure_staged(session.leases["docker"], execution, None)
+            staged.set_result(None)
+            return await execute_loop(current_agent_name)
+
+        monkeypatch.setattr(engine, "_execute_loop", staged_loop)
     try:
-        await asyncio.wait_for(entered.wait(), 5)
-        session = engine._execution_session
-        lease = session.leases["docker"]
-        session.begin_teardown("cancelled", retain=True)
-        deadline = session.cleanup_deadline
-        loop = asyncio.get_running_loop()
-        clock = loop.time
-        monkeypatch.setattr(loop, "time", lambda: clock() + 31)
-        await session.finalize_leases("cancelled", retain=True)
-        monkeypatch.setattr(loop, "time", clock)
-        opening.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(opening, 5)
-        checkpoint_path = engine.handle_dashboard_stop("cancelled for fence regression")
-        assert checkpoint_path is not None
-        checkpoint = CheckpointManager.load_checkpoint(checkpoint_path)
-        assert checkpoint.workspace is not None
-        assert checkpoint.workspace["identities"]["docker"]["incarnation"] == lease.incarnation
-        assert session.cleanup_uncertain and session.cleanup_deadline == deadline
-        state = json.loads((tmp_path / "state.json").read_text())
-        assert {
-            item["Config"]["Labels"]["io.conductor.resource"]
-            for item in state["containers"].values()
-        } == {"mcp-fence"}
-        before = len((tmp_path / "docker.jsonl").read_text().splitlines())
-        home = tmp_path / "new-controller"
-        home.mkdir()
-        monkeypatch.setenv("HOME", str(home))
-        monkeypatch.setenv("CONDUCTOR_HOME", str(home / ".conductor"))
-        competitor = WorkflowEngine(
-            config,
-            workflow_path=path,
-            execution_environment=environment,
-            run_context=RunContext(run_id="fence-root"),
-        )
-        competitor._execution_session.backends["docker"] = DockerRunnerBackend("docker")
-        restore(competitor, checkpoint)
-        with pytest.raises(WorkspaceAttachError, match="fence"):
-            await competitor.resume(checkpoint.current_agent, checkpoint=checkpoint)
-        later = [
-            json.loads(line)["argv"]
-            for line in (tmp_path / "docker.jsonl").read_text().splitlines()[before:]
-        ]
-        assert not any(row[0] in {"cp", "run", "start", "rm", "volume"} for row in later)
-        assert json.loads((tmp_path / "state.json").read_text()) == state
-        print(
-            {
-                "case": "cross-home-fence",
-                "pending": pending,
-                "deadline": deadline,
-                "checkpoint": checkpoint.workspace,
-                "new_controller_commands": later,
-                "guard_preserved": state["containers"],
-            }
-        )
-    finally:
-        release.set()
-        if not opening.done():
+        async with owned_opening(engine.run({}), release) as opening:
+            if pending == "sdk":
+                # Ordinary staging has its own backend bounds, not the SDK marker budget.
+                done, _ = await asyncio.wait({opening, staged}, return_when=asyncio.FIRST_COMPLETED)
+                if opening in done:
+                    await opening
+            await asyncio.wait_for(entered.wait(), 5)
+            session = engine._execution_session
+            lease = session.leases["docker"]
+            session.begin_teardown("cancelled", retain=True)
+            deadline = session.cleanup_deadline
+            loop = asyncio.get_running_loop()
+            clock = loop.time
+            monkeypatch.setattr(loop, "time", lambda: clock() + 31)
+            await session.finalize_leases("cancelled", retain=True)
+            monkeypatch.setattr(loop, "time", clock)
             opening.cancel()
-            await asyncio.gather(opening, return_exceptions=True)
-        attempt = session.mcp_lifecycle.attempts[0]
-        assert attempt.lease is not None
-        lease = attempt.lease
-        entry = attempt.entries[0]
-        if entry.allocation is not None:
-            done, unfinished = await asyncio.wait({entry.allocation}, timeout=10)
-            assert done and not unfinished
-        for owner in tuple(entry.manager._owners):
-            done, unfinished = await asyncio.wait({owner}, timeout=10)
-            assert done and not unfinished
-        assert entry._cleanup is not None
-        await asyncio.wait_for(asyncio.shield(entry._cleanup), 10)
-        mcp = realm.backend._lease_states[realm.backend._lease_key(lease)].mcp
-        assert mcp is not None
-        for operation in (*mcp.operations, *mcp.probes):
-            done, unfinished = await asyncio.wait({operation}, timeout=10)
-            assert done and not unfinished
-        assert engine._mcp_step_managers == {}
-        # QA disposal follows independent terminal proof; it is not product recovery.
-        state = json.loads((tmp_path / "state.json").read_text())
-        for metadata in state["containers"].values():
-            labels = metadata["Config"]["Labels"]
-            assert labels["io.conductor.run_id"] == lease.lease_id
-            assert labels["io.conductor.incarnation"] == lease.incarnation
-            assert (await realm.backend._run_docker(("rm", "-f", metadata["Id"])))[0] == 0
-        for volume, labels in state["volumes"].items():
-            assert volume == realm.backend._volume_name(lease)
-            assert labels["io.conductor.incarnation"] == lease.incarnation
-            assert (await realm.backend._run_docker(("volume", "rm", "-f", volume)))[0] == 0
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(opening, 5)
+            checkpoint_path = engine.handle_dashboard_stop("cancelled for fence regression")
+            assert checkpoint_path is not None
+            checkpoint = CheckpointManager.load_checkpoint(checkpoint_path)
+            assert checkpoint.workspace is not None
+            assert checkpoint.workspace["identities"]["docker"]["incarnation"] == lease.incarnation
+            assert session.cleanup_uncertain and session.cleanup_deadline == deadline
+            state = json.loads((tmp_path / "state.json").read_text())
+            assert {
+                item["Config"]["Labels"]["io.conductor.resource"]
+                for item in state["containers"].values()
+            } == {"mcp-fence"}
+            before = len((tmp_path / "docker.jsonl").read_text().splitlines())
+            home = tmp_path / "new-controller"
+            home.mkdir()
+            monkeypatch.setenv("HOME", str(home))
+            monkeypatch.setenv("CONDUCTOR_HOME", str(home / ".conductor"))
+            competitor = WorkflowEngine(
+                config,
+                workflow_path=path,
+                execution_environment=environment,
+                run_context=RunContext(run_id="fence-root"),
+            )
+            competitor._execution_session.backends["docker"] = DockerRunnerBackend("docker")
+            restore(competitor, checkpoint)
+            with pytest.raises(WorkspaceAttachError, match="fence"):
+                await competitor.resume(checkpoint.current_agent, checkpoint=checkpoint)
+            later = [
+                json.loads(line)["argv"]
+                for line in (tmp_path / "docker.jsonl").read_text().splitlines()[before:]
+            ]
+            assert not any(row[0] in {"cp", "run", "start", "rm", "volume"} for row in later)
+            assert json.loads((tmp_path / "state.json").read_text()) == state
+            print(
+                {
+                    "case": "cross-home-fence",
+                    "pending": pending,
+                    "deadline": deadline,
+                    "checkpoint": checkpoint.workspace,
+                    "new_controller_commands": later,
+                    "guard_preserved": state["containers"],
+                }
+            )
+    finally:
+        with preserve_primary():
+            for attempt in session.mcp_lifecycle.attempts:
+                lease = attempt.lease
+                if lease is None:
+                    continue
+                for entry in attempt.entries:
+                    if entry.allocation is not None:
+                        done, unfinished = await asyncio.wait({entry.allocation}, timeout=10)
+                        assert done and not unfinished
+                    for owner in tuple(entry.manager._owners):
+                        done, unfinished = await asyncio.wait({owner}, timeout=10)
+                        assert done and not unfinished
+                    assert entry._cleanup is not None
+                    await asyncio.wait_for(asyncio.shield(entry._cleanup), 10)
+                mcp = realm.backend._lease_states[realm.backend._lease_key(lease)].mcp
+                assert mcp is not None
+                for operation in (*mcp.operations, *mcp.probes):
+                    done, unfinished = await asyncio.wait({operation}, timeout=10)
+                    assert done and not unfinished
+                assert engine._mcp_step_managers == {}
+                # QA disposal follows independent terminal proof; it is not product recovery.
+                state = json.loads((tmp_path / "state.json").read_text())
+                for metadata in state["containers"].values():
+                    labels = metadata["Config"]["Labels"]
+                    assert labels["io.conductor.run_id"] == lease.lease_id
+                    assert labels["io.conductor.incarnation"] == lease.incarnation
+                    assert (await realm.backend._run_docker(("rm", "-f", metadata["Id"])))[0] == 0
+                for volume, labels in state["volumes"].items():
+                    assert volume == realm.backend._volume_name(lease)
+                    assert labels["io.conductor.incarnation"] == lease.incarnation
+                    assert (await realm.backend._run_docker(("volume", "rm", "-f", volume)))[0] == 0
 
 
 @pytest.mark.parametrize("winner", ["first", "new"])

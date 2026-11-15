@@ -168,7 +168,7 @@ async def test_environment_delivery_through_real_sdk(
             )
             assert _names(launch.env) == _names(realm.operator)
             assert launch.payload == expected and peer.env == expected
-            assert launch.child_pid == peer.pid and launch.pid != peer.pid
+            assert peer.is_owned_by(launch.pid, launch.child_pid)
             assert peer.called is (failure != "startup") and peer.closed and launch.joined
             assert launch.exit_code == (23 if failure == "startup" else 0)
             assert not env_file.exists()

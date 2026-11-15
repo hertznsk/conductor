@@ -33,7 +33,7 @@ from conductor.config.schema import (
 )
 from conductor.engine.workflow import _MCP_STEP_POOL_MAX, WorkflowEngine
 from conductor.exceptions import ExecutionError
-from tests.test_engine.mcp_placement import placement_config, placement_engine
+from tests.test_engine.mcp_placement import owned_opening, placement_config, placement_engine
 
 
 @pytest.fixture
@@ -82,6 +82,37 @@ def _manager_factory(**_kwargs: Any) -> MagicMock:
     manager.connect_server = AsyncMock(return_value=[])
     manager.close = AsyncMock()
     return manager
+
+
+@pytest.mark.parametrize("cleanup_error", [False, True])
+async def test_owned_opening_releases_and_joins_after_readiness_failure(
+    cleanup_error: bool,
+) -> None:
+    # Requirement: failed readiness releases and joins its owner without hiding either failure.
+    entered, release, closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    primary = TimeoutError("readiness failed")
+    secondary = RuntimeError("opening cleanup failed")
+    owners: list[asyncio.Task[None]] = []
+
+    async def open_until_released() -> None:
+        entered.set()
+        try:
+            await release.wait()
+        finally:
+            closed.set()
+            if cleanup_error:
+                raise secondary
+
+    with pytest.raises(TimeoutError) as caught:
+        async with owned_opening(open_until_released(), release) as opening:
+            owners.append(opening)
+            await asyncio.wait_for(entered.wait(), 5)
+            raise primary
+
+    assert caught.value is primary
+    assert release.is_set() and closed.is_set()
+    assert [owner.done() for owner in owners] == [True]
+    assert primary.__cause__ is (secondary if cleanup_error else None)
 
 
 async def test_docker_profile_full_execution_identity_and_reuse(realm) -> None:
@@ -211,13 +242,18 @@ async def test_allocation_docker_only_root_owns_late_target(realm, monkeypatch, 
     monkeypatch.setattr(MCPManager, "close", close_manager)
     async with placement_engine(config, realm) as engine:
         session = engine._execution_session
-        opening = asyncio.create_task(engine._get_mcp_step_manager("srv", None, step_key="call"))
-        await asyncio.wait_for(allocated.wait(), 5)
-        session.begin_teardown("cancelled", retain=expired)
-        deadline = session.cleanup_deadline
-        assert session.sealed and deadline is not None
-        assert order == []
-        try:
+        # Staging is a prerequisite, outside the held allocation readiness budget.
+        execution = engine._execution_resolver.manifest.profiles["call"].execution
+        assert execution is not None
+        await realm.backend._ensure_staged(session.leases["docker"], execution, None)
+        async with owned_opening(
+            engine._get_mcp_step_manager("srv", None, step_key="call"), release
+        ) as opening:
+            await asyncio.wait_for(allocated.wait(), 5)
+            session.begin_teardown("cancelled", retain=expired)
+            deadline = session.cleanup_deadline
+            assert session.sealed and deadline is not None
+            assert order == []
             if expired:
                 opening.cancel()
                 loop = asyncio.get_running_loop()
@@ -243,11 +279,6 @@ async def test_allocation_docker_only_root_owns_late_target(realm, monkeypatch, 
             )
             assert session.cleanup_deadline == deadline
             assert not list(realm.root.glob("*.launcher.json"))
-        finally:
-            release.set()
-            if not opening.done():
-                with pytest.raises(ExecutionSpecError):
-                    await opening
 
 
 async def test_docker_eviction_retains_cleanup_proof_until_root_finalize(realm, monkeypatch):

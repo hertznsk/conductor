@@ -1,4 +1,4 @@
-"""Dependency-free JSON-RPC peer emitting adversarial stdout/stderr diagnostics."""
+"""JSON-RPC peer emitting adversarial stdout/stderr diagnostics."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import os
 import sys
 from pathlib import Path
 
+import psutil
+
 CANARY = "docker-diagnostic-canary-5bf7"
 
 
@@ -14,7 +16,13 @@ def diagnostic_peer(receipt: Path) -> int:
     """Record protocol progress without storing the emitted diagnostic bytes."""
     mode = os.environ["PEER_FAILURE"]
     canary = os.environ.get("DIAGNOSTIC_CANARY", CANARY)
-    snapshot = {"pid": os.getpid(), "env": dict(os.environ), "called": False, "closed": False}
+    snapshot = {
+        "pid": os.getpid(),
+        "parent_pids": [parent.pid for parent in psutil.Process().parents()],
+        "env": dict(os.environ),
+        "called": False,
+        "closed": False,
+    }
     receipt.write_text(json.dumps(snapshot), encoding="utf-8")
     try:
         if mode == "diagnostic-stderr-startup":
